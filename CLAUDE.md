@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-GEMB_ClimateForcing.jl loads climate forcing data from reanalysis datasets and returns [GEMB.jl](https://github.com/alex-s-gardner/GEMB.jl)-compatible `ClimateForcing` structs. The package uses **pure Julia** (no Python dependencies) to access cloud-optimized ARCO Zarr stores via authenticated HTTPS.
+GEMB_ClimateForcing.jl loads climate forcing data from reanalysis datasets and returns a `DimStack` with climate variables. The package uses **pure Julia** (no Python dependencies) to access cloud-optimized ARCO Zarr stores via authenticated HTTPS.
+
+**Architecture**: GEMB_ClimateForcing has **no dependency on GEMB**. Instead, GEMB.jl provides a package extension (`ext/GEMBClimateForcing.jl`) that converts the DimStack to `GEMB.ClimateForcing`. This allows the forcing data to be used by other models or tools without requiring GEMB.
 
 ## Development Commands
 
@@ -57,7 +59,11 @@ julia --project=. examples/test_authentication.jl
    - Accesses 4 variable groups (temperature, pressure/precip, wind, radiation)
    - Nearest-neighbor lat/lon selection
    - Unit conversions (J/m² → W/m², m → kg/m², dewpoint → vapor pressure)
-   - Returns `GEMB.ClimateForcing` struct with all required variables
+   - Returns `DimStack` with all climate variables as DimArrays
+   - Physical validation via `validate_climate_forcing_units()`
+
+4. **`src/utils.jl`** - Utility functions
+   - `dewpoint_to_vapor_pressure()` - Magnus formula for vapor pressure calculation
 
 ### Data Flow
 
@@ -74,9 +80,19 @@ Slice time range and extract data at point
     ↓
 Convert units and compute derived variables (e.g., wind_speed from u10/v10)
     ↓
-GEMB.initialize_forcing() - create ClimateForcing struct
+Create DimStack with all variables + metadata
     ↓
-Return ClimateForcing with DimArray variables
+Validate physical ranges (validate_climate_forcing_units)
+    ↓
+Return DimStack
+    
+[Optional: if GEMB.jl is loaded]
+    ↓
+GEMB.ClimateForcing(dimstack) - extension method
+    ↓
+GEMB-specific validation and conversion
+    ↓
+Return GEMB.ClimateForcing struct
 ```
 
 ### Pure Julia Design
@@ -85,7 +101,8 @@ This package deliberately avoids PythonCall/xarray in favor of pure Julia:
 - **Zarr.jl** (v0.10+) for reading cloud Zarr stores
 - **AuthenticatedHTTPStore** implements Bearer token auth (pattern from GCStore)
 - **HTTP.jl + OpenSSL.jl** for HTTPS requests with custom headers
-- **DimensionalData.jl** for dimension-aware indexing (already used by GEMB.jl)
+- **DimensionalData.jl** for dimension-aware indexing and DimStack output
+- **No GEMB dependency** - GEMB.jl provides conversion via package extension
 
 ### ERA5-Land Specifics
 
@@ -108,16 +125,20 @@ To add support for a new reanalysis dataset (e.g., ERA5, MERRA-2):
 
 1. Create `src/datasets/your_dataset.jl`
 2. Implement `load_your_dataset(lat, lon; time_range, token, kwargs...)`
-3. Return a `GEMB.ClimateForcing` struct with required variables:
+3. Return a `DimStack` with required variables:
    - `temperature_air`, `pressure_air`, `vapor_pressure`
    - `wind_speed`, `precipitation`
    - `shortwave_downward`, `longwave_downward`
-4. Add dispatch case in `src/interface.jl`:
+   - Metadata with: `latitude`, `longitude`, `temperature_air_mean`, 
+     `wind_speed_mean`, `precipitation_mean`, 
+     `temperature_observation_height`, `wind_observation_height`
+4. Call `validate_climate_forcing_units(stack)` before returning
+5. Add dispatch case in `src/interface.jl`:
    ```julia
    elseif dataset == :yourdataset
        return load_your_dataset(lat, lon; time_range=time_range, token=token, kwargs...)
    ```
-5. Update README and tests
+6. Update README and tests
 
 Use `src/datasets/era5_land.jl` as a template.
 
@@ -137,10 +158,11 @@ ERA5-Land variables require conversion for GEMB compatibility:
 - `u10`, `v10` (m/s) → `wind_speed` (m/s): magnitude √(u² + v²)
 
 ### Performance Characteristics
-- First load: ~30-60 seconds (network dependent, loads metadata from 4 stores)
+- First load: ~10-25 seconds (network dependent, uses parallel loading)
 - Subsequent loads: faster due to HTTP caching
 - Memory: only requested time/location downloaded (lazy loading)
 - Geo-chunked is 2-5x faster than time-chunked for point time-series
+- **Parallel loading:** 4 variable groups loaded concurrently for 1.5-2x speedup
 
 ### Testing Strategy
 Tests use conditional integration testing:

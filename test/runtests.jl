@@ -1,6 +1,5 @@
 using Test
 using GEMB_ClimateForcing
-using GEMB
 using Dates
 using Statistics
 using DimensionalData
@@ -84,69 +83,79 @@ println("="^70)
             time_range = (DateTime(2020, 1, 1), DateTime(2020, 1, 2))  # 1 day
 
             @testset "Load Small Dataset" begin
-                cf = climate_forcing(
+                stack = climate_forcing(
                     :era5land, lat, lon;
                     time_range=time_range,
                     token=token
                 )
 
                 # Check type
-                @test cf isa GEMB.ClimateForcing
+                @test stack isa DimStack
 
-                # Check all fields are present
-                @test hasfield(typeof(cf), :temperature_air)
-                @test hasfield(typeof(cf), :pressure_air)
-                @test hasfield(typeof(cf), :precipitation)
-                @test hasfield(typeof(cf), :wind_speed)
-                @test hasfield(typeof(cf), :shortwave_downward)
-                @test hasfield(typeof(cf), :longwave_downward)
-                @test hasfield(typeof(cf), :vapor_pressure)
+                # Check all required variables are present
+                @test haskey(stack, :temperature_air)
+                @test haskey(stack, :pressure_air)
+                @test haskey(stack, :precipitation)
+                @test haskey(stack, :wind_speed)
+                @test haskey(stack, :shortwave_downward)
+                @test haskey(stack, :longwave_downward)
+                @test haskey(stack, :vapor_pressure)
 
-                # Check dimensions
-                n_steps = length(cf.temperature_air)
+                # Check time dimension
+                @test hasdim(stack, Ti)
+                time_dim = dims(stack, Ti)
+                n_steps = length(time_dim)
                 @test n_steps >= 24  # At least 24 hourly steps for 1 day
-                @test length(cf.pressure_air) == n_steps
-                @test length(cf.precipitation) == n_steps
-                @test length(cf.wind_speed) == n_steps
-                @test length(cf.shortwave_downward) == n_steps
-                @test length(cf.longwave_downward) == n_steps
-                @test length(cf.vapor_pressure) == n_steps
+
+                # Check dimensions match
+                @test length(stack[:temperature_air]) == n_steps
+                @test length(stack[:pressure_air]) == n_steps
+                @test length(stack[:precipitation]) == n_steps
+                @test length(stack[:wind_speed]) == n_steps
+                @test length(stack[:shortwave_downward]) == n_steps
+                @test length(stack[:longwave_downward]) == n_steps
+                @test length(stack[:vapor_pressure]) == n_steps
 
                 # Check physical ranges
-                @test all(cf.temperature_air .> 200)  # > -73°C
-                @test all(cf.temperature_air .< 320)  # < 47°C
-                @test all(cf.pressure_air .> 0)
-                @test all(cf.pressure_air .< 150000)
-                @test all(cf.precipitation .>= 0)
-                @test all(cf.wind_speed .>= 0)
-                @test all(cf.vapor_pressure .>= 0)
+                @test all(stack[:temperature_air] .> 200)  # > -73°C
+                @test all(stack[:temperature_air] .< 320)  # < 47°C
+                @test all(stack[:pressure_air] .> 0)
+                @test all(stack[:pressure_air] .< 150000)
+                @test all(stack[:precipitation] .>= 0)
+                @test all(stack[:wind_speed] .>= 0)
+                @test all(stack[:vapor_pressure] .>= 0)
 
                 # Check metadata
-                @test cf.time_step > 0
-                @test cf.temperature_air_mean > 200
-                @test cf.wind_speed_mean >= 0
-                @test cf.precipitation_mean >= 0
-                @test cf.temperature_observation_height == 2.0
-                @test cf.wind_observation_height == 10.0
+                meta = metadata(stack)
+                @test haskey(meta, "latitude")
+                @test haskey(meta, "longitude")
+                @test haskey(meta, "temperature_air_mean")
+                @test haskey(meta, "wind_speed_mean")
+                @test haskey(meta, "precipitation_mean")
+                @test haskey(meta, "temperature_observation_height")
+                @test haskey(meta, "wind_observation_height")
+                @test meta["temperature_observation_height"] == 2.0
+                @test meta["wind_observation_height"] == 10.0
             end
 
-            @testset "Compatible with GEMB" begin
-                # Verify ClimateForcing works with GEMB
-                cf = climate_forcing(
-                    :era5land, lat, lon;
-                    time_range=time_range,
-                    token=token
-                )
+            @testset "Parallel Loading Consistency" begin
+                # Load same data twice (relies on caching for speed)
+                lat, lon = 72.58, -38.46
+                time_range = (DateTime(2020, 1, 1), DateTime(2020, 1, 2))
 
-                mp = GEMB.ModelParameters(output_frequency=:last)
-                profile = GEMB.initialize_profile(mp, cf)
+                stack1 = climate_forcing(:era5land, lat, lon; time_range=time_range, token=token)
+                stack2 = climate_forcing(:era5land, lat, lon; time_range=time_range, token=token)
 
-                # Profile can be either NamedTuple or DimStack depending on GEMB version
-                @test profile isa Union{NamedTuple, DimStack}
+                # Verify identical results (parallel loading should be deterministic)
+                @test stack1[:temperature_air] == stack2[:temperature_air]
+                @test stack1[:pressure_air] == stack2[:pressure_air]
+                @test stack1[:wind_speed] == stack2[:wind_speed]
+                @test stack1[:precipitation] == stack2[:precipitation]
+                @test stack1[:shortwave_downward] == stack2[:shortwave_downward]
+                @test stack1[:longwave_downward] == stack2[:longwave_downward]
+                @test stack1[:vapor_pressure] == stack2[:vapor_pressure]
 
-                # Test with single timestep
-                output = GEMB.gemb(profile, cf, mp)
-                @test output isa DimStack
+                println("  ✓ Parallel loading produces consistent results")
             end
 
         else

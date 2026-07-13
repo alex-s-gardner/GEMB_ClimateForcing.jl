@@ -22,8 +22,20 @@ Thumbs.db
 test_with_key.jl
 *.log
 
+# Development documentation (not for package)
+REFACTORING_SUMMARY.md
+GITHUB_READY.md
+IMPLEMENTATION_NOTES.md
+PUBLISHING_CHECKLIST.md
+QUICKSTART.md
+TESTING.md
+UNIT_VALIDATION.md
+
 # Claude Code
 .claude/
+
+# CDS API credentials
+.cdsapirc
 
 # Environment
 .env

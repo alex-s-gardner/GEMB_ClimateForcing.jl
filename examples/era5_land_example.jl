@@ -35,12 +35,15 @@ println("="^60)
 println("Loading ERA5-Land Climate Forcing Data")
 println("="^60)
 
-cf = climate_forcing(
+forcing_data = climate_forcing(
     :era5land, lat, lon;
     time_range=time_range,
     token=token,
     chunk_strategy=:geo  # Optimized for time-series extraction
 )
+
+# Convert DimStack to GEMB.ClimateForcing (via extension)
+cf = GEMB.ClimateForcing(forcing_data)
 
 println("\nForcing data summary:")
 println("  Time steps: ", length(cf.temperature_air))

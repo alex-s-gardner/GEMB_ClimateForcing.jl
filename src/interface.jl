@@ -1,7 +1,7 @@
 """
-    climate_forcing(dataset::Symbol, lat::Real, lon::Real; kwargs...) -> ClimateForcing
+    climate_forcing(dataset::Symbol, lat::Real, lon::Real; kwargs...) -> DimStack
 
-Load climate forcing data from specified dataset and return GEMB-compatible ClimateForcing struct.
+Load climate forcing data from specified dataset and return a DimStack with climate variables.
 
 # Arguments
 - `dataset::Symbol`: Dataset identifier
@@ -20,28 +20,37 @@ Load climate forcing data from specified dataset and return GEMB-compatible Clim
 - `kwargs...`: Dataset-specific keyword arguments
 
 # Returns
-- `ClimateForcing`: Struct ready for `gemb(profile, cf, mp)`
+- `DimStack`: Stack with climate forcing variables as DimArrays
+  - `temperature_air`, `pressure_air`, `vapor_pressure`, `wind_speed`,
+    `precipitation`, `shortwave_downward`, `longwave_downward`
+  - Metadata includes location, dataset info, and observation heights
 
 # Examples
 ```julia
+using GEMB_ClimateForcing
+using GEMB  # Automatically provides DimStack → ClimateForcing conversion
+
 # Load ERA5-Land for Summit, Greenland
-cf = climate_forcing(
+forcing_data = climate_forcing(
     :era5land, 72.58, -38.46;
     time_range=(DateTime(2020,1,1), DateTime(2020,12,31)),
     token=ENV["CDS_API_KEY"]
 )
 
+# Convert to GEMB.ClimateForcing (requires GEMB.jl)
+cf = GEMB.ClimateForcing(forcing_data)
+
 # Use with GEMB
-using GEMB
-mp = ModelParameters(output_frequency=:daily)
-profile = initialize_profile(mp, cf)
-output = gemb(profile, cf, mp)
+mp = GEMB.ModelParameters(output_frequency=:daily)
+profile = GEMB.initialize_profile(mp, cf)
+output = GEMB.gemb(profile, cf, mp)
 ```
 
 # Notes
 - For ERA5-Land, obtain a free API key from https://cds.climate.copernicus.eu/
 - Store token in environment variable: `export CDS_API_KEY="your-token-here"`
 - Geo-chunked strategy is recommended for single-point time-series extraction
+- DimStack can be used directly or converted to GEMB.ClimateForcing via extension
 """
 function climate_forcing(
     dataset::Symbol,
