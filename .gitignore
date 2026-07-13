@@ -1,0 +1,36 @@
+# Julia
+*.jl.*.cov
+*.jl.cov
+*.jl.mem
+/Manifest.toml
+/docs/build/
+/docs/site/
+
+# OS-specific
+.DS_Store
+Thumbs.db
+*~
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Local development
+test_with_key.jl
+*.log
+
+# Claude Code
+.claude/
+
+# Environment
+.env
+*.env
+secrets.txt
+
+# Temporary files
+*.tmp
+tmp/
+temp/
