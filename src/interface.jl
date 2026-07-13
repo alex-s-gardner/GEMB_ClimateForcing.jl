@@ -17,6 +17,7 @@ Load climate forcing data from specified dataset and return a DimStack with clim
 - `chunk_strategy::Symbol=:geo`: Chunking strategy
   - `:geo` - Geo-chunked (optimized for time-series at a point)
   - `:time` - Time-chunked (optimized for spatial maps)
+- `cache_size::Int=128`: Number of chunks to cache per variable group (ERA5-Land only)
 - `kwargs...`: Dataset-specific keyword arguments
 
 # Returns
@@ -58,7 +59,7 @@ function climate_forcing(
     lon::Real;
     time_range::Union{Tuple{DateTime,DateTime},Nothing}=nothing,
     token::Union{String,Nothing}=nothing,
-    chunk_strategy::Symbol=:time,
+    chunk_strategy::Symbol=:geo,  # :geo is optimized for point time-series (counter-intuitively!)
     kwargs...
 )
     # Validate required arguments

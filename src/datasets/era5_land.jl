@@ -158,6 +158,7 @@ Load ERA5-Land reanalysis data using pure Julia (Zarr.jl) and return a DimStack 
 - `time_range::Tuple{DateTime,DateTime}`: Time range to extract (required)
 - `token::Union{String,Nothing}`: CDS API key (required)
 - `chunk_strategy::Symbol=:geo`: :geo (time-series) or :time (spatial)
+- `cache_size::Int=128`: Number of chunks to cache per variable group
 
 # Returns
 - `DimStack`: Stack with climate forcing variables as DimArrays:
@@ -190,6 +191,7 @@ function load_era5_land(
     time_range::Tuple{DateTime,DateTime},
     token::Union{String,Nothing}=nothing,
     chunk_strategy::Symbol=:geo,
+    cache_size::Int=128,
     kwargs...
 )
     # Validate token
@@ -213,12 +215,12 @@ function load_era5_land(
         url_wind = era5_land_url("sfc-wind", chunk_strategy)
         url_rad = era5_land_url("sfc-radiation-heat", chunk_strategy)
 
-        # Create stores in parallel (task-based concurrency for I/O operations)
+        # Create stores with caching (each store has independent cache)
         stores = @sync begin
-            t1 = @spawn AuthenticatedHTTPStore(url_temp; token=token)
-            t2 = @spawn AuthenticatedHTTPStore(url_precip; token=token)
-            t3 = @spawn AuthenticatedHTTPStore(url_wind; token=token)
-            t4 = @spawn AuthenticatedHTTPStore(url_rad; token=token)
+            t1 = @spawn AuthenticatedHTTPStore(url_temp; token=token, cache_size=cache_size)
+            t2 = @spawn AuthenticatedHTTPStore(url_precip; token=token, cache_size=cache_size)
+            t3 = @spawn AuthenticatedHTTPStore(url_wind; token=token, cache_size=cache_size)
+            t4 = @spawn AuthenticatedHTTPStore(url_rad; token=token, cache_size=cache_size)
             (fetch(t1), fetch(t2), fetch(t3), fetch(t4))
         end
         store_temp, store_precip, store_wind, store_rad = stores
