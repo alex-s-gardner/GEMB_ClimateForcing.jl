@@ -11,7 +11,7 @@ Load climate forcing data from various reanalysis datasets and return a `DimStac
 - **No Downloads**: Lazy loading of only requested time ranges and locations
 - **DimensionalData Integration**: Zarr arrays automatically work with DimStack indexing
 - ⚡ **Parallel Loading**: Concurrent access to multiple variable groups for optimal performance
-- 🚀 **Chunk Caching**: LRU cache for HTTP responses - repeated queries are near-instant
+- 🚀 **Chunk Caching**: Optional persistent disk cache via Zarr.CachingStore
 - **Extensible**: Easy to add new datasets (ERA5, MERRA-2, JRA-55, etc.)
 
 ## Supported Datasets
@@ -91,7 +91,7 @@ Load climate forcing data from specified dataset.
 - `chunk_strategy::Symbol=:geo` - Chunking strategy (`:geo` or `:time`)
   - `:geo` - Optimized for time-series extraction at a point (recommended)
   - `:time` - Optimized for spatial maps
-- `cache_size::Int=128` - Number of chunks to cache per variable group
+- `cache_path::Union{String,Nothing}=nothing` - Path for persistent disk cache (Zarr.CachingStore)
 
 **Returns:**
 - `DimStack` - Stack with climate forcing variables as DimArrays:
@@ -154,14 +154,14 @@ No PythonCall or xarray required!
 **Characteristics:**
 - First data load: ~10-25 seconds (1 year of hourly data)
 - Parallel loading of 4 variable groups provides 1.5-2x speedup
-- **Chunk caching**: Repeated queries for same time/location are near-instant (2-50x faster)
+- **Disk caching**: With `cache_path`, subsequent loads skip network entirely
 - Memory: only requested time/location downloaded (lazy loading)
 
 **Tips:**
 - **Use geo-chunked strategy** (default) for extracting time-series at single points
 - **Use time-chunked strategy** when extracting spatial maps
-- **Increase cache_size** for large time ranges (default 128 chunks ≈ 1-10 MB)
-- Caching is per-session - repeated calls benefit from cached chunks
+- **Enable disk caching** with `cache_path` for repeated access to the same data across sessions
+- Cache persists on disk - subsequent Julia sessions benefit without re-downloading
 
 ## Examples
 
