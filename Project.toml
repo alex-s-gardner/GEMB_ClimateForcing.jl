@@ -1,0 +1,29 @@
+name = "GEMB_ClimateForcing"
+uuid = "a1b2c3d4-5678-9abc-def0-123456789abc"
+version = "0.1.0"
+authors = ["Alex Gardner <alex.s.gardner@jpl.nasa.gov> and contributors"]
+
+[deps]
+Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
+DimensionalData = "0703355e-b756-11e9-17c0-8b28908087d0"
+GEMB = "658e70de-abe2-4db6-8b40-f6dcda98d853"
+HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
+OpenSSL = "4d8831e6-92b7-49fb-bdf8-b643e874388c"
+Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
+Zarr = "0a941bbe-ad1d-11e8-39d9-ab76183a1d99"
+
+[compat]
+Dates = "1.11.0"
+DimensionalData = "0.30"
+GEMB = "1"
+HTTP = "1"
+OpenSSL = "1"
+Statistics = "1.11.1"
+Zarr = "0.9, 0.10"
+julia = "1.10"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]
