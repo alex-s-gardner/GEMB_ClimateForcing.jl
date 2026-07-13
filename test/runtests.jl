@@ -69,10 +69,10 @@ println("="^70)
     end
 
     @testset "ERA5-Land Loading (Integration)" begin
-        # Only run if CDS_API_KEY is available
+        # Only run if CDS_API_KEY is available and non-empty
         token = get(ENV, "CDS_API_KEY", nothing)
 
-        if !isnothing(token)
+        if !isnothing(token) && !isempty(strip(token))
             println("\n" * "="^70)
             println("Running ERA5-Land Data Retrieval Tests")
             println("(This will download actual data from ECMWF servers)")
@@ -180,8 +180,9 @@ println("="^70)
             time_range=(DateTime(2020,1,1), DateTime(2020,2,1))
         )
 
-        # Invalid token (only test if CDS_API_KEY not set, to avoid rate limiting)
-        if isnothing(get(ENV, "CDS_API_KEY", nothing))
+        # Invalid token (only test if CDS_API_KEY not set or empty, to avoid rate limiting)
+        token = get(ENV, "CDS_API_KEY", nothing)
+        if isnothing(token) || isempty(strip(token))
             @test_throws Exception climate_forcing(
                 :era5land, 72.0, -38.0;
                 time_range=(DateTime(2020,1,1), DateTime(2020,1,2)),
