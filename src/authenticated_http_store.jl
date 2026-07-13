@@ -1,29 +1,33 @@
 """
-AuthenticatedHTTPStore - HTTP store with Bearer token authentication.
+AuthenticatedHTTPStore - HTTP store with Bearer token authentication and caching.
 
 Follows the pattern from Zarr.jl's GCStore implementation for authenticating
-requests to cloud-optimized Zarr stores over HTTPS.
+requests to cloud-optimized Zarr stores over HTTPS. Includes LRU caching to
+minimize repeated HTTP requests for the same chunks.
 """
 
 using HTTP
 using OpenSSL: OpenSSL
+using LRUCache
 import Zarr
 
 """
     AuthenticatedHTTPStore <: Zarr.AbstractStore
 
-HTTP store that supports Bearer token authentication via custom headers.
+HTTP store that supports Bearer token authentication via custom headers with LRU caching.
 
 # Fields
 - `url::String`: Base URL of the Zarr store
 - `headers::Dict{String,String}`: HTTP headers (includes Authorization)
 - `allowed_codes::Set{Int}`: HTTP status codes to treat as "key not found" (default: 404)
+- `cache::LRU{String,Union{Vector{UInt8},Nothing}}`: LRU cache for HTTP responses
 
 # Example
 ```julia
 store = AuthenticatedHTTPStore(
     "https://example.com/path/to/data.zarr",
-    token="your-bearer-token"
+    token="your-bearer-token",
+    cache_size=128  # Cache up to 128 chunks
 )
 arr = Zarr.zopen(store)
 ```
@@ -32,37 +36,52 @@ struct AuthenticatedHTTPStore <: Zarr.AbstractStore
     url::String
     headers::Dict{String,String}
     allowed_codes::Set{Int}
+    cache::LRU{String,Union{Vector{UInt8},Nothing}}
 end
 
 """
-    AuthenticatedHTTPStore(url::String; token::String, allowed_codes=Set((404,)))
+    AuthenticatedHTTPStore(url::String; token::String, allowed_codes=Set((404,)), cache_size=128)
 
-Create an authenticated HTTP store for accessing Zarr data via HTTPS.
+Create an authenticated HTTP store for accessing Zarr data via HTTPS with caching.
 
 # Arguments
 - `url::String`: Base URL of the Zarr store
 - `token::String`: Bearer token for authentication
 - `allowed_codes`: HTTP status codes to treat as "key not found"
+- `cache_size::Int`: Maximum number of chunks to cache (default: 128)
 
 # Returns
-- `AuthenticatedHTTPStore` instance
+- `AuthenticatedHTTPStore` instance with LRU cache
+
+# Notes
+- Cache size of 128 chunks ≈ 1-10 MB depending on chunk size
+- Cache is shared across all variables in the same store
+- Metadata (.zarray, .zattrs, .zgroup) is also cached
 """
-function AuthenticatedHTTPStore(url::String; token::String, allowed_codes::Set{Int}=Set((404,)))
+function AuthenticatedHTTPStore(url::String; token::String, allowed_codes::Set{Int}=Set((404,)), cache_size::Int=128)
     # Build headers with Bearer token (following GCStore pattern)
     headers = Dict{String,String}(
         "Authorization" => "Bearer $(token)"
     )
-    AuthenticatedHTTPStore(url, headers, allowed_codes)
+    # Create LRU cache for HTTP responses
+    cache = LRU{String,Union{Vector{UInt8},Nothing}}(maxsize=cache_size)
+    AuthenticatedHTTPStore(url, headers, allowed_codes, cache)
 end
 
 """
     Base.getindex(s::AuthenticatedHTTPStore, k::String)
 
-Retrieve data from the authenticated HTTP store.
+Retrieve data from the authenticated HTTP store with caching.
 
 Follows the pattern from GCStore: passes headers to HTTP.request() for authentication.
+Uses LRU cache to avoid repeated HTTP requests for the same keys.
 """
 function Base.getindex(s::AuthenticatedHTTPStore, k::String)
+    # Check cache first
+    if haskey(s.cache, k)
+        return s.cache[k]
+    end
+
     full_url = string(s.url, "/", k)
 
     # Make authenticated request (following GCStore pattern)
@@ -75,15 +94,19 @@ function Base.getindex(s::AuthenticatedHTTPStore, k::String)
     )
 
     # Handle response
-    if r.status >= 300
+    result = if r.status >= 300
         if r.status in s.allowed_codes
-            return nothing  # Key not found
+            nothing  # Key not found
         else
             error("HTTP $(r.status) accessing $(full_url): $(String(r.body))")
         end
     else
-        return r.body
+        r.body
     end
+
+    # Cache the result (including nothing for 404s)
+    s.cache[k] = result
+    return result
 end
 
 # Implement required AbstractStore interface for read-only HTTP stores
