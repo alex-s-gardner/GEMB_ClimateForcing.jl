@@ -84,7 +84,6 @@ function Base.getindex(s::AuthenticatedHTTPStore, k::String)
 end
 
 # Implement required AbstractStore interface for read-only HTTP stores
-
 Zarr.storagesize(s::AuthenticatedHTTPStore, p::String) = 0
 Zarr.subdirs(s::AuthenticatedHTTPStore, p::String) = String[]
 Zarr.subkeys(s::AuthenticatedHTTPStore, p::String) = String[]

@@ -33,7 +33,7 @@ using HTTP
 using OpenSSL
 
 # Export main interface
-export climate_forcing
+export climate_forcing, get_cds_api_key
 
 # Include submodules
 include("utils.jl")

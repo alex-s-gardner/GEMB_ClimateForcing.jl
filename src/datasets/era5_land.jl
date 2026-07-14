@@ -333,6 +333,7 @@ function load_era5_land(
 
         # Convert radiation: J/m² (hourly accumulation) -> W/m²
         shortwave_downward = shortwave_raw ./ 3600.0
+        shortwave_downward[shortwave_downward .< 0] .= 0.0  # Remove numerical noise
         longwave_downward = longwave_raw ./ 3600.0
 
         println("  Data loaded successfully!")
