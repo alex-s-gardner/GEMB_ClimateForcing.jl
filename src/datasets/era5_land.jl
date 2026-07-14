@@ -158,7 +158,7 @@ Load ERA5-Land reanalysis data using pure Julia (Zarr.jl) and return a DimStack 
 - `time_range::Tuple{DateTime,DateTime}`: Time range to extract (required)
 - `token::Union{String,Nothing}`: CDS API key (required)
 - `chunk_strategy::Symbol=:geo`: :geo (time-series) or :time (spatial)
-- `cache_size::Int=128`: Number of chunks to cache per variable group
+- `cache_path::Union{String,Nothing}=nothing`: Path for persistent disk cache (uses Zarr.CachingStore)
 
 # Returns
 - `DimStack`: Stack with climate forcing variables as DimArrays:
@@ -191,7 +191,7 @@ function load_era5_land(
     time_range::Tuple{DateTime,DateTime},
     token::Union{String,Nothing}=nothing,
     chunk_strategy::Symbol=:geo,
-    cache_size::Int=128,
+    cache_path::Union{String,Nothing}=nothing,
     kwargs...
 )
     # Validate token
@@ -215,15 +215,21 @@ function load_era5_land(
         url_wind = era5_land_url("sfc-wind", chunk_strategy)
         url_rad = era5_land_url("sfc-radiation-heat", chunk_strategy)
 
-        # Create stores with caching (each store has independent cache)
-        stores = @sync begin
-            t1 = @spawn AuthenticatedHTTPStore(url_temp; token=token, cache_size=cache_size)
-            t2 = @spawn AuthenticatedHTTPStore(url_precip; token=token, cache_size=cache_size)
-            t3 = @spawn AuthenticatedHTTPStore(url_wind; token=token, cache_size=cache_size)
-            t4 = @spawn AuthenticatedHTTPStore(url_rad; token=token, cache_size=cache_size)
-            (fetch(t1), fetch(t2), fetch(t3), fetch(t4))
+        # Create authenticated HTTP stores
+        store_temp = AuthenticatedHTTPStore(url_temp; token=token)
+        store_precip = AuthenticatedHTTPStore(url_precip; token=token)
+        store_wind = AuthenticatedHTTPStore(url_wind; token=token)
+        store_rad = AuthenticatedHTTPStore(url_rad; token=token)
+
+        # Wrap with Zarr.CachingStore for persistent disk caching if cache_path provided
+        if !isnothing(cache_path)
+            mkpath(cache_path)
+            store_temp = Zarr.CachingStore(store_temp, Zarr.DirectoryStore(joinpath(cache_path, "sfc-2m-temperature")))
+            store_precip = Zarr.CachingStore(store_precip, Zarr.DirectoryStore(joinpath(cache_path, "sfc-pressure-precipitation")))
+            store_wind = Zarr.CachingStore(store_wind, Zarr.DirectoryStore(joinpath(cache_path, "sfc-wind")))
+            store_rad = Zarr.CachingStore(store_rad, Zarr.DirectoryStore(joinpath(cache_path, "sfc-radiation-heat")))
+            println("  Using disk cache: $(cache_path)")
         end
-        store_temp, store_precip, store_wind, store_rad = stores
 
         # Open Zarr groups in parallel (highest impact for performance)
         println("  Opening Zarr groups in parallel...")
@@ -327,6 +333,7 @@ function load_era5_land(
 
         # Convert radiation: J/m² (hourly accumulation) -> W/m²
         shortwave_downward = shortwave_raw ./ 3600.0
+        shortwave_downward[shortwave_downward .< 0] .= 0.0  # Remove numerical noise
         longwave_downward = longwave_raw ./ 3600.0
 
         println("  Data loaded successfully!")
