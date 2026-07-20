@@ -48,8 +48,17 @@ end
 Find index of nearest value in sorted or unsorted array.
 """
 function find_nearest_index(values::AbstractVector, target)
-    _, idx = findmin(abs.(values .- target))
-    return idx
+    # Single pass, no temporaries (avoids materializing abs.(values .- target)).
+    best_idx = firstindex(values)
+    best_dist = abs(values[best_idx] - target)
+    @inbounds for i in eachindex(values)
+        d = abs(values[i] - target)
+        if d < best_dist
+            best_dist = d
+            best_idx = i
+        end
+    end
+    return best_idx
 end
 
 """
@@ -262,20 +271,12 @@ function load_era5_land(
         lon_values = zg_temp["longitude"][:]
         time_values_raw = zg_temp["time"][:]
 
-        # Convert time from hours since epoch to DateTime
-        # ERA5-Land uses "hours since 1900-01-01" typically
+        # Parse the epoch from the time axis units ("hours since YYYY-MM-DD" for ERA5-Land).
         time_units = zg_temp["time"].attrs["units"]
-        if occursin("hours since", time_units)
-            epoch_match = match(r"hours since (\d{4}-\d{2}-\d{2})", time_units)
-            if !isnothing(epoch_match)
-                epoch = DateTime(epoch_match.captures[1])
-                time_values = [epoch + Hour(Int(h)) for h in time_values_raw]
-            else
-                error("Could not parse time units: $(time_units)")
-            end
-        else
-            error("Unexpected time units: $(time_units)")
-        end
+        occursin("hours since", time_units) || error("Unexpected time units: $(time_units)")
+        epoch_match = match(r"hours since (\d{4}-\d{2}-\d{2})", time_units)
+        isnothing(epoch_match) && error("Could not parse time units: $(time_units)")
+        epoch = DateTime(epoch_match.captures[1])
 
         # Find nearest lat/lon indices
         println("  Finding nearest grid point...")
@@ -288,53 +289,62 @@ function load_era5_land(
         println("    Requested: $(lat)°N, $(lon)°E")
         println("    Nearest: $(selected_lat)°N, $(selected_lon)°E")
 
-        # Find time range indices
-        time_start_idx = findfirst(t -> t >= start_time, time_values)
-        time_end_idx = findlast(t -> t <= end_time, time_values)
+        # Find time range indices by comparing in the axis's native numeric unit
+        # (hours since epoch). Only the two requested bounds are converted, avoiding a
+        # full-length DateTime allocation across the entire (multi-decade) time axis.
+        start_hours = Dates.value(start_time - epoch) / 3_600_000  # ms → hours
+        end_hours = Dates.value(end_time - epoch) / 3_600_000
+        time_start_idx = findfirst(h -> h >= start_hours, time_values_raw)
+        time_end_idx = findlast(h -> h <= end_hours, time_values_raw)
 
         if isnothing(time_start_idx) || isnothing(time_end_idx)
             error("Requested time range not available in dataset")
         end
 
         time_slice = time_start_idx:time_end_idx
-        selected_times = time_values[time_slice]
+        # Build DateTime values only for the selected slice.
+        selected_times = [epoch + Hour(round(Int, time_values_raw[i])) for i in time_slice]
 
         println("  Extracting $(length(selected_times)) time steps in parallel...")
 
         # Extract data for selected point and time range in parallel
         # ERA5-Land ARCO Zarr actual storage order: (longitude, latitude, time)
         # Even though _ARRAY_DIMENSIONS says ["time", "latitude", "longitude"]
+        # Read each slice once at its native dtype (no throwaway Float64 copy here).
+        # Conversions below promote to Float64 inside a single fused kernel per variable.
         data = @sync begin
-            t1 = @spawn Float64.(t2m_zarr[lon_idx, lat_idx, time_slice])
-            t2 = @spawn Float64.(d2m_zarr[lon_idx, lat_idx, time_slice])
-            t3 = @spawn Float64.(sp_zarr[lon_idx, lat_idx, time_slice])
-            t4 = @spawn Float64.(tp_zarr[lon_idx, lat_idx, time_slice])
-            t5 = @spawn Float64.(u10_zarr[lon_idx, lat_idx, time_slice])
-            t6 = @spawn Float64.(v10_zarr[lon_idx, lat_idx, time_slice])
-            t7 = @spawn Float64.(ssrd_zarr[lon_idx, lat_idx, time_slice])
-            t8 = @spawn Float64.(strd_zarr[lon_idx, lat_idx, time_slice])
+            t1 = @spawn t2m_zarr[lon_idx, lat_idx, time_slice]
+            t2 = @spawn d2m_zarr[lon_idx, lat_idx, time_slice]
+            t3 = @spawn sp_zarr[lon_idx, lat_idx, time_slice]
+            t4 = @spawn tp_zarr[lon_idx, lat_idx, time_slice]
+            t5 = @spawn u10_zarr[lon_idx, lat_idx, time_slice]
+            t6 = @spawn v10_zarr[lon_idx, lat_idx, time_slice]
+            t7 = @spawn ssrd_zarr[lon_idx, lat_idx, time_slice]
+            t8 = @spawn strd_zarr[lon_idx, lat_idx, time_slice]
             (fetch(t1), fetch(t2), fetch(t3), fetch(t4),
              fetch(t5), fetch(t6), fetch(t7), fetch(t8))
         end
-        temperature_air, temperature_dewpoint, pressure_air, precipitation_raw,
+        t2m_raw, d2m_raw, sp_raw, precipitation_raw,
             u10, v10, shortwave_raw, longwave_raw = data
 
         println("  Converting units...")
 
-        # Convert dewpoint to vapor pressure
-        vapor_pressure = dewpoint_to_vapor_pressure(temperature_dewpoint)
+        # Variables consumed directly: promote to Float64.
+        temperature_air = Float64.(t2m_raw)
+        pressure_air = Float64.(sp_raw)
 
-        # Convert precipitation: m -> kg/m²
-        precipitation = precipitation_raw .* 1000.0
-        precipitation[precipitation .< 0] .= 0.0  # Remove numerical noise
+        # Dewpoint -> vapor pressure (Magnus formula; promotes internally, one output array).
+        vapor_pressure = dewpoint_to_vapor_pressure(d2m_raw)
 
-        # Wind speed from components
-        wind_speed = hypot.(u10, v10)
+        # Precipitation: m -> kg/m², clamp numerical noise (single fused pass, no BitArray mask).
+        precipitation = @. max(Float64(precipitation_raw) * 1000.0, 0.0)
 
-        # Convert radiation: J/m² (hourly accumulation) -> W/m²
-        shortwave_downward = shortwave_raw ./ 3600.0
-        shortwave_downward[shortwave_downward .< 0] .= 0.0  # Remove numerical noise
-        longwave_downward = longwave_raw ./ 3600.0
+        # Wind speed magnitude from components (one fused output, no Float64 pre-copies).
+        wind_speed = @. hypot(Float64(u10), Float64(v10))
+
+        # Radiation: J/m² (hourly accumulation) -> W/m²; clamp shortwave noise.
+        shortwave_downward = @. max(Float64(shortwave_raw) / 3600.0, 0.0)
+        longwave_downward = @. Float64(longwave_raw) / 3600.0
 
         println("  Data loaded successfully!")
         println("  Number of time steps: $(length(selected_times))")
