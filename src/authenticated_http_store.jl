@@ -89,7 +89,26 @@ Zarr.subdirs(s::AuthenticatedHTTPStore, p::String) = String[]
 Zarr.subkeys(s::AuthenticatedHTTPStore, p::String) = String[]
 
 function Zarr.isinitialized(s::AuthenticatedHTTPStore, i::String)
-    s[i] !== nothing
+    # Probe existence with a HEAD request so we don't download the whole object body
+    # just to test for a key. Zarr issues many such probes (e.g. ~10 per group during
+    # a consolidated zopen). Fall back to GET if the server rejects HEAD (405/501).
+    full_url = string(s.url, "/", i)
+    r = HTTP.request(
+        "HEAD",
+        full_url,
+        s.headers,
+        status_exception=false,
+        socket_type_tls=OpenSSL.SSLStream
+    )
+    if r.status < 300
+        return true
+    elseif r.status in s.allowed_codes
+        return false
+    elseif r.status in (405, 501)  # HEAD not allowed/implemented — fall back to GET
+        return s[i] !== nothing
+    else
+        error("HTTP $(r.status) (HEAD) accessing $(full_url)")
+    end
 end
 
 function Base.setindex!(s::AuthenticatedHTTPStore, v, k::String)
