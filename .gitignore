@@ -46,3 +46,6 @@ secrets.txt
 *.tmp
 tmp/
 temp/
+
+# Benchmark golden snapshot
+test/.golden_forcing.jls
