@@ -88,6 +88,19 @@ Zarr.storagesize(s::AuthenticatedHTTPStore, p::String) = 0
 Zarr.subdirs(s::AuthenticatedHTTPStore, p::String) = String[]
 Zarr.subkeys(s::AuthenticatedHTTPStore, p::String) = String[]
 
+# Declare the Zarr format directly instead of letting Zarr detect it. Format detection
+# (`is_zarr2`/`is_zarr3`) issues ~10 serial network `isinitialized` probes per group
+# during a consolidated `zopen` — even with consolidated metadata, because Zarr delegates
+# format detection to the parent store. These ARCO ERA5-Land stores are always Zarr v2,
+# so short-circuiting removes those round-trips (~10x faster group open) with no I/O.
+Zarr.ZarrFormat(s::AuthenticatedHTTPStore, path) = Zarr.ZarrFormat(2)
+
+# Same short-circuit when the store is wrapped in a CachingStore (the `cache_path` path):
+# `zopen` builds ConsolidatedStore(CachingStore(AuthenticatedHTTPStore, ...)) and delegates
+# format detection to the CachingStore, whose probes fetch full bodies from the remote on a
+# cold cache. Declaring v2 for a CachingStore backed by our store skips those fetches too.
+Zarr.ZarrFormat(s::Zarr.CachingStore{<:AuthenticatedHTTPStore}, path) = Zarr.ZarrFormat(2)
+
 function Zarr.isinitialized(s::AuthenticatedHTTPStore, i::String)
     # Probe existence with a HEAD request so we don't download the whole object body
     # just to test for a key. Zarr issues many such probes (e.g. ~10 per group during
