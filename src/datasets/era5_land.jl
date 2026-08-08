@@ -7,6 +7,7 @@ Loads data from ECMWF's cloud-optimized Zarr stores via HTTPS with Bearer token.
 
 using Zarr
 using DimensionalData
+using Rasters
 using Dates
 using Statistics
 
@@ -22,6 +23,15 @@ const ERA5_LAND_STORES = Dict(
     "sfc-pressure-precipitation" => "009",
     "sfc-wind" => "008",
     "sfc-radiation-heat" => "010"
+)
+
+# One representative variable per group for reading chunk metadata.
+# All groups share the same spatial grid so any variable works.
+const _ERA5_LAND_CHUNK_MAP_VAR = Dict(
+    "sfc-2m-temperature"         => "t2m",
+    "sfc-pressure-precipitation" => "sp",
+    "sfc-wind"                   => "u10",
+    "sfc-radiation-heat"         => "ssrd",
 )
 
 """
@@ -395,4 +405,101 @@ function load_era5_land(
             rethrow()
         end
     end
+end
+
+"""
+    era5_land_chunk_map(; chunk_strategy, token, variable_group, cache_path) -> Raster{Int64}
+
+Return a global `Raster{Int64}` where each cell's value is a unique spatial chunk ID for
+that ERA5-Land grid cell under `chunk_strategy`. Cells with the same ID share a single
+Zarr chunk and are read together in one network request.
+
+No climate data values are downloaded — only the coordinate vectors and Zarr chunk
+metadata are fetched.
+"""
+function era5_land_chunk_map(;
+    chunk_strategy::Symbol = :geo,
+    token::Union{String,Nothing} = nothing,
+    variable_group::String = "sfc-2m-temperature",
+    cache_path::Union{String,Nothing} = nothing,
+)
+    isnothing(token) &&
+        throw(ArgumentError("token is required for ERA5-Land access. Get one from https://cds.climate.copernicus.eu/"))
+    haskey(ERA5_LAND_STORES, variable_group) ||
+        throw(ArgumentError("Unknown variable_group $(repr(variable_group)). " *
+                            "Available: $(join(sort(collect(keys(ERA5_LAND_STORES))), ", "))"))
+
+    println("Building ERA5-Land chunk map...")
+    println("  Chunk strategy: $(chunk_strategy)")
+    println("  Variable group: $(variable_group)")
+
+    url   = era5_land_url(variable_group, chunk_strategy)
+    store = AuthenticatedHTTPStore(url; token=token)
+
+    if !isnothing(cache_path)
+        mkpath(cache_path)
+        store = Zarr.CachingStore(store, Zarr.DirectoryStore(joinpath(cache_path, variable_group)))
+        println("  Using disk cache: $(cache_path)")
+    end
+
+    zg = Zarr.zopen(store, consolidated=true, fill_as_missing=false)
+
+    # Read full coordinate vectors (no climate data read)
+    lat_values = zg["latitude"][:]
+    lon_values = zg["longitude"][:]
+
+    # Chunk shape from Zarr array metadata.
+    # Empirical on-disk order for these ARCO stores is (lon, lat, time),
+    # matching the indexing convention used in load_era5_land.
+    var_name = _ERA5_LAND_CHUNK_MAP_VAR[variable_group]
+    chunks = zg[var_name].metadata.chunks   # NTuple{3,Int}: (lon_chunk, lat_chunk, time_chunk)
+    lon_chunk_size = chunks[1]
+    lat_chunk_size = chunks[2]
+
+    n_lon = length(lon_values)
+    n_lat = length(lat_values)
+    # Ceiling division gives correct chunk count including the partial final chunk.
+    n_lon_chunks = cld(n_lon, lon_chunk_size)
+    n_lat_chunks = cld(n_lat, lat_chunk_size)
+
+    println("  Grid size: $(n_lon) × $(n_lat)")
+    println("  Chunk shape: lon=$(lon_chunk_size), lat=$(lat_chunk_size)")
+    println("  Chunk grid: $(n_lon_chunks) × $(n_lat_chunks) = $(n_lon_chunks * n_lat_chunks) spatial chunks")
+
+    # Build chunk ID matrix. IDs are zero-based and linearized in lon-major order:
+    #   lon_cid = (i - 1) ÷ lon_chunk_size
+    #   lat_cid = (j - 1) ÷ lat_chunk_size
+    #   chunk_id = lon_cid * n_lat_chunks + lat_cid
+    # Integer floor division naturally assigns partial final chunks the same ID as the
+    # rest of their block — no special-casing needed at the grid boundary.
+    chunk_ids = Matrix{Int64}(undef, n_lon, n_lat)
+    @inbounds for j in 1:n_lat
+        lat_cid = (j - 1) ÷ lat_chunk_size
+        for i in 1:n_lon
+            lon_cid = (i - 1) ÷ lon_chunk_size
+            chunk_ids[i, j] = lon_cid * n_lat_chunks + lat_cid
+        end
+    end
+
+    meta = Dict{String,Any}(
+        "dataset"              => "ERA5-Land",
+        "chunk_strategy"       => string(chunk_strategy),
+        "variable_group"       => variable_group,
+        "lon_chunk_size"       => lon_chunk_size,
+        "lat_chunk_size"       => lat_chunk_size,
+        "n_lon_chunks"         => n_lon_chunks,
+        "n_lat_chunks"         => n_lat_chunks,
+        "total_spatial_chunks" => n_lon_chunks * n_lat_chunks,
+    )
+
+    raster = Rasters.Raster(
+        chunk_ids,
+        (Rasters.X(lon_values), Rasters.Y(lat_values));
+        name     = :chunk_id,
+        metadata = meta,
+    )
+
+    println("  ✓ Chunk map built: $(size(raster, Rasters.X)) × $(size(raster, Rasters.Y)), " *
+            "$(n_lon_chunks * n_lat_chunks) unique spatial chunks")
+    return raster
 end

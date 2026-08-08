@@ -28,6 +28,9 @@ println("="^70)
     # Include invariant-parameter tests (offline validation always; downloads opt-in)
     include("test_invariant.jl")
 
+    # Include chunk map tests (offline formula always; integration opt-in via GEMB_TEST_CHUNK_MAP=1)
+    include("test_chunk_map.jl")
+
     @testset "Input Validation" begin
         # Missing time_range
         @test_throws ArgumentError climate_forcing(:era5land, 72.0, -38.0)

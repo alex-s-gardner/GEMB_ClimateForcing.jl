@@ -97,3 +97,71 @@ function climate_forcing(
         throw(ArgumentError("Unsupported dataset: $dataset. Supported: :era5land"))
     end
 end
+
+"""
+    climate_chunk_map(dataset::Symbol; chunk_strategy, token, variable_group, cache_path) -> Raster{Int64}
+
+Return a global `Raster{Int64}` where the integer value at each grid cell is the unique
+spatial chunk ID for that cell in the given Zarr store layout.
+
+Cells sharing the same chunk ID occupy the same Zarr chunk and are read together in a
+single network request when that location is queried. Use this to visualize download
+locality before submitting batch queries.
+
+No climate data values are downloaded — only coordinate vectors and chunk metadata are
+fetched.
+
+# Arguments
+- `dataset::Symbol`: Dataset identifier. Currently only `:era5land`.
+
+# Keyword Arguments
+- `chunk_strategy::Symbol=:geo`: `:geo` (geoChunked.zarr) or `:time` (timeChunked.zarr)
+- `token::Union{String,Nothing}=nothing`: Bearer token (required for ERA5-Land)
+- `variable_group::String="sfc-2m-temperature"`: ERA5-Land variable group to read chunk
+  metadata from. All groups share the same spatial grid, so the default works for all cases.
+- `cache_path::Union{String,Nothing}=nothing`: Zarr.CachingStore cache directory
+
+# Returns
+- `Raster{Int64}` with `X` (longitude, 0–359.9°E) and `Y` (latitude, 90→-90°N) dims.
+  Chunk IDs are zero-based integers in `[0, n_lon_chunks*n_lat_chunks - 1]`. The
+  `metadata` dict contains `"chunk_strategy"`, `"lon_chunk_size"`, `"lat_chunk_size"`,
+  `"n_lon_chunks"`, `"n_lat_chunks"`, and `"total_spatial_chunks"`.
+
+# Examples
+```julia
+using GEMB_ClimateForcing
+token = ENV["CDS_API_KEY"]
+
+geo_map  = climate_chunk_map(:era5land; chunk_strategy=:geo,  token=token)
+time_map = climate_chunk_map(:era5land; chunk_strategy=:time, token=token)
+
+# Crop to Greenland (0–360 lon convention: -38°E → 322°E)
+greenland = geo_map[X=310..360, Y=59..84]
+```
+"""
+function climate_chunk_map(
+    dataset::Symbol;
+    chunk_strategy::Symbol = :geo,
+    token::Union{String,Nothing} = nothing,
+    variable_group::String = "sfc-2m-temperature",
+    cache_path::Union{String,Nothing} = nothing,
+)
+    if !(chunk_strategy in (:geo, :time))
+        throw(ArgumentError("chunk_strategy must be :geo or :time"))
+    end
+
+    if dataset == :era5land
+        return era5_land_chunk_map(;
+            chunk_strategy = chunk_strategy,
+            token          = token,
+            variable_group = variable_group,
+            cache_path     = cache_path,
+        )
+    elseif dataset == :era5
+        throw(ArgumentError("ERA5 dataset not yet implemented"))
+    elseif dataset == :merra2
+        throw(ArgumentError("MERRA-2 dataset not yet implemented"))
+    else
+        throw(ArgumentError("Unsupported dataset: $dataset. Supported: :era5land"))
+    end
+end
