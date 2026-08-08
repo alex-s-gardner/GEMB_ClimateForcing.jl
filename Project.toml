@@ -16,7 +16,7 @@ Zarr = "0a941bbe-ad1d-11e8-39d9-ab76183a1d99"
 
 [compat]
 DimensionalData = "0.30"
-Downloads = "1.7.0"
+Downloads = "1.6"
 HTTP = "1"
 NCDatasets = "0.14.15"
 OpenSSL = "1"
