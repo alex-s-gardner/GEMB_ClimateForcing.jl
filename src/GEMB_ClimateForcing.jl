@@ -33,12 +33,14 @@ using HTTP
 using OpenSSL
 
 # Export main interface
-export climate_forcing, get_cds_api_key
+export climate_forcing, get_cds_api_key, climate_adjust_for_elevation, empirical_lapse_rate,
+    GREENLAND_LAPSE_RATE, ARCTIC_LAPSE_RATE, ANTARCTICA_LAPSE_RATE
 
 # Include submodules
 include("utils.jl")
 include("authenticated_http_store.jl")
 include("interface.jl")
 include("datasets/era5_land.jl")
+include("elevation_adjustment.jl")
 
 end # module

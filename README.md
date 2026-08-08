@@ -9,6 +9,7 @@ Load climate forcing data from various reanalysis datasets and return a `DimStac
 - **Cloud-Optimized**: Direct access to ARCO (Analysis-Ready, Cloud-Optimized) Zarr stores via HTTPS
 - **Authenticated Access**: Bearer token authentication following Zarr.jl's GCStore pattern
 - **No Downloads**: Lazy loading of only requested time ranges and locations
+- **Elevation Downscaling**: Physically-based `climate_adjust_for_elevation()` for snow/ice surfaces with region-specific lapse rates (Glover 1999 / RACMO-based)
 - **DimensionalData Integration**: Zarr arrays automatically work with DimStack indexing
 - ⚡ **Parallel Loading**: Concurrent access to multiple variable groups for optimal performance
 - 🚀 **Chunk Caching**: Optional persistent disk cache via Zarr.CachingStore
@@ -115,6 +116,87 @@ forcing_data = climate_forcing(
 # Convert to GEMB.ClimateForcing (requires GEMB.jl loaded)
 cf = GEMB.ClimateForcing(forcing_data)
 ```
+
+### `climate_adjust_for_elevation(climate_forcing_original, delta_elevation; kwargs...)`
+
+Adjust a climate-forcing `DimStack` for the difference in elevation between the
+reanalysis grid cell and a desired target elevation (downscaling). Reanalyses
+resolve topography only at their native (coarse) resolution, so a point of
+interest — an AWS, a glacier stake, or a high-resolution DEM cell — often sits
+at a substantially different elevation than the reanalysis surface. This
+function applies physically-based, per-variable corrections for **snow/ice
+(glacier and ice-sheet) surfaces**.
+
+**Arguments:**
+- `climate_forcing_original::DimStack` - forcing returned by `climate_forcing` (must have a `Ti` dimension)
+- `delta_elevation::Real` - `z_target − z_reanalysis` in metres (positive = target above the grid cell)
+
+**Keyword Arguments:**
+- `lapse_rate=6.5` - near-surface temperature lapse rate in **K/km** (positive = cooling with height). Accepts:
+  - a **scalar** (applied to all time steps; default `6.5`, the free-air value);
+  - a **length-12 vector** — monthly values, assumed ordered January (1) to December (12), indexed by each step's month;
+  - a **vector matching the climate-record length** — a per-time-step lapse rate.
+
+  Region-specific monthly tables are exported as named constants:
+  `GREENLAND_LAPSE_RATE` (Fausto 2009), `ARCTIC_LAPSE_RATE` (Gardner 2009),
+  `ANTARCTICA_LAPSE_RATE` (Fortuin & Oerlemans 1990). Use `empirical_lapse_rate`
+  to fit the rate locally from neighbouring grid cells (the RACMO gold-standard).
+- `precip_scaling_method=nothing` - precipitation elevation treatment:
+  - `nothing` (default) — precipitation unchanged (RACMO downscaling practice);
+  - `:clausius_clapeyron` — scale by `eₛ(T′)/eₛ(T)` (Glover 1999, Eq. 19): precip
+    decreases as air cools with elevation (ice-sheet "elevation-desert" effect).
+
+**Adjustments applied** (`Δz = delta_elevation`, `Γ` in K/km):
+
+| Variable | Adjustment | Key reference |
+|----------|-----------|---------------|
+| `temperature_air` | lapse `T − (Γ/1000)·Δz` | Glover 1999; Fausto 2009; Gardner 2009 |
+| `pressure_air` | hydrostatic `P·exp(−g·Δz/(R_d·T̄))` | Glover 1999; validated by Noël 2018 |
+| `vapor_pressure` | constant relative humidity, recomputed at `T′` (over-ice below 0 °C) | Glover 1999 (Eq. 20); Curry & Webster 1999 |
+| `longwave_downward` | Konzelmann (1994) clear-sky emissivity, preserving reanalysis cloud increment Δε | Konzelmann 1994; Fiddes & Gruber 2014 |
+| `shortwave_downward` | unchanged (elevation-attenuation ≲ few %/km; needs solar geometry) | — |
+| `precipitation` | unchanged, or Clausius–Clapeyron `×eₛ(T′)/eₛ(T)` if requested | Glover 1999 (Eq. 19) |
+| `wind_speed` | unchanged | — |
+
+`Δz = 0` reproduces the input exactly. Physical-range validation is re-run on the result.
+
+**Example:**
+```julia
+stack = climate_forcing(:era5land, 72.58, -38.46;
+                        time_range=(DateTime(2020,1,1), DateTime(2020,12,31)),
+                        token=ENV["CDS_API_KEY"])
+
+# Downscale to a point 250 m above the grid cell, Greenland monthly lapse rates
+adjusted = climate_adjust_for_elevation(stack, 250.0; lapse_rate=GREENLAND_LAPSE_RATE)
+
+# A single locally-observed rate, plus elevation-desert precipitation scaling
+adjusted = climate_adjust_for_elevation(stack, 250.0;
+                                        lapse_rate=5.5,
+                                        precip_scaling_method=:clausius_clapeyron)
+
+# Gold-standard (RACMO-style): fit the local gradient from neighbouring grid
+# cells and use it instead of a climatological table (Noël et al. 2016, 2025)
+Γ = empirical_lapse_rate(neighbour_T2m, neighbour_elevations)   # K/km
+adjusted = climate_adjust_for_elevation(stack, 250.0; lapse_rate=Γ)
+```
+
+> **Precipitation phase.** Total precipitation is preserved by default, but
+> because temperature is elevation-cooled, a downstream temperature-based
+> rain/snow split (as GEMB applies) yields a larger *snow* fraction at higher,
+> colder targets. The RACMO2.3 downscaling studies (Noël et al. 2016, 2020,
+> 2022, 2025) likewise interpolate total precipitation with **no** elevation
+> correction — even over mountainous Patagonia — relying on the host model's
+> resolved orography.
+
+> **Scientific basis.** The per-variable scheme follows Glover (1999, *J.
+> Climate* 12, 551–563, Eqs. 15–20), which established these exact elevation
+> corrections for the Greenland ice sheet, and is the surface-field analogue of
+> TopoSCALE (Fiddes & Gruber, 2014); the full pressure-level interpolation is
+> unavailable because ERA5-Land exposes surface variables only. The corrections
+> are consistent with the RACMO2.3p2 studies of Noël et al. (2018, 2019).
+> Near-surface lapse rates over melting glaciers and ice sheets are markedly
+> shallower than the 6.5 K/km free-air default — a key reason to use a
+> region-specific table or a locally-fitted rate.
 
 ## ERA5-Land Details
 

@@ -18,6 +18,12 @@ println("="^70)
     # Include unit validation tests
     include("test_unit_validation.jl")
 
+    # Include elevation adjustment tests (offline, analytic)
+    include("test_elevation_adjustment.jl")
+
+    # Include analytical physics cross-checks (offline)
+    include("test_elevation_physics.jl")
+
     @testset "Input Validation" begin
         # Missing time_range
         @test_throws ArgumentError climate_forcing(:era5land, 72.0, -38.0)
