@@ -198,6 +198,50 @@ adjusted = climate_adjust_for_elevation(stack, 250.0; lapse_rate=Γ)
 > shallower than the 6.5 K/km free-air default — a key reason to use a
 > region-specific table or a locally-fitted rate.
 
+### `climate_model_invariant(; model, parameter, ...)`
+
+Load a climate model's **time-invariant** (static) parameters — land–sea mask,
+geopotential/orography, vegetation, soil, lake, glacier — as **lazy** `Raster`s.
+
+These fields are *not* in the time-series ARCO Zarr stores. ECMWF distributes them
+as ready-made global NetCDF files on the ERA5-Land 0.1° grid
+([data documentation](https://confluence.ecmwf.int/spaces/CKB/pages/140385202/ERA5-Land+data+documentation)).
+This function downloads the requested file(s) once, caches them on disk, and opens
+them lazily — no array data is read until the raster is indexed, cropped, or
+`read`/`collect`ed.
+
+```julia
+using GEMB_ClimateForcing, Rasters
+
+# Land-sea mask as a lazy Raster (fractional 0–1, incl. coastal cells).
+lsm = climate_model_invariant(parameter=:lsm)
+iceland = read(lsm[X = 335 .. 347, Y = 63 .. 67])   # crop then read
+
+# Orography (m) from geopotential.
+z = climate_model_invariant(parameter=:z)
+orography = z ./ 9.80665
+
+# Everything at once, as a lazy RasterStack.
+inv = climate_model_invariant()                      # :lsm, :z, :cvl, :cvh, ...
+```
+
+Available ERA5-Land parameters (GRIB shortName): `:lsm` (land-sea mask), `:z`
+(geopotential), `:cl` (lake cover), `:dl` (lake depth), `:cvl`/`:cvh` (low/high
+vegetation cover), `:tvl`/`:tvh` (low/high vegetation type), `:slt` (soil type),
+`:glm` (glacier mask). See `ERA5_LAND_INVARIANT_PARAMETERS`.
+
+> **Grid convention.** The invariant grid uses **0–359.9°E** longitude and
+> **descending** latitude (90→−90°N). The `X = a .. b` / `Y = a .. b` selector takes
+> `min .. max` regardless of axis order. Geopotential `z` is in m² s⁻²; divide by
+> `9.80665` for orography in metres.
+
+The land-sea mask and geopotential are useful for restricting an analysis to land
+cells and for the elevation-downscaling workflow: `z / 9.80665` gives the
+reanalysis surface elevation (the `z_reanalysis` in `Δz = z_target − z_reanalysis`
+passed to [`climate_adjust_for_elevation`](#climate_adjust_for_elevationclimate_forcing_original-delta_elevation-kwargs)),
+and neighbouring land-cell elevations feed
+[`empirical_lapse_rate`](#empirical_lapse_ratevalues-elevations).
+
 ## ERA5-Land Details
 
 ### Variables
@@ -283,3 +327,36 @@ MIT License - see LICENSE file for details
 
 - [GEMB.jl](https://github.com/alex-s-gardner/GEMB.jl) - Glacier Energy and Mass Balance model
 - [ERA5-Land](https://cds.climate.copernicus.eu/datasets/reanalysis-era5-land) - Dataset information
+
+## About Datasets
+
+### ERA5-Land (ECMWF ARCO Zarr)
+
+Climate forcing data is sourced from the [ERA5-Land reanalysis](https://cds.climate.copernicus.eu/datasets/reanalysis-era5-land) via ECMWF's Analysis-Ready, Cloud-Optimized (ARCO) Zarr stores hosted at `arco.datastores.ecmwf.int`. Access requires a free [CDS API key](https://cds.climate.copernicus.eu/api-how-to).
+
+**Grid and temporal coverage:**
+
+| Property | Value |
+|---|---|
+| Spatial resolution | 0.1° (~9 km) |
+| Grid size | 1801 × 3600 (lat × lon) |
+| Temporal resolution | Hourly |
+| Time coverage | 1940–present (~671,000 time steps) |
+
+**Variables loaded** (from 4 separate Zarr store groups):
+
+| Store group | Raw variables | Derived output |
+|---|---|---|
+| `sfc-2m-temperature` | `t2m`, `d2m` | `temperature_air` (K), `vapor_pressure` (Pa) |
+| `sfc-pressure-precipitation` | `sp`, `tp` | `pressure_air` (Pa), `precipitation` (kg/m²/hr) |
+| `sfc-wind` | `u10`, `v10` | `wind_speed` (m/s) |
+| `sfc-radiation-heat` | `ssrd`, `strd` | `shortwave_downward` (W/m²), `longwave_downward` (W/m²) |
+
+**Chunk layout** (storage order: `time × lat × lon`):
+
+| Strategy | time chunk | lat chunk | lon chunk | Optimized for |
+|---|---|---|---|---|
+| `:geo` (default) | 33,792 | 4 | 8 | Point time-series — ~3.85 years per chunk, tiny spatial footprint |
+| `:time` | 1 | 1,024 | 1,024 | Spatial maps — one timestep, ~103°×103° tile |
+
+The `:geo` strategy is strongly preferred for single-point simulations: extracting a full multi-decade time series at one location reads only a handful of chunks, whereas `:time` would load large spatial tiles (1024×1024 grid cells) to recover a single point's value.

@@ -6,15 +6,21 @@ authors = ["Alex Gardner <alex.s.gardner@jpl.nasa.gov> and contributors"]
 [deps]
 Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
 DimensionalData = "0703355e-b756-11e9-17c0-8b28908087d0"
+Downloads = "f43a241f-c20a-4ad4-852c-f6b1247861c6"
 HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
+NCDatasets = "85f8d34a-cbdd-5861-8df4-14fed0d494ab"
 OpenSSL = "4d8831e6-92b7-49fb-bdf8-b643e874388c"
+Rasters = "a3a2b9e3-a471-40c9-b274-f788e487c689"
 Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 Zarr = "0a941bbe-ad1d-11e8-39d9-ab76183a1d99"
 
 [compat]
 DimensionalData = "0.30"
+Downloads = "1.7.0"
 HTTP = "1"
+NCDatasets = "0.14.15"
 OpenSSL = "1"
+Rasters = "0.15.0"
 Zarr = "0.9, 0.10"
 julia = "1.10"
 

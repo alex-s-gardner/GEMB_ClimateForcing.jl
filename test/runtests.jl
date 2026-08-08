@@ -3,6 +3,7 @@ using GEMB_ClimateForcing
 using Dates
 using Statistics
 using DimensionalData
+using Rasters
 
 println("="^70)
 println("GEMB_ClimateForcing.jl Test Suite")
@@ -23,6 +24,9 @@ println("="^70)
 
     # Include analytical physics cross-checks (offline)
     include("test_elevation_physics.jl")
+
+    # Include invariant-parameter tests (offline validation always; downloads opt-in)
+    include("test_invariant.jl")
 
     @testset "Input Validation" begin
         # Missing time_range
