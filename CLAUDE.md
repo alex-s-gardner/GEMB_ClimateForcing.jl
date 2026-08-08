@@ -27,6 +27,9 @@ julia --project=. -e 'using Pkg; Pkg.test()'
 # Run tests with CDS API key (includes integration tests)
 export CDS_API_KEY="your-token-here"
 julia --project=. -e 'using Pkg; Pkg.test()'
+
+# Run invariant-parameter download tests (no CDS token needed, fetches ~50 MB/file)
+GEMB_TEST_INVARIANT=1 julia --project=. -e 'using Pkg; Pkg.test()'
 ```
 
 ### Running Examples
