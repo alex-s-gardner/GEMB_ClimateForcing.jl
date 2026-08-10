@@ -47,6 +47,15 @@ const _INVARIANT_BASE_URL = Dict{Symbol,String}(
     :era5_land => _ERA5_LAND_INVARIANT_BASE,
 )
 
+# Models served not as ready-made global files but as tiled, extent-based rasters
+# (handled by dedicated loaders rather than the file registry above). See
+# `datasets/copernicus_dem.jl`.
+const _INVARIANT_EXTENT_MODELS = Set{Symbol}((:copernicus_dem_30m,))
+
+# All model symbols `climate_model_invariant` accepts, for validation/error messages.
+_invariant_supported_models() =
+    sort(collect(union(keys(_INVARIANT_REGISTRY), _INVARIANT_EXTENT_MODELS)))
+
 """
     _default_invariant_cache(model::Symbol) -> String
 
@@ -98,21 +107,29 @@ function _open_invariant_raster(path::String)
 end
 
 """
-    climate_model_invariant(; model=:era5_land, parameter=nothing,
+    climate_model_invariant(; model=:era5_land, parameter=nothing, extent=nothing,
                               cache_path=nothing, force_download=false)
 
 Load time-invariant (static) parameters for a climate model as **lazy** `Raster`s.
 
-Invariant fields (land–sea mask, geopotential/orography, vegetation, soil, lake,
-glacier) are not part of the time-series ARCO Zarr stores; ECMWF distributes them
-as ready-made global files on the ERA5-Land grid. This function downloads the
-requested file(s) once, caches them on disk, and opens them lazily — no array data
-is read until the returned raster is indexed, cropped, or `read`/`collect`ed.
+Two kinds of source are supported:
+
+- **File-based models** (e.g. `:era5_land`): invariant fields (land–sea mask,
+  geopotential/orography, vegetation, soil, lake, glacier) distributed as ready-made
+  global files. Selected with `parameter`; downloaded once, cached, opened lazily.
+- **Tiled, extent-based models** (e.g. `:copernicus_dem_30m`): a high-resolution DEM
+  served as Cloud-Optimized GeoTIFF tiles. Selected with `extent`; the covering tiles
+  are read over HTTP byte ranges (GDAL `/vsicurl/`) and mosaicked lazily — no full
+  tile is ever downloaded.
+
+In both cases no array data is read until the returned raster is indexed, cropped, or
+`read`/`collect`ed.
 
 # Keyword arguments
-- `model::Symbol=:era5_land`: source model. Currently only `:era5_land`.
-- `parameter::Union{Symbol,Nothing}=nothing`: which invariant to load, by GRIB
-  shortName.
+- `model::Symbol=:era5_land`: source model. `:era5_land` (file-based) or
+  `:copernicus_dem_30m` (extent-based, 30 m global DEM via AWS Open Data / ASF).
+- `parameter::Union{Symbol,Nothing}=nothing`: (file-based models) which invariant to
+  load, by GRIB shortName.
   - `nothing` (default) — load **all** available parameters and return a lazy
     `RasterStack`.
   - a single `Symbol` (e.g. `:lsm`, `:z`) — return a single lazy `Raster`.
@@ -120,21 +137,29 @@ is read until the returned raster is indexed, cropped, or `read`/`collect`ed.
   `:cl` (lake cover), `:dl` (lake depth), `:cvl`/`:cvh` (low/high vegetation
   cover), `:tvl`/`:tvh` (low/high vegetation type), `:slt` (soil type),
   `:glm` (glacier mask). See [`ERA5_LAND_INVARIANT_PARAMETERS`](@ref).
-- `cache_path::Union{String,Nothing}=nothing`: directory for the downloaded files.
-  Defaults to a per-model folder under `tempdir()`.
+- `extent=nothing`: lat/lon box to load, as an `Extents.Extent(X=(xmin,xmax),
+  Y=(ymin,ymax))` or a NamedTuple `(; X=(…), Y=(…))`. `nothing` (default) means the
+  **full data extent**. For the Copernicus DEM this is a lazy global mosaic of every
+  published land tile (built without opening any tile); for file-based models it means
+  the whole grid (no crop), and a given box crops lazily. Longitude convention follows
+  the model (see note below).
+- `cache_path::Union{String,Nothing}=nothing`: directory for downloaded files / the
+  DEM tile index. Defaults to a per-model folder under `tempdir()`.
 - `force_download::Bool=false`: re-download even if a cached file exists.
 
 # Returns
-- A lazy `Raster` (single `parameter`) or a lazy `RasterStack` (`parameter =
-  nothing`), with `X` (longitude) and `Y` (latitude) dimensions and CRS EPSG:4326.
+- File-based: a lazy `Raster` (single `parameter`) or a lazy `RasterStack`
+  (`parameter = nothing`).
+- Extent-based: a lazy `Raster` cropped to `extent`.
+Both carry `X` (longitude) and `Y` (latitude) dimensions and CRS EPSG:4326.
 
-!!! note "Longitude convention"
-    The ERA5-Land invariant grid uses **0–359.9°E** longitude (not −180…180) and
-    **descending** latitude (90→−90°N), matching the source files. Select longitude
-    in that 0–360 convention; the `X = a .. b` / `Y = a .. b` interval selector takes
-    `min .. max` regardless of the axis order, so pass `Y = 63 .. 67` for a box near
-    Iceland at `X = 335 .. 347` (≈ −25…−13°E). Geopotential `z` is in m² s⁻²; divide
-    by `9.80665` for orography (m).
+!!! note "Longitude convention differs by model"
+    The **ERA5-Land** invariant grid uses **0–359.9°E** longitude (not −180…180) and
+    **descending** latitude (90→−90°N); pass e.g. `Y = 63 .. 67` for a box near Iceland
+    at `X = 335 .. 347` (≈ −25…−13°E). Geopotential `z` is in m² s⁻²; divide by
+    `9.80665` for orography (m).
+    The **Copernicus DEM** uses standard **−180…180°E** longitude, so the same Iceland
+    box is `X = (-25, -13)`.
 
 # Examples
 ```julia
@@ -148,19 +173,43 @@ orography = z ./ 9.80665
 
 # Everything as a lazy stack.
 inv = climate_model_invariant()          # RasterStack with :lsm, :z, :cvl, ...
+
+# Copernicus 30 m DEM over a box in the Kenai Peninsula, Alaska (lazy).
+using Rasters   # for Extent / X / Y
+dem = climate_model_invariant(model=:copernicus_dem_30m,
+                              extent=Extent(X=(-150.0, -149.0), Y=(59.0, 60.0)))
+elev = read(dem)                          # only this window is fetched over HTTP
+
+# Full-extent (global) DEM as a lazy mosaic; crop before reading.
+gdem = climate_model_invariant(model=:copernicus_dem_30m)   # every published tile
+alps = read(gdem[X = 6 .. 11, Y = 45 .. 48])
 ```
 """
 function climate_model_invariant(;
     model::Symbol=:era5_land,
     parameter::Union{Symbol,Nothing}=nothing,
+    extent=nothing,
     cache_path::Union{String,Nothing}=nothing,
     force_download::Bool=false,
 )
-    haskey(_INVARIANT_REGISTRY, model) ||
+    (haskey(_INVARIANT_REGISTRY, model) || model in _INVARIANT_EXTENT_MODELS) ||
         throw(ArgumentError("Unsupported model $(repr(model)) for invariant parameters. " *
-                            "Supported: $(join(sort(collect(keys(_INVARIANT_REGISTRY))), ", "))"))
-    params = _INVARIANT_REGISTRY[model]
+                            "Supported: $(join(_invariant_supported_models(), ", "))"))
+
     cache = isnothing(cache_path) ? _default_invariant_cache(model) : cache_path
+
+    # Tiled, extent-based models (e.g. the Copernicus 30 m DEM) are handled by a
+    # dedicated loader. `extent === nothing` means the full data extent (the default).
+    if model in _INVARIANT_EXTENT_MODELS
+        isnothing(parameter) ||
+            throw(ArgumentError("model $(repr(model)) is extent-based and does not take " *
+                                "a `parameter`; pass `extent` (or omit it for full extent)."))
+        if model == :copernicus_dem_30m
+            return _load_copernicus_dem_30m(extent; cache_path=cache, force_download=force_download)
+        end
+    end
+
+    params = _INVARIANT_REGISTRY[model]
 
     println("Loading $(model) invariant parameter(s) as lazy Raster(s)...")
 
@@ -169,7 +218,7 @@ function climate_model_invariant(;
         names = sort(collect(keys(params)))
         rasters = map(names) do p
             path = _download_invariant(model, p; cache_path=cache, force=force_download)
-            _open_invariant_raster(path)
+            _crop_to_extent(_open_invariant_raster(path), extent)
         end
         stack = RasterStack(NamedTuple{Tuple(names)}(Tuple(rasters)))
         println("  ✓ Loaded $(length(names)) invariant parameters: $(join(names, ", "))")
@@ -179,8 +228,23 @@ function climate_model_invariant(;
             throw(ArgumentError("Unknown invariant parameter $(repr(parameter)) for $(model). " *
                                 "Available: $(join(sort(collect(keys(params))), ", "))"))
         path = _download_invariant(model, parameter; cache_path=cache, force=force_download)
-        r = _open_invariant_raster(path)
+        r = _crop_to_extent(_open_invariant_raster(path), extent)
         println("  ✓ Loaded $(parameter) as lazy Raster $(size(r))")
         return r
     end
+end
+
+"""
+    _crop_to_extent(raster, extent) -> raster
+
+Lazily crop a file-based invariant `Raster` to `extent` (an `Extents.Extent` or a
+`(; X, Y)` NamedTuple), or return it unchanged when `extent === nothing` (full extent).
+The `X = a .. b` selector takes `min .. max` regardless of axis order, so this works for
+the ERA5-Land grid's 0–360°E longitude and descending latitude.
+"""
+_crop_to_extent(raster, ::Nothing) = raster
+function _crop_to_extent(raster, extent)
+    x = extent.X
+    y = extent.Y
+    return view(raster, X=(minimum(x) .. maximum(x)), Y=(minimum(y) .. maximum(y)))
 end

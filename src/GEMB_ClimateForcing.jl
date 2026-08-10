@@ -42,6 +42,7 @@ include("utils.jl")
 include("authenticated_http_store.jl")
 include("interface.jl")
 include("datasets/era5_land.jl")
+include("datasets/copernicus_dem.jl")
 include("invariant.jl")
 include("elevation_adjustment.jl")
 
