@@ -408,6 +408,51 @@ function load_era5_land(
 end
 
 """
+    _coords_to_range(values::AbstractVector, name::AbstractString) -> AbstractRange
+
+Convert a regularly-spaced coordinate vector into a `range`. ERA5-Land coordinates are on a
+uniform 0.1° grid, so this recovers the exact step and returns a `range` whose lookup gets a
+`Regular` span (with finite bounds) instead of the `Irregular(nothing, nothing)` span that
+plain `Vector` lookups receive. Falls back to the original vector if the spacing is not
+uniform (within a small tolerance), so a non-regular grid still produces a valid — if
+`Irregular` — lookup rather than a silently wrong one.
+
+The stored coordinate values carry ~1e-11° of accumulated float round-off (e.g. the −179.9°
+cell arrives as −179.90000000000595). Anchoring the range on the raw endpoints would preserve
+that drift, so any raster built from a *different* file on the same nominal grid (e.g. the
+ERA5-Land invariant NetCDFs, whose coords are clean) fails DimensionalData's bit-exact lookup
+comparison in a broadcast. To avoid that, snap the step and the origin to the nominal grid
+(round the step to the ~1e-6° level, then round the origin to the nearest step multiple) so
+both code paths yield identical Float64 coordinates. The snapped range is still validated
+against the raw values within tolerance before it is trusted.
+"""
+function _coords_to_range(values::AbstractVector, name::AbstractString)
+    n = length(values)
+    n < 2 && return values
+    raw_step = (values[end] - values[1]) / (n - 1)
+    # Tolerance is a fraction of the nominal step; ERA5-Land steps are 0.1°.
+    tol = abs(raw_step) * 1e-6
+    # Snap step and origin to the nominal grid to strip sub-tol float drift, so this range
+    # matches other rasters built on the same grid (see docstring). digits=6 keeps ~1e-6°
+    # resolution — far finer than any real climate grid — while erasing the ~1e-11° noise.
+    # Round step and origin *independently*: a grid may be registered at a half-step offset
+    # (e.g. GPM IMERG cell centers at −179.95° on a 0.1° step), so the origin is NOT assumed
+    # to be a multiple of the step. Grids whose step/origin are not clean decimals at this
+    # precision (e.g. a genuine 1/3° step) fail the tolerance check below and fall back to a
+    # safe Irregular lookup rather than being snapped to a wrong grid.
+    step_size = round(raw_step; digits=6)
+    origin = round(values[1]; digits=6)
+    rng = range(origin; step=step_size, length=n)
+    if all(i -> abs(rng[i] - values[i]) <= tol, 1:n)
+        return rng
+    else
+        @warn "$(name) coordinates are not uniformly spaced or not on a clean decimal grid; \
+               using Irregular lookup" raw_step
+        return values
+    end
+end
+
+"""
     era5_land_chunk_map(; chunk_strategy, token, variable_group, cache_path) -> Raster{Int64}
 
 Return a global `Raster{Int64}` where each cell's value is a unique spatial chunk ID for
@@ -447,6 +492,14 @@ function era5_land_chunk_map(;
     # Read full coordinate vectors (no climate data read)
     lat_values = zg["latitude"][:]
     lon_values = zg["longitude"][:]
+
+    # ERA5-Land is a regular 0.1° grid. Convert the coordinate vectors to ranges so the
+    # Raster's lookups get a `Regular` span with finite bounds. Plain `Vector` lookups are
+    # assigned an `Irregular(nothing, nothing)` span, whose `bounds` are `nothing`; that
+    # makes `rasterize`/`Touches` selectors fail with `isless(::Nothing, ::Float64)` when
+    # they try to compute cell edges.
+    lon_range = _coords_to_range(lon_values, "longitude")
+    lat_range = _coords_to_range(lat_values, "latitude")
 
     # Chunk shape from Zarr array metadata.
     # Empirical on-disk order for these ARCO stores is (lon, lat, time),
@@ -492,10 +545,14 @@ function era5_land_chunk_map(;
         "total_spatial_chunks" => n_lon_chunks * n_lat_chunks,
     )
 
+    # ERA5-Land is on a plain geographic grid; tag it EPSG:4326 explicitly so downstream
+    # geospatial ops (resample, reproject, projected crops) have a CRS to work with instead
+    # of assuming one. The lon/lat ranges are already lon-major / descending-lat as stored.
     raster = Rasters.Raster(
         chunk_ids,
-        (Rasters.X(lon_values), Rasters.Y(lat_values));
+        (Rasters.X(lon_range), Rasters.Y(lat_range));
         name     = :chunk_id,
+        crs      = Rasters.EPSG(4326),
         metadata = meta,
     )
 
