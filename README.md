@@ -1,28 +1,15 @@
 # GEMB_ClimateForcing.jl
 
-Load climate forcing data from various reanalysis datasets and return a `DimStack` with climate variables. Seamlessly converts to [GEMB.jl](https://github.com/alex-s-gardner/GEMB.jl) `ClimateForcing` via package extension.
+Load climate forcing data as a `DimStack` of climate variables. Converts seamlessly to [GEMB.jl](https://github.com/alex-s-gardner/GEMB.jl) `ClimateForcing` via a package extension.
 
-## Features
+Pure Julia — no Python. Reanalysis data is read from Analysis-Ready, Cloud-Optimized (ARCO) Zarr stores over authenticated HTTPS, downloading only the requested time range and location (lazy loading).
 
-- **Pure Julia**: No Python dependencies - native Zarr.jl with authenticated HTTP access
-- **Unified Interface**: Single `climate_forcing()` function for all datasets
-- **Cloud-Optimized**: Direct access to ARCO (Analysis-Ready, Cloud-Optimized) Zarr stores via HTTPS
-- **Authenticated Access**: Bearer token authentication following Zarr.jl's GCStore pattern
-- **No Downloads**: Lazy loading of only requested time ranges and locations
-- **Elevation Downscaling**: Physically-based `climate_adjust_for_elevation()` for snow/ice surfaces with region-specific lapse rates (Glover 1999 / RACMO-based)
-- **DimensionalData Integration**: Zarr arrays automatically work with DimStack indexing
-- ⚡ **Parallel Loading**: Concurrent access to multiple variable groups for optimal performance
-- 🚀 **Chunk Caching**: Optional persistent disk cache via Zarr.CachingStore
-- **Extensible**: Easy to add new datasets (ERA5, MERRA-2, JRA-55, etc.)
+## Capabilities
 
-## Supported Datasets
-
-| Dataset | Symbol | Resolution | Coverage | Status |
-|---------|--------|------------|----------|--------|
-| ERA5-Land | `:era5land` | 0.1° (~9 km) | 1950-present | ✅ Implemented |
-| ERA5 | `:era5` | 0.25° (~25 km) | 1940-present | 🔜 Planned |
-| MERRA-2 | `:merra2` | 0.5° × 0.625° | 1980-present | 🔜 Planned |
-| JRA-55 | `:jra55` | 1.25° | 1958-present | 🔜 Planned |
+- **Reanalysis loading** — point time-series extraction from ERA5-Land ARCO Zarr stores (`climate_forcing`).
+- **Elevation downscaling** — physically-based per-variable correction of a forcing stack to a target elevation for snow/ice surfaces (`climate_adjust_for_elevation`).
+- **Invariant fields** — lazy `Raster`s for land–sea mask, geopotential/orography, vegetation/soil/lake, and a 30 m global DEM (`climate_model_invariant`).
+- **Chunk mapping** — visualize Zarr download locality before batch queries (`climate_chunk_map`).
 
 ## Installation
 
@@ -33,330 +20,149 @@ Pkg.develop(path="/path/to/GEMB_ClimateForcing.jl")
 
 ## Quick Start
 
-### 1. Get a CDS API Key
+ERA5-Land requires a free [CDS API key](https://cds.climate.copernicus.eu/). Register, copy your key, and set it in the environment:
 
-ERA5-Land requires a free API key from the Copernicus Climate Data Store:
-
-1. Register at [https://cds.climate.copernicus.eu/](https://cds.climate.copernicus.eu/)
-2. Go to your profile page
-3. Copy your API key
-4. Set environment variable:
-   ```bash
-   export CDS_API_KEY="your-token-here"
-   ```
-
-### 2. Load Climate Forcing
+```bash
+export CDS_API_KEY="your-token-here"
+```
 
 ```julia
 using GEMB_ClimateForcing
-using GEMB  # Extension automatically provides DimStack → ClimateForcing conversion
+using GEMB  # extension provides DimStack → ClimateForcing conversion
 using Dates
 
-# Load ERA5-Land for Summit, Greenland (returns DimStack)
+# Load ERA5-Land for Summit, Greenland (returns a DimStack)
 forcing_data = climate_forcing(
-    :era5land,           # Dataset
-    72.58, -38.46,       # Latitude, Longitude
+    :era5land, 72.58, -38.46;
     time_range=(DateTime(2020,1,1), DateTime(2020,12,31)),
-    token=ENV["CDS_API_KEY"]
+    token=ENV["CDS_API_KEY"],
 )
 
-# Convert to GEMB.ClimateForcing (extension method)
+# Convert to GEMB.ClimateForcing and run GEMB
 cf = GEMB.ClimateForcing(forcing_data)
-```
-
-### 3. Run GEMB
-
-```julia
-# Initialize model
 mp = GEMB.ModelParameters(output_frequency=:daily)
 profile = GEMB.initialize_profile(mp, cf)
-
-# Run simulation
 output = GEMB.gemb(profile, cf, mp)
 ```
+
+See `examples/era5_land_example.jl` for a complete workflow.
 
 ## API Reference
 
 ### `climate_forcing(dataset, lat, lon; kwargs...)`
 
-Load climate forcing data from specified dataset.
+Load climate forcing and return a `DimStack`.
 
-**Arguments:**
-- `dataset::Symbol` - Dataset identifier (`:era5land`, `:era5`, etc.)
-- `lat::Real` - Latitude in degrees [-90, 90]
-- `lon::Real` - Longitude in degrees [-180, 180] or [0, 360]
+- `dataset::Symbol` — `:era5land`
+- `lat::Real` — latitude [-90, 90]
+- `lon::Real` — longitude [-180, 180] or [0, 360]
 
-**Keyword Arguments:**
-- `time_range::Tuple{DateTime,DateTime}` - Time range to extract (required)
-- `token::Union{String,Nothing}` - API token for authentication (required for ERA5-Land)
-- `chunk_strategy::Symbol=:geo` - Chunking strategy (`:geo` or `:time`)
-  - `:geo` - Optimized for time-series extraction at a point (recommended)
-  - `:time` - Optimized for spatial maps
-- `cache_path::Union{String,Nothing}=nothing` - Path for persistent disk cache (Zarr.CachingStore)
+Keyword arguments:
 
-**Returns:**
-- `DimStack` - Stack with climate forcing variables as DimArrays:
-  - `temperature_air`, `pressure_air`, `vapor_pressure`, `wind_speed`,
-    `precipitation`, `shortwave_downward`, `longwave_downward`
-  - Metadata includes location info and observation heights
+- `time_range::Tuple{DateTime,DateTime}` — required
+- `token::Union{String,Nothing}` — CDS API key (required for ERA5-Land)
+- `chunk_strategy::Symbol=:geo` — `:geo` for point time-series (recommended), `:time` for spatial maps
+- `cache_path::Union{String,Nothing}=nothing` — persistent disk cache (`Zarr.CachingStore`)
 
-**Example:**
-```julia
-using GEMB_ClimateForcing
-using GEMB
+Returns a `DimStack` with `temperature_air`, `pressure_air`, `vapor_pressure`, `wind_speed`, `precipitation`, `shortwave_downward`, and `longwave_downward`, plus location and observation-height metadata.
 
-# Load data (returns DimStack)
-forcing_data = climate_forcing(
-    :era5land, 72.58, -38.46;
-    time_range=(DateTime(2020,1,1), DateTime(2021,1,1)),
-    token=ENV["CDS_API_KEY"],
-    chunk_strategy=:geo
-)
+### `climate_adjust_for_elevation(stack, delta_elevation; kwargs...)`
 
-# Convert to GEMB.ClimateForcing (requires GEMB.jl loaded)
-cf = GEMB.ClimateForcing(forcing_data)
-```
+Downscale a forcing `DimStack` (must have a `Ti` dimension) for the elevation difference between the reanalysis grid cell and a target point, using physically-based per-variable corrections for **snow/ice (glacier and ice-sheet) surfaces**.
 
-### `climate_adjust_for_elevation(climate_forcing_original, delta_elevation; kwargs...)`
-
-Adjust a climate-forcing `DimStack` for the difference in elevation between the
-reanalysis grid cell and a desired target elevation (downscaling). Reanalyses
-resolve topography only at their native (coarse) resolution, so a point of
-interest — an AWS, a glacier stake, or a high-resolution DEM cell — often sits
-at a substantially different elevation than the reanalysis surface. This
-function applies physically-based, per-variable corrections for **snow/ice
-(glacier and ice-sheet) surfaces**.
-
-**Arguments:**
-- `climate_forcing_original::DimStack` - forcing returned by `climate_forcing` (must have a `Ti` dimension)
-- `delta_elevation::Real` - `z_target − z_reanalysis` in metres (positive = target above the grid cell)
-
-**Keyword Arguments:**
-- `lapse_rate=6.5` - near-surface temperature lapse rate in **K/km** (positive = cooling with height). Accepts:
-  - a **scalar** (applied to all time steps; default `6.5`, the free-air value);
-  - a **length-12 vector** — monthly values, assumed ordered January (1) to December (12), indexed by each step's month;
-  - a **vector matching the climate-record length** — a per-time-step lapse rate.
-
-  Region-specific monthly tables are exported as named constants:
-  `GREENLAND_LAPSE_RATE` (Fausto 2009), `ARCTIC_LAPSE_RATE` (Gardner 2009),
-  `ANTARCTICA_LAPSE_RATE` (Fortuin & Oerlemans 1990). Use `empirical_lapse_rate`
-  to fit the rate locally from neighbouring grid cells (the RACMO gold-standard).
-- `precip_scaling_method=nothing` - precipitation elevation treatment:
-  - `nothing` (default) — precipitation unchanged (RACMO downscaling practice);
-  - `:clausius_clapeyron` — scale by `eₛ(T′)/eₛ(T)` (Glover 1999, Eq. 19): precip
-    decreases as air cools with elevation (ice-sheet "elevation-desert" effect).
-
-**Adjustments applied** (`Δz = delta_elevation`, `Γ` in K/km):
+- `delta_elevation::Real` — `z_target − z_reanalysis` in metres (positive = target above the grid cell)
+- `lapse_rate=6.5` — near-surface temperature lapse rate in **K/km**. Accepts a scalar, a length-12 monthly vector (Jan→Dec), or a per-time-step vector. Region-specific monthly tables are exported: `GREENLAND_LAPSE_RATE` (Fausto 2009), `ARCTIC_LAPSE_RATE` (Gardner 2009), `ANTARCTICA_LAPSE_RATE` (Fortuin & Oerlemans 1990). Use `empirical_lapse_rate` to fit the rate from neighbouring grid cells.
+- `precip_scaling_method=nothing` — `nothing` leaves precipitation unchanged (RACMO practice); `:clausius_clapeyron` scales by `eₛ(T′)/eₛ(T)` (Glover 1999, elevation-desert effect).
 
 | Variable | Adjustment | Key reference |
 |----------|-----------|---------------|
 | `temperature_air` | lapse `T − (Γ/1000)·Δz` | Glover 1999; Fausto 2009; Gardner 2009 |
-| `pressure_air` | hydrostatic `P·exp(−g·Δz/(R_d·T̄))` | Glover 1999; validated by Noël 2018 |
-| `vapor_pressure` | constant relative humidity, recomputed at `T′` (over-ice below 0 °C) | Glover 1999 (Eq. 20); Curry & Webster 1999 |
-| `longwave_downward` | Konzelmann (1994) clear-sky emissivity, preserving reanalysis cloud increment Δε | Konzelmann 1994; Fiddes & Gruber 2014 |
-| `shortwave_downward` | unchanged (elevation-attenuation ≲ few %/km; needs solar geometry) | — |
-| `precipitation` | unchanged, or Clausius–Clapeyron `×eₛ(T′)/eₛ(T)` if requested | Glover 1999 (Eq. 19) |
+| `pressure_air` | hydrostatic `P·exp(−g·Δz/(R_d·T̄))` | Glover 1999; Noël 2018 |
+| `vapor_pressure` | constant relative humidity, recomputed at `T′` | Glover 1999; Curry & Webster 1999 |
+| `longwave_downward` | Konzelmann (1994) clear-sky emissivity, preserving cloud increment Δε | Konzelmann 1994; Fiddes & Gruber 2014 |
+| `shortwave_downward` | unchanged | — |
+| `precipitation` | unchanged, or Clausius–Clapeyron `×eₛ(T′)/eₛ(T)` if requested | Glover 1999 |
 | `wind_speed` | unchanged | — |
 
-`Δz = 0` reproduces the input exactly. Physical-range validation is re-run on the result.
+`Δz = 0` reproduces the input exactly. Physical-range validation re-runs on the result.
 
-**Example:**
 ```julia
 stack = climate_forcing(:era5land, 72.58, -38.46;
                         time_range=(DateTime(2020,1,1), DateTime(2020,12,31)),
                         token=ENV["CDS_API_KEY"])
 
-# Downscale to a point 250 m above the grid cell, Greenland monthly lapse rates
+# Downscale 250 m above the grid cell with Greenland monthly lapse rates
 adjusted = climate_adjust_for_elevation(stack, 250.0; lapse_rate=GREENLAND_LAPSE_RATE)
 
-# A single locally-observed rate, plus elevation-desert precipitation scaling
-adjusted = climate_adjust_for_elevation(stack, 250.0;
-                                        lapse_rate=5.5,
-                                        precip_scaling_method=:clausius_clapeyron)
-
-# Gold-standard (RACMO-style): fit the local gradient from neighbouring grid
-# cells and use it instead of a climatological table (Noël et al. 2016, 2025)
+# Fit the local gradient from neighbouring cells (RACMO-style)
 Γ = empirical_lapse_rate(neighbour_T2m, neighbour_elevations)   # K/km
 adjusted = climate_adjust_for_elevation(stack, 250.0; lapse_rate=Γ)
 ```
 
-> **Precipitation phase.** Total precipitation is preserved by default, but
-> because temperature is elevation-cooled, a downstream temperature-based
-> rain/snow split (as GEMB applies) yields a larger *snow* fraction at higher,
-> colder targets. The RACMO2.3 downscaling studies (Noël et al. 2016, 2020,
-> 2022, 2025) likewise interpolate total precipitation with **no** elevation
-> correction — even over mountainous Patagonia — relying on the host model's
-> resolved orography.
-
-> **Scientific basis.** The per-variable scheme follows Glover (1999, *J.
-> Climate* 12, 551–563, Eqs. 15–20), which established these exact elevation
-> corrections for the Greenland ice sheet, and is the surface-field analogue of
-> TopoSCALE (Fiddes & Gruber, 2014); the full pressure-level interpolation is
-> unavailable because ERA5-Land exposes surface variables only. The corrections
-> are consistent with the RACMO2.3p2 studies of Noël et al. (2018, 2019).
-> Near-surface lapse rates over melting glaciers and ice sheets are markedly
-> shallower than the 6.5 K/km free-air default — a key reason to use a
-> region-specific table or a locally-fitted rate.
+> The scheme follows Glover (1999, *J. Climate* 12, 551–563, Eqs. 15–20) and is the surface-field analogue of TopoSCALE (Fiddes & Gruber 2014); it is consistent with the RACMO2.3p2 studies of Noël et al. (2018, 2019). Near-surface lapse rates over melting ice are markedly shallower than the 6.5 K/km free-air default, so prefer a region-specific table or a locally-fitted rate.
 
 ### `climate_model_invariant(; model, parameter, ...)`
 
-Load a climate model's **time-invariant** (static) parameters — land–sea mask,
-geopotential/orography, vegetation, soil, lake, glacier — as **lazy** `Raster`s.
-
-These fields are *not* in the time-series ARCO Zarr stores. ECMWF distributes them
-as ready-made global NetCDF files on the ERA5-Land 0.1° grid
-([data documentation](https://confluence.ecmwf.int/spaces/CKB/pages/140385202/ERA5-Land+data+documentation)).
-This function downloads the requested file(s) once, caches them on disk, and opens
-them lazily — no array data is read until the raster is indexed, cropped, or
-`read`/`collect`ed.
+Load a climate model's **time-invariant** fields as **lazy** `Raster`s — not present in the time-series Zarr stores. ECMWF distributes ERA5-Land invariants as global NetCDF files; they are downloaded once, cached, and opened lazily (no data read until indexed/cropped/collected).
 
 ```julia
 using GEMB_ClimateForcing, Rasters
 
-# Land-sea mask as a lazy Raster (fractional 0–1, incl. coastal cells).
-lsm = climate_model_invariant(parameter=:lsm)
-iceland = read(lsm[X = 335 .. 347, Y = 63 .. 67])   # crop then read
+lsm = climate_model_invariant(parameter=:lsm)          # land-sea mask (0–1)
+iceland = read(lsm[X = 335 .. 347, Y = 63 .. 67])      # crop then read
 
-# Orography (m) from geopotential.
-z = climate_model_invariant(parameter=:z)
-orography = z ./ 9.80665
+z = climate_model_invariant(parameter=:z)              # geopotential (m² s⁻²)
+orography = z ./ 9.80665                                # elevation in metres
 
-# Everything at once, as a lazy RasterStack.
-inv = climate_model_invariant()                      # :lsm, :z, :cvl, :cvh, ...
+inv = climate_model_invariant()                         # all params as a lazy RasterStack
 ```
 
-Available ERA5-Land parameters (GRIB shortName): `:lsm` (land-sea mask), `:z`
-(geopotential), `:cl` (lake cover), `:dl` (lake depth), `:cvl`/`:cvh` (low/high
-vegetation cover), `:tvl`/`:tvh` (low/high vegetation type), `:slt` (soil type),
-`:glm` (glacier mask). See `ERA5_LAND_INVARIANT_PARAMETERS`.
+Available ERA5-Land parameters (GRIB shortName): `:lsm`, `:z`, `:cl` (lake cover), `:dl` (lake depth), `:cvl`/`:cvh` (low/high vegetation cover), `:tvl`/`:tvh` (low/high vegetation type), `:slt` (soil type), `:glm` (glacier mask). See `ERA5_LAND_INVARIANT_PARAMETERS`.
 
-> **Grid convention.** The invariant grid uses **0–359.9°E** longitude and
-> **descending** latitude (90→−90°N). The `X = a .. b` / `Y = a .. b` selector takes
-> `min .. max` regardless of axis order. Geopotential `z` is in m² s⁻²; divide by
-> `9.80665` for orography in metres.
+The 30 m global Copernicus DEM is available via `model=:copernicus_dem_30m`, served from Cloud-Optimized GeoTIFFs with byte-range reads (tiles are never downloaded in full):
 
-The land-sea mask and geopotential are useful for restricting an analysis to land
-cells and for the elevation-downscaling workflow: `z / 9.80665` gives the
-reanalysis surface elevation (the `z_reanalysis` in `Δz = z_target − z_reanalysis`
-passed to [`climate_adjust_for_elevation`](#climate_adjust_for_elevationclimate_forcing_original-delta_elevation-kwargs)),
-and neighbouring land-cell elevations feed
-[`empirical_lapse_rate`](#empirical_lapse_ratevalues-elevations).
+```julia
+dem = climate_model_invariant(model=:copernicus_dem_30m,
+                              extent=Extents.Extent(X=(-38.5, -38.0), Y=(72.5, 72.8)))
+```
+
+> **Grid convention.** ERA5-Land invariants use **0–359.9°E** longitude and **descending** latitude (90→−90°N). The `X = a .. b` / `Y = a .. b` selector takes `min .. max` regardless of axis order.
 
 ## ERA5-Land Details
 
-### Variables
+Data is read from ECMWF's ARCO Zarr stores at `arco.datastores.ecmwf.int`. Variables are loaded from four store groups and converted for GEMB:
 
-GEMB_ClimateForcing automatically loads and converts the following ERA5-Land variables:
+| Store group | Raw variables | Derived output |
+|---|---|---|
+| `sfc-2m-temperature` | `t2m`, `d2m` | `temperature_air` (K), `vapor_pressure` (Pa via dewpoint) |
+| `sfc-pressure-precipitation` | `sp`, `tp` | `pressure_air` (Pa), `precipitation` (kg/m² = `tp`×1000) |
+| `sfc-wind` | `u10`, `v10` | `wind_speed` (m/s magnitude) |
+| `sfc-radiation-heat` | `ssrd`, `strd` | `shortwave_downward`, `longwave_downward` (W/m² = J/m² ÷ 3600) |
 
-| ERA5-Land Variable | GEMB Variable | Units | Conversion |
-|-------------------|---------------|-------|------------|
-| `t2m` | `temperature_air` | K | Direct |
-| `d2m` | `vapor_pressure` | Pa | Via dewpoint formula |
-| `sp` | `pressure_air` | Pa | Direct |
-| `tp` | `precipitation` | kg/m² | Multiply by 1000 |
-| `u10`, `v10` | `wind_speed` | m/s | Magnitude |
-| `ssrd` | `shortwave_downward` | W/m² | Divide by 3600 |
-| `strd` | `longwave_downward` | W/m² | Divide by 3600 |
+Grid: 0.1° (~9 km), 1801 × 3600 (lat × lon), hourly, 1950–present.
 
-### Data Source
+**Chunk layout** (storage order `time × lat × lon`):
 
-ERA5-Land data is accessed from ECMWF's cloud-optimized ARCO Zarr stores:
-```
-https://arco.datastores.ecmwf.int/cadl-arco-{geo|time}-{store-id}/arco/reanalysis_era5_land/...
-```
+| Strategy | time chunk | lat chunk | lon chunk | Optimized for |
+|---|---|---|---|---|
+| `:geo` (default) | 33,792 | 4 | 8 | Point time-series (~3.85 years/chunk, tiny spatial footprint) |
+| `:time` | 1 | 1,024 | 1,024 | Spatial maps (one timestep, ~103°×103° tile) |
 
-### Pure Julia Implementation
+`:geo` is strongly preferred for single-point simulations: a multi-decade series at one location reads only a handful of chunks, whereas `:time` would load 1024×1024 tiles to recover a single point.
 
-GEMB_ClimateForcing uses pure Julia components:
-- **Zarr.jl** (v0.10+) for reading cloud-optimized Zarr arrays
-- **AuthenticatedHTTPStore** - Custom store following GCStore pattern for Bearer token auth
-- **HTTP.jl** + **OpenSSL.jl** for HTTPS requests with custom headers
-- **DimensionalData.jl** for dimension-aware array indexing (already used by GEMB.jl)
-
-No PythonCall or xarray required!
-
-### Performance
-
-**Characteristics:**
-- First data load: ~10-25 seconds (1 year of hourly data)
-- Parallel loading of 4 variable groups provides 1.5-2x speedup
-- **Disk caching**: With `cache_path`, subsequent loads skip network entirely
-- Memory: only requested time/location downloaded (lazy loading)
-
-**Tips:**
-- **Use geo-chunked strategy** (default) for extracting time-series at single points
-- **Use time-chunked strategy** when extracting spatial maps
-- **Enable disk caching** with `cache_path` for repeated access to the same data across sessions
-- Cache persists on disk - subsequent Julia sessions benefit without re-downloading
-
-## Examples
-
-See `examples/era5_land_example.jl` for a complete working example including:
-- Loading ERA5-Land forcing
-- Running GEMB with spinup
-- Analyzing results
-
-Run with:
-```bash
-export CDS_API_KEY="your-token-here"
-julia --project=. examples/era5_land_example.jl
-```
-
-## Adding New Datasets
-
-To add support for a new dataset:
-
-1. Create `src/datasets/your_dataset.jl`
-2. Implement `load_your_dataset(lat, lon; kwargs...)` function
-3. Add to dispatch in `src/interface.jl`
-4. Update README with dataset details
-
-See `src/datasets/era5_land.jl` for a template implementation.
+**Performance.** First load ~10–25 s for a year of hourly data; parallel loading of the four groups gives a 1.5–2× speedup. With `cache_path`, subsequent loads (including in later Julia sessions) skip the network entirely.
 
 ## Citation
 
 If you use ERA5-Land data, please cite:
 
-> Muñoz Sabater, J., (2019): ERA5-Land hourly data from 1950 to present. Copernicus Climate Change Service (C3S) Climate Data Store (CDS). DOI: [10.24381/cds.e2161bac](https://doi.org/10.24381/cds.e2161bac)
+> Muñoz Sabater, J. (2019): ERA5-Land hourly data from 1950 to present. Copernicus Climate Change Service (C3S) Climate Data Store (CDS). DOI: [10.24381/cds.e2161bac](https://doi.org/10.24381/cds.e2161bac)
 
 ## License
 
-MIT License - see LICENSE file for details
+MIT License — see LICENSE file for details.
 
 ## Related Projects
 
-- [GEMB.jl](https://github.com/alex-s-gardner/GEMB.jl) - Glacier Energy and Mass Balance model
-- [ERA5-Land](https://cds.climate.copernicus.eu/datasets/reanalysis-era5-land) - Dataset information
-
-## About Datasets
-
-### ERA5-Land (ECMWF ARCO Zarr)
-
-Climate forcing data is sourced from the [ERA5-Land reanalysis](https://cds.climate.copernicus.eu/datasets/reanalysis-era5-land) via ECMWF's Analysis-Ready, Cloud-Optimized (ARCO) Zarr stores hosted at `arco.datastores.ecmwf.int`. Access requires a free [CDS API key](https://cds.climate.copernicus.eu/api-how-to).
-
-**Grid and temporal coverage:**
-
-| Property | Value |
-|---|---|
-| Spatial resolution | 0.1° (~9 km) |
-| Grid size | 1801 × 3600 (lat × lon) |
-| Temporal resolution | Hourly |
-| Time coverage | 1940–present (~671,000 time steps) |
-
-**Variables loaded** (from 4 separate Zarr store groups):
-
-| Store group | Raw variables | Derived output |
-|---|---|---|
-| `sfc-2m-temperature` | `t2m`, `d2m` | `temperature_air` (K), `vapor_pressure` (Pa) |
-| `sfc-pressure-precipitation` | `sp`, `tp` | `pressure_air` (Pa), `precipitation` (kg/m²/hr) |
-| `sfc-wind` | `u10`, `v10` | `wind_speed` (m/s) |
-| `sfc-radiation-heat` | `ssrd`, `strd` | `shortwave_downward` (W/m²), `longwave_downward` (W/m²) |
-
-**Chunk layout** (storage order: `time × lat × lon`):
-
-| Strategy | time chunk | lat chunk | lon chunk | Optimized for |
-|---|---|---|---|---|
-| `:geo` (default) | 33,792 | 4 | 8 | Point time-series — ~3.85 years per chunk, tiny spatial footprint |
-| `:time` | 1 | 1,024 | 1,024 | Spatial maps — one timestep, ~103°×103° tile |
-
-The `:geo` strategy is strongly preferred for single-point simulations: extracting a full multi-decade time series at one location reads only a handful of chunks, whereas `:time` would load large spatial tiles (1024×1024 grid cells) to recover a single point's value.
+- [GEMB.jl](https://github.com/alex-s-gardner/GEMB.jl) — Glacier Energy and Mass Balance model
+- [ERA5-Land](https://cds.climate.copernicus.eu/datasets/reanalysis-era5-land) — dataset information
