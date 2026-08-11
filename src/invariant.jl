@@ -98,12 +98,22 @@ end
 
 Open a single invariant NetCDF file as a lazy 2-D (`X`, `Y`) `Raster`. The stored
 files carry a singleton `time` axis; it is dropped so the result is purely spatial.
+X and Y coordinates are rounded to 13 decimal places to eliminate floating-point noise.
 """
 function _open_invariant_raster(path::String)
     # lazy=true keeps the data disk-backed; only metadata/coords are read now.
     r = Raster(path; lazy=true)
     # Drop the singleton time dimension if present, keeping the raster lazy.
-    return hasdim(r, Ti) ? view(r, Ti(1)) : r
+    r = hasdim(r, Ti) ? view(r, Ti(1)) : r
+    # Round X/Y coords to 13 decimal places to eliminate floating-point noise. The
+    # lookup is a lazy, immutable range, so rebuild it with a materialized rounded
+    # vector (keyword `data=` preserves the lookup's CRS/order/span metadata).
+    new_dims = map(dims(r)) do d
+        d isa Union{X,Y} || return d
+        lk = lookup(d)
+        rebuild(d, rebuild(lk; data=round.(parent(lk); digits=13)))
+    end
+    return rebuild(r; dims=new_dims)
 end
 
 """
@@ -146,6 +156,8 @@ In both cases no array data is read until the returned raster is indexed, croppe
 - `cache_path::Union{String,Nothing}=nothing`: directory for downloaded files / the
   DEM tile index. Defaults to a per-model folder under `tempdir()`.
 - `force_download::Bool=false`: re-download even if a cached file exists.
+- `verbose::Bool=true`: print progress/status messages. Set `false` to silence all
+  output (useful when loading many extents in a loop).
 
 # Returns
 - File-based: a lazy `Raster` (single `parameter`) or a lazy `RasterStack`
@@ -191,6 +203,7 @@ function climate_model_invariant(;
     extent=nothing,
     cache_path::Union{String,Nothing}=nothing,
     force_download::Bool=false,
+    verbose::Bool=true,
 )
     (haskey(_INVARIANT_REGISTRY, model) || model in _INVARIANT_EXTENT_MODELS) ||
         throw(ArgumentError("Unsupported model $(repr(model)) for invariant parameters. " *
@@ -205,13 +218,14 @@ function climate_model_invariant(;
             throw(ArgumentError("model $(repr(model)) is extent-based and does not take " *
                                 "a `parameter`; pass `extent` (or omit it for full extent)."))
         if model == :copernicus_dem_30m
-            return _load_copernicus_dem_30m(extent; cache_path=cache, force_download=force_download)
+            return _load_copernicus_dem_30m(extent; cache_path=cache,
+                                            force_download=force_download, verbose=verbose)
         end
     end
 
     params = _INVARIANT_REGISTRY[model]
 
-    println("Loading $(model) invariant parameter(s) as lazy Raster(s)...")
+    verbose && println("Loading $(model) invariant parameter(s) as lazy Raster(s)...")
 
     if parameter === nothing
         # Load every available parameter into a lazy RasterStack.
@@ -221,7 +235,7 @@ function climate_model_invariant(;
             _crop_to_extent(_open_invariant_raster(path), extent)
         end
         stack = RasterStack(NamedTuple{Tuple(names)}(Tuple(rasters)))
-        println("  ✓ Loaded $(length(names)) invariant parameters: $(join(names, ", "))")
+        verbose && println("  ✓ Loaded $(length(names)) invariant parameters: $(join(names, ", "))")
         return stack
     else
         haskey(params, parameter) ||
@@ -229,7 +243,7 @@ function climate_model_invariant(;
                                 "Available: $(join(sort(collect(keys(params))), ", "))"))
         path = _download_invariant(model, parameter; cache_path=cache, force=force_download)
         r = _crop_to_extent(_open_invariant_raster(path), extent)
-        println("  ✓ Loaded $(parameter) as lazy Raster $(size(r))")
+        verbose && println("  ✓ Loaded $(parameter) as lazy Raster $(size(r))")
         return r
     end
 end
