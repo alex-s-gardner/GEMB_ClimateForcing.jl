@@ -27,6 +27,7 @@ module GEMB_ClimateForcing
 
 using Dates
 using DimensionalData
+using Random
 using Statistics
 using Zarr
 using HTTP
@@ -37,6 +38,14 @@ export climate_forcing, climate_chunk_map, get_cds_api_key, climate_adjust_for_e
     empirical_lapse_rate, climate_model_invariant, ERA5_LAND_INVARIANT_PARAMETERS,
     GREENLAND_LAPSE_RATE, ARCTIC_LAPSE_RATE, ANTARCTICA_LAPSE_RATE
 
+# Export synthetic forcing and climate fitting
+export simulate_climate_forcing, simulation_parameter_sets, forcing_climatology,
+    datetime2decyear, decyear2datetime,
+    dewpoint_to_vapor_pressure, vapor_pressure_to_relative_humidity,
+    relative_humidity_to_vapor_pressure,
+    fit_air_temperature, fit_precipitation, fit_longwave_irradiance_delta,
+    fit_seasonal_daily_noise, varname2longname, simulate_coeffs_disp
+
 # Include submodules
 include("utils.jl")
 include("authenticated_http_store.jl")
@@ -45,5 +54,17 @@ include("datasets/era5_land.jl")
 include("datasets/copernicus_dem.jl")
 include("invariant.jl")
 include("elevation_adjustment.jl")
+
+# Synthetic forcing generation
+include("simulate/simulate_climate_forcing.jl")
+include("forcing_climatology.jl")
+
+# Climate fitting functions
+include("fit_climate/fit_air_temperature.jl")
+include("fit_climate/fit_precipitation.jl")
+include("fit_climate/fit_longwave_irradiance_delta.jl")
+include("fit_climate/fit_seasonal_daily_noise.jl")
+include("fit_climate/varname2longname.jl")
+include("fit_climate/simulate_coeffs_disp.jl")
 
 end # module

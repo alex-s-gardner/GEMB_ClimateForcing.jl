@@ -88,12 +88,12 @@ _copernicus_dem_vsicurl(id::AbstractString) = "/vsicurl/" * _copernicus_dem_tile
 Download the published `tileList.txt` once (cached under `cache_path`), and return the
 set of tile stems that actually exist. Reuses the download-to-`.part`-then-`mv` idiom.
 """
-function _copernicus_dem_tile_index(; cache_path::String, force::Bool)
+function _copernicus_dem_tile_index(; cache_path::String, force::Bool, verbose::Bool=true)
     mkpath(cache_path)
     local_path = joinpath(cache_path, "tileList.txt")
     if force || !isfile(local_path)
-        println("  Downloading Copernicus DEM tile index")
-        println("    $(_COPERNICUS_DEM_30M_TILELIST_URL)")
+        verbose && println("  Downloading Copernicus DEM tile index")
+        verbose && println("    $(_COPERNICUS_DEM_30M_TILELIST_URL)")
         tmp = local_path * ".part"
         try
             Downloads.download(_COPERNICUS_DEM_30M_TILELIST_URL, tmp)
@@ -248,19 +248,19 @@ tiles are opened** to build it — so even the global default is cheap to constr
 single covering tile is opened directly at native resolution. Reads go through GDAL
 `/vsicurl/`, so nothing is fetched until the raster is indexed/cropped/`read`.
 """
-function _load_copernicus_dem_30m(extent; cache_path::String, force_download::Bool)
+function _load_copernicus_dem_30m(extent; cache_path::String, force_download::Bool, verbose::Bool=true)
     _configure_gdal_http()
-    index = _copernicus_dem_tile_index(; cache_path=cache_path, force=force_download)
+    index = _copernicus_dem_tile_index(; cache_path=cache_path, force=force_download, verbose=verbose)
 
     if extent === nothing
         # Full data extent: every published tile.
         ids = sort!(collect(index))
         xmin, xmax, ymin, ymax = -180.0, 180.0, -90.0, 90.0
-        println("  Copernicus DEM: full data extent ($(length(ids)) tiles)")
+        verbose && println("  Copernicus DEM: full data extent ($(length(ids)) tiles)")
     else
         xmin, xmax, ymin, ymax = _copernicus_dem_extent(extent)
         ids = _copernicus_dem_tiles_for_extent(xmin, xmax, ymin, ymax, index)
-        println("  Copernicus DEM: $(length(ids)) tile(s) cover the requested extent")
+        verbose && println("  Copernicus DEM: $(length(ids)) tile(s) cover the requested extent")
     end
 
     if length(ids) == 1
