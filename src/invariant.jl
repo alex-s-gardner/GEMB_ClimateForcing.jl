@@ -173,15 +173,23 @@ Both carry `X` (longitude) and `Y` (latitude) dimensions and CRS EPSG:4326.
     The **Copernicus DEM** uses standard **−180…180°E** longitude, so the same Iceland
     box is `X = (-25, -13)`.
 
+!!! tip "Accurate height above the WGS84 ellipsoid"
+    `z ./ 9.80665` is only a crude geopotential height (constant gravity, sea-level datum).
+    For a true geometric **height above the WGS84 ellipsoid**, pass the `:z` raster to
+    [`geopotential2height`](@ref), which applies latitude-dependent gravity/radius and adds
+    the geoid undulation streamed from the PROJ CDN.
+
 # Examples
 ```julia
 # Land-sea mask as a lazy Raster; nothing is read until you crop/collect it.
 lsm = climate_model_invariant(parameter=:lsm)
 iceland = read(lsm[X = 335 .. 347, Y = 63 .. 67])   # fractional 0–1 land cover
 
-# Orography (m) from geopotential.
+# Orography (m) from geopotential (crude, constant-gravity approximation).
 z = climate_model_invariant(parameter=:z)
 orography = z ./ 9.80665
+# Accurate height above the WGS84 ellipsoid (latitude-dependent gravity + streamed geoid).
+h_ellipsoidal = geopotential2height(read(z[X = 335 .. 347, Y = 63 .. 67]))
 
 # Everything as a lazy stack.
 inv = climate_model_invariant()          # RasterStack with :lsm, :z, :cvl, ...
