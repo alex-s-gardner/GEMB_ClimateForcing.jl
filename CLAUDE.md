@@ -120,8 +120,10 @@ julia --project=. examples/test_authentication.jl
      `DimStack` from a named parameter set (`simulation_parameter_sets`, e.g. `"test_1"`), seeded
      RNG (`MersenneTwister`) for MATLAB-matching reproducibility.
    - Time↔decimal-year helpers `datetime2decyear` / `decyear2datetime` live here.
-   - `src/forcing_climatology.jl` — `forcing_climatology(ds[, range])` averages complete years
-     (drops leap day 366 and partial years) into a one-year climatological forcing.
+   - Climatological averaging (`forcing_climatology`) lives in **GEMB.jl**, not here — it
+     operates on GEMB's `ClimateForcing` type (drops leap day 366 and partial years, averaging
+     complete years into a one-year cycle). Convert a `DimStack` with `GEMB.ClimateForcing(ds)`
+     first.
 
 9. **`src/fit_climate/`** - Parameter fitting (workflow 4, inverse of simulate)
    - `fit_air_temperature`, `fit_precipitation`, `fit_longwave_irradiance_delta`,
@@ -243,7 +245,7 @@ Tests use conditional integration testing:
 ## JuliaGeo Integration
 
 - **DimensionalData.jl** — all forcing output is a `DimStack`; the `Ti` (time) dimension is
-  required by `climate_adjust_for_elevation` and `forcing_climatology`.
+  required by `climate_adjust_for_elevation` (and by GEMB.jl's `forcing_climatology`).
 - **Rasters.jl** — invariant fields and the DEM are returned as lazy `Raster`/`RasterStack`
   (backends: `RastersNCDatasetsExt` via NCDatasets, `RastersArchGDALExt` via ArchGDAL).
 - **GDAL** (via ArchGDAL) — `/vsicurl/` remote COG reads for the Copernicus DEM.
