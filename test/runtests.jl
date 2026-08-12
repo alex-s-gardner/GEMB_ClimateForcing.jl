@@ -74,6 +74,9 @@ println("="^70)
     # Include Copernicus DEM tests (offline logic always; /vsicurl/ reads opt-in via GEMB_TEST_COPERNICUS_DEM=1)
     include("test_copernicus_dem.jl")
 
+    # Include geoid / geopotential2height tests (offline physics always; streamed geoid opt-in via GEMB_TEST_GEOID=1)
+    include("test_geoid.jl")
+
     @testset "Input Validation" begin
         # Missing time_range
         @test_throws ArgumentError climate_forcing(:era5land, 72.0, -38.0)

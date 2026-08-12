@@ -45,6 +45,8 @@ offline by default:
 - `GEMB_TEST_INVARIANT=1` — enables ERA5-Land invariant NetCDF downloads
 - `GEMB_TEST_CHUNK_MAP=1` — enables `climate_chunk_map` integration
 - `GEMB_TEST_COPERNICUS_DEM=1` — enables Copernicus DEM `/vsicurl/` reads
+- `GEMB_TEST_GEOID=1` — enables streaming the EGM96 geoid grid (`/vsicurl/`) for
+  `geopotential2height`
 
 There is no per-file test runner; run a single suite by editing `include`s in
 `test/runtests.jl` or invoking the file directly with the package loaded.

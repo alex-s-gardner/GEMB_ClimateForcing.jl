@@ -44,7 +44,8 @@ export simulate_climate_forcing, simulation_parameter_sets, forcing_climatology,
     dewpoint_to_vapor_pressure, vapor_pressure_to_relative_humidity,
     relative_humidity_to_vapor_pressure,
     fit_air_temperature, fit_precipitation, fit_longwave_irradiance_delta,
-    fit_seasonal_daily_noise, varname2longname, simulate_coeffs_disp
+    fit_seasonal_daily_noise, varname2longname, simulate_coeffs_disp,
+    geopotential2height, geoid_undulation, GEOID_MODELS
 
 # Include submodules
 include("utils.jl")
@@ -52,6 +53,7 @@ include("authenticated_http_store.jl")
 include("interface.jl")
 include("datasets/era5_land.jl")
 include("datasets/copernicus_dem.jl")
+include("geoid.jl")
 include("invariant.jl")
 include("elevation_adjustment.jl")
 
