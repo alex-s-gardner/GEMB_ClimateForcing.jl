@@ -437,6 +437,10 @@ function climate_adjust_for_elevation(
     z_reanalysis = get(src_meta, "elevation", nothing)
     new_meta = merge(copy(src_meta), Dict(
         "delta_elevation" => Δz,
+        # Cumulative elevation offset relative to the source reanalysis, so
+        # repeated adjustments compose. Surfaced downstream (via `initialize_forcing`)
+        # in GEMB output metadata and diagnostic plots.
+        "elevation_offset" => get(src_meta, "elevation_offset", 0.0) + Δz,
         "precip_scaling_method" => string(precip_scaling_method),
         "temperature_air_mean" => Statistics.mean(T′),
         "precipitation_mean" => Statistics.mean(precip′) * 8760.0,
