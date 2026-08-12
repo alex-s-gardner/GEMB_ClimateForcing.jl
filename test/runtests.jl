@@ -43,19 +43,6 @@ println("="^70)
         @test parent(ds[:precipitation]) == parent(ds2[:precipitation])
     end
 
-    # Include forcing climatology tests (offline)
-    @testset "Forcing Climatology" begin
-        ds = simulate_climate_forcing("test_1", 3)
-        ds_clim = forcing_climatology(ds)
-        @test ds_clim isa DimStack
-        # One year of steps: 365 days × 8 steps/day = 2920
-        n_steps = length(dims(ds_clim, Ti))
-        @test n_steps == 2920
-        # Metadata carried forward
-        @test haskey(metadata(ds_clim), "temperature_air_mean")
-        @test haskey(metadata(ds_clim), "precipitation_mean")
-    end
-
     # Include unit validation tests
     include("test_unit_validation.jl")
 

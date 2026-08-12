@@ -39,7 +39,7 @@ export climate_forcing, climate_chunk_map, get_cds_api_key, climate_adjust_for_e
     GREENLAND_LAPSE_RATE, ARCTIC_LAPSE_RATE, ANTARCTICA_LAPSE_RATE
 
 # Export synthetic forcing and climate fitting
-export simulate_climate_forcing, simulation_parameter_sets, forcing_climatology,
+export simulate_climate_forcing, simulation_parameter_sets,
     datetime2decyear, decyear2datetime,
     dewpoint_to_vapor_pressure, vapor_pressure_to_relative_humidity,
     relative_humidity_to_vapor_pressure,
@@ -59,7 +59,6 @@ include("elevation_adjustment.jl")
 
 # Synthetic forcing generation
 include("simulate/simulate_climate_forcing.jl")
-include("forcing_climatology.jl")
 
 # Climate fitting functions
 include("fit_climate/fit_air_temperature.jl")
