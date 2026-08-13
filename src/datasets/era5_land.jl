@@ -220,14 +220,14 @@ function load_era5_land(
 
     start_time, end_time = time_range
 
-    println("Loading ERA5-Land data from cloud-optimized Zarr stores (pure Julia)...")
-    println("  Location: $(lat)°N, $(lon)°E")
-    println("  Time range: $(start_time) to $(end_time)")
-    println("  Chunk strategy: $(chunk_strategy)")
+    @info "Loading ERA5-Land data from cloud-optimized Zarr stores (pure Julia)..."
+    @info "Location: $(lat)°N, $(lon)°E"
+    @info "Time range: $(start_time) to $(end_time)"
+    @info "Chunk strategy: $(chunk_strategy)"
 
     try
         # Create authenticated stores for each variable group
-        println("  Creating authenticated HTTP stores...")
+        @info "Creating authenticated HTTP stores..."
 
         url_temp = era5_land_url("sfc-2m-temperature", chunk_strategy)
         url_precip = era5_land_url("sfc-pressure-precipitation", chunk_strategy)
@@ -247,11 +247,11 @@ function load_era5_land(
             store_precip = Zarr.CachingStore(store_precip, Zarr.DirectoryStore(joinpath(cache_path, "sfc-pressure-precipitation")))
             store_wind = Zarr.CachingStore(store_wind, Zarr.DirectoryStore(joinpath(cache_path, "sfc-wind")))
             store_rad = Zarr.CachingStore(store_rad, Zarr.DirectoryStore(joinpath(cache_path, "sfc-radiation-heat")))
-            println("  Using disk cache: $(cache_path)")
+            @info "Using disk cache: $(cache_path)"
         end
 
         # Open Zarr groups in parallel (highest impact for performance)
-        println("  Opening Zarr groups in parallel...")
+        @info "Opening Zarr groups in parallel..."
         zarr_groups = @sync begin
             t1 = @spawn Zarr.zopen(store_temp, consolidated=true, fill_as_missing=false)
             t2 = @spawn Zarr.zopen(store_precip, consolidated=true, fill_as_missing=false)
@@ -262,7 +262,7 @@ function load_era5_land(
         zg_temp, zg_precip, zg_wind, zg_rad = zarr_groups
 
         # Access individual arrays
-        println("  Accessing variables...")
+        @info "Accessing variables..."
         t2m_zarr = zg_temp["t2m"]
         d2m_zarr = zg_temp["d2m"]
         sp_zarr = zg_precip["sp"]
@@ -273,7 +273,7 @@ function load_era5_land(
         strd_zarr = zg_rad["strd"]
 
         # Get coordinate arrays
-        println("  Reading coordinates...")
+        @info "Reading coordinates..."
         # ERA5-Land coordinates: time, latitude, longitude
         # Dimensions are (time, latitude, longitude)
 
@@ -289,15 +289,14 @@ function load_era5_land(
         epoch = DateTime(epoch_match.captures[1])
 
         # Find nearest lat/lon indices
-        println("  Finding nearest grid point...")
+        @info "Finding nearest grid point..."
         lat_idx = find_nearest_index(lat_values, lat)
         lon_idx = find_nearest_index(lon_values, lon)
 
         selected_lat = lat_values[lat_idx]
         selected_lon = lon_values[lon_idx]
 
-        println("    Requested: $(lat)°N, $(lon)°E")
-        println("    Nearest: $(selected_lat)°N, $(selected_lon)°E")
+        @info "Selected grid point" requested="$(lat)°N, $(lon)°E" nearest="$(selected_lat)°N, $(selected_lon)°E"
 
         # Find time range indices by comparing in the axis's native numeric unit
         # (hours since epoch). Only the two requested bounds are converted, avoiding a
@@ -315,7 +314,7 @@ function load_era5_land(
         # Build DateTime values only for the selected slice.
         selected_times = [epoch + Hour(round(Int, time_values_raw[i])) for i in time_slice]
 
-        println("  Extracting $(length(selected_times)) time steps in parallel...")
+        @info "Extracting $(length(selected_times)) time steps in parallel..."
 
         # Extract data for selected point and time range in parallel
         # ERA5-Land ARCO Zarr actual storage order: (longitude, latitude, time)
@@ -337,7 +336,7 @@ function load_era5_land(
         t2m_raw, d2m_raw, sp_raw, precipitation_raw,
             u10, v10, shortwave_raw, longwave_raw = data
 
-        println("  Converting units...")
+        @info "Converting units..."
 
         # Variables consumed directly: promote to Float64.
         temperature_air = Float64.(t2m_raw)
@@ -356,8 +355,7 @@ function load_era5_land(
         shortwave_downward = @. max(Float64(shortwave_raw) / 3600.0, 0.0)
         longwave_downward = @. Float64(longwave_raw) / 3600.0
 
-        println("  Data loaded successfully!")
-        println("  Number of time steps: $(length(selected_times))")
+        @info "Data loaded successfully!" n_time_steps=length(selected_times)
 
         # Create DimArrays with time dimension
         time_dim = Ti(selected_times)
@@ -391,11 +389,11 @@ function load_era5_land(
         ))
 
         # Validate units before returning
-        println("  Validating units...")
+        @info "Validating units..."
         validate_climate_forcing_units(stack)
-        println("  ✓ All units validated")
+        @info "✓ All units validated"
 
-        println("  DimStack created successfully!")
+        @info "DimStack created successfully!"
         return stack
 
     catch e
@@ -474,9 +472,7 @@ function era5_land_chunk_map(;
         throw(ArgumentError("Unknown variable_group $(repr(variable_group)). " *
                             "Available: $(join(sort(collect(keys(ERA5_LAND_STORES))), ", "))"))
 
-    println("Building ERA5-Land chunk map...")
-    println("  Chunk strategy: $(chunk_strategy)")
-    println("  Variable group: $(variable_group)")
+    @info "Building ERA5-Land chunk map..." chunk_strategy variable_group
 
     url   = era5_land_url(variable_group, chunk_strategy)
     store = AuthenticatedHTTPStore(url; token=token)
@@ -484,7 +480,7 @@ function era5_land_chunk_map(;
     if !isnothing(cache_path)
         mkpath(cache_path)
         store = Zarr.CachingStore(store, Zarr.DirectoryStore(joinpath(cache_path, variable_group)))
-        println("  Using disk cache: $(cache_path)")
+        @info "Using disk cache: $(cache_path)"
     end
 
     zg = Zarr.zopen(store, consolidated=true, fill_as_missing=false)
@@ -515,9 +511,7 @@ function era5_land_chunk_map(;
     n_lon_chunks = cld(n_lon, lon_chunk_size)
     n_lat_chunks = cld(n_lat, lat_chunk_size)
 
-    println("  Grid size: $(n_lon) × $(n_lat)")
-    println("  Chunk shape: lon=$(lon_chunk_size), lat=$(lat_chunk_size)")
-    println("  Chunk grid: $(n_lon_chunks) × $(n_lat_chunks) = $(n_lon_chunks * n_lat_chunks) spatial chunks")
+    @info "ERA5-Land grid" grid_size="$(n_lon) × $(n_lat)" chunk_shape="lon=$(lon_chunk_size), lat=$(lat_chunk_size)" chunk_grid="$(n_lon_chunks) × $(n_lat_chunks) = $(n_lon_chunks * n_lat_chunks) spatial chunks"
 
     # Build chunk ID matrix. IDs are zero-based and linearized in lon-major order:
     #   lon_cid = (i - 1) ÷ lon_chunk_size
@@ -556,7 +550,7 @@ function era5_land_chunk_map(;
         metadata = meta,
     )
 
-    println("  ✓ Chunk map built: $(size(raster, Rasters.X)) × $(size(raster, Rasters.Y)), " *
-            "$(n_lon_chunks * n_lat_chunks) unique spatial chunks")
+    @info "✓ Chunk map built: $(size(raster, Rasters.X)) × $(size(raster, Rasters.Y)), " *
+          "$(n_lon_chunks * n_lat_chunks) unique spatial chunks"
     return raster
 end

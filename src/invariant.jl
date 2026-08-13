@@ -77,8 +77,7 @@ function _download_invariant(model::Symbol, parameter::Symbol; cache_path::Strin
     local_path = joinpath(cache_path, info.file)
     url = string(_INVARIANT_BASE_URL[model], "/", info.file)
     if force || !isfile(local_path)
-        println("  Downloading $(parameter) ($(info.description))")
-        println("    $(url)")
+        @info "Downloading $(parameter) ($(info.description))" url
         tmp = local_path * ".part"
         try
             Downloads.download(url, tmp)
@@ -88,7 +87,7 @@ function _download_invariant(model::Symbol, parameter::Symbol; cache_path::Strin
             error("Failed to download invariant parameter $(parameter) for $(model) from $(url):\n$e")
         end
     else
-        println("  Using cached $(parameter): $(local_path)")
+        @info "Using cached $(parameter): $(local_path)"
     end
     return local_path
 end
@@ -233,7 +232,7 @@ function climate_model_invariant(;
 
     params = _INVARIANT_REGISTRY[model]
 
-    verbose && println("Loading $(model) invariant parameter(s) as lazy Raster(s)...")
+    verbose && @info "Loading $(model) invariant parameter(s) as lazy Raster(s)..."
 
     if parameter === nothing
         # Load every available parameter into a lazy RasterStack.
@@ -243,7 +242,7 @@ function climate_model_invariant(;
             _crop_to_extent(_open_invariant_raster(path), extent)
         end
         stack = RasterStack(NamedTuple{Tuple(names)}(Tuple(rasters)))
-        verbose && println("  ✓ Loaded $(length(names)) invariant parameters: $(join(names, ", "))")
+        verbose && @info "✓ Loaded $(length(names)) invariant parameters: $(join(names, ", "))"
         return stack
     else
         haskey(params, parameter) ||
@@ -251,7 +250,7 @@ function climate_model_invariant(;
                                 "Available: $(join(sort(collect(keys(params))), ", "))"))
         path = _download_invariant(model, parameter; cache_path=cache, force=force_download)
         r = _crop_to_extent(_open_invariant_raster(path), extent)
-        verbose && println("  ✓ Loaded $(parameter) as lazy Raster $(size(r))")
+        verbose && @info "✓ Loaded $(parameter) as lazy Raster $(size(r))"
         return r
     end
 end

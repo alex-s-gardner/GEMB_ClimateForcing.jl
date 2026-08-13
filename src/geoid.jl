@@ -92,8 +92,7 @@ function _load_geoid(model::Symbol; cache_path=nothing, force_download::Bool=fal
     _configure_gdal_http()   # shared with the Copernicus DEM loader (CA bundle + retries)
     info = GEOID_MODELS[model]
     url = "/vsicurl/$(_PROJ_CDN_BASE)/$(info.file)"
-    verbose && println("  Streaming $(model) geoid ($(info.description), $(info.resolution))")
-    verbose && println("    $(_PROJ_CDN_BASE)/$(info.file)")
+    verbose && @info "Streaming $(model) geoid ($(info.description), $(info.resolution))" source="$(_PROJ_CDN_BASE)/$(info.file)"
     return Raster(url; lazy=true)
 end
 
