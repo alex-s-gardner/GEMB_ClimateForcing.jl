@@ -234,6 +234,37 @@ function geopotential2height(geopotential, latitude, longitude; height_reference
     end
 end
 
+# Map a `climate_forcing` dataset symbol to the invariant-registry model symbol.
+_invariant_model(model::Symbol) = model === :era5land ? :era5_land : model
+
+"""
+    surface_elevation(model, lat, lon; height_reference=:orthometric,
+                      cache_path=nothing, verbose=false) -> Float64
+
+Surface elevation (m) of `model`'s grid cell nearest `(lat, lon)`, derived from the model's
+geopotential invariant (`:z`). Samples the cached geopotential raster once at the nearest cell and
+converts it with [`geopotential2height`](@ref).
+
+`height_reference=:orthometric` (default) returns the height above the geoid (≈ mean sea level),
+the natural frame for comparison with sea-level DEMs; `:wgs84` returns the ellipsoidal height.
+
+`model` accepts either the invariant symbol (`:era5_land`) or the `climate_forcing` dataset symbol
+(`:era5land`). `cache_path` is forwarded to [`climate_model_invariant`](@ref) for the geopotential
+file. The geopotential invariant is downloaded once and cached, then opened lazily, so a point
+sample reads at most one chunk from local disk.
+"""
+function surface_elevation(model::Symbol, lat::Real, lon::Real;
+                           height_reference::Symbol=:orthometric,
+                           cache_path=nothing, verbose::Bool=false)
+    z = climate_model_invariant(; model=_invariant_model(model), parameter=:z,
+                                cache_path=cache_path, verbose=verbose)  # lazy Raster, native 0–359.9°E
+    # The geopotential grid is native 0–360°E; map a negative longitude into that range before
+    # the nearest-cell lookup. `geopotential2height(:orthometric)` needs no geoid sample, so the
+    # longitude sign is otherwise immaterial here.
+    Φ = Float64(z[X(Near(lon < 0 ? lon + 360 : lon)), Y(Near(lat))])
+    return geopotential2height(Φ, Float64(lat), Float64(lon); height_reference=height_reference)
+end
+
 function geopotential2height(z::AbstractRaster; kwargs...)
     hasdim(z, X) && hasdim(z, Y) ||
         throw(ArgumentError("geopotential2height(::AbstractRaster) needs both X and Y dims."))

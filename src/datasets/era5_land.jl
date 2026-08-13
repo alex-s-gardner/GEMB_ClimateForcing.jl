@@ -298,6 +298,13 @@ function load_era5_land(
 
         @info "Selected grid point" requested="$(lat)°N, $(lon)°E" nearest="$(selected_lat)°N, $(selected_lon)°E"
 
+        # Orthometric surface elevation (m) of the selected cell, from the cached ERA5-Land
+        # geopotential invariant. Stored alongside lat/lon so the forcing stack is
+        # self-describing and downstream elevation adjustment / plotting can report an absolute
+        # elevation. Sampling one cell from the local (lazy) invariant is negligible next to the
+        # forcing download.
+        selected_elevation = surface_elevation(:era5land, selected_lat, selected_lon)
+
         # Find time range indices by comparing in the axis's native numeric unit
         # (hours since epoch). Only the two requested bounds are converted, avoiding a
         # full-length DateTime allocation across the entire (multi-decade) time axis.
@@ -379,6 +386,7 @@ function load_era5_land(
         ); metadata = Dict(
             "latitude" => selected_lat,
             "longitude" => selected_lon,
+            "elevation" => selected_elevation,
             "dataset" => "ERA5-Land",
             "chunk_strategy" => string(chunk_strategy),
             "temperature_air_mean" => Statistics.mean(temperature_air),

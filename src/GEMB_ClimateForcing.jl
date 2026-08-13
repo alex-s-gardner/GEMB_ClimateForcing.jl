@@ -45,7 +45,7 @@ export simulate_climate_forcing, simulation_parameter_sets,
     relative_humidity_to_vapor_pressure,
     fit_air_temperature, fit_precipitation, fit_longwave_irradiance_delta,
     fit_seasonal_daily_noise, varname2longname, simulate_coeffs_disp,
-    geopotential2height, geoid_undulation, GEOID_MODELS
+    geopotential2height, geoid_undulation, GEOID_MODELS, surface_elevation
 
 # Include submodules
 include("utils.jl")
