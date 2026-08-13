@@ -92,8 +92,7 @@ function _copernicus_dem_tile_index(; cache_path::String, force::Bool, verbose::
     mkpath(cache_path)
     local_path = joinpath(cache_path, "tileList.txt")
     if force || !isfile(local_path)
-        verbose && println("  Downloading Copernicus DEM tile index")
-        verbose && println("    $(_COPERNICUS_DEM_30M_TILELIST_URL)")
+        verbose && @info "Downloading Copernicus DEM tile index" url=_COPERNICUS_DEM_30M_TILELIST_URL
         tmp = local_path * ".part"
         try
             Downloads.download(_COPERNICUS_DEM_30M_TILELIST_URL, tmp)
@@ -256,11 +255,11 @@ function _load_copernicus_dem_30m(extent; cache_path::String, force_download::Bo
         # Full data extent: every published tile.
         ids = sort!(collect(index))
         xmin, xmax, ymin, ymax = -180.0, 180.0, -90.0, 90.0
-        verbose && println("  Copernicus DEM: full data extent ($(length(ids)) tiles)")
+        verbose && @info "Copernicus DEM: full data extent ($(length(ids)) tiles)"
     else
         xmin, xmax, ymin, ymax = _copernicus_dem_extent(extent)
         ids = _copernicus_dem_tiles_for_extent(xmin, xmax, ymin, ymax, index)
-        verbose && println("  Copernicus DEM: $(length(ids)) tile(s) cover the requested extent")
+        verbose && @info "Copernicus DEM: $(length(ids)) tile(s) cover the requested extent"
     end
 
     if length(ids) == 1
