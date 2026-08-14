@@ -122,6 +122,9 @@ end
         @test_throws ArgumentError climate_adjust_for_elevation(stack, 100.0; lapse_rate=bad_monthly)
     end
 
+    # Holds because the fixture is sub-saturated (T=260 K, e=150 Pa ⇒ RH≈0.68). For a
+    # supersaturated step the RH clamp rewrites vapor pressure and longwave even at
+    # Δz = 0; only temperature, pressure, and precipitation are identities there.
     @testset "Zero delta is identity" begin
         stack = make_forcing_stack()
         adj = climate_adjust_for_elevation(stack, 0.0)
