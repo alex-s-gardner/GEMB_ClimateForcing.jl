@@ -10,6 +10,7 @@ GEMB_ClimateForcing.jl provides climate forcing for the GEMB surface mass/energy
 2. **Elevation downscaling** — physically-based per-variable correction of a forcing stack to a target elevation (`climate_adjust_for_elevation`).
 3. **Static/invariant fields** — lazy `Raster`s for land-sea mask, geopotential, vegetation, and a 30 m global DEM (`climate_model_invariant`).
 4. **Synthetic forcing + fitting** — generate stochastic forcing from parameter sets, and fit those parameters from observed data (`simulate_climate_forcing`, `fit_*`). These are Julia translations of GEMB's MATLAB `simulate_*` / `fit_*` functions and validate against them.
+5. **Satellite observations** — 10-daily C3S surface albedo, *ordered* from the CDS Retrieve API rather than read from a cloud store (`satellite_albedo`).
 
 **No GEMB dependency**: GEMB.jl provides a package extension that converts the `DimStack` to `GEMB.ClimateForcing`. The conversion code lives in GEMB.jl, *not* here — there is no `ext/` directory in this repo. This lets the forcing be used by other models without requiring GEMB.
 
@@ -47,6 +48,9 @@ offline by default:
 - `GEMB_TEST_COPERNICUS_DEM=1` — enables Copernicus DEM `/vsicurl/` reads
 - `GEMB_TEST_GEOID=1` — enables streaming the EGM96 geoid grid (`/vsicurl/`) for
   `geopotential2height`
+- `GEMB_TEST_SATELLITE_ALBEDO=1` (plus `CDS_API_KEY`) — enables `satellite_albedo` CDS
+  job orders. Slow (jobs queue server-side for minutes) and requires the dataset licence
+  to have been accepted in the CDS web UI.
 
 There is no per-file test runner; run a single suite by editing `include`s in
 `test/runtests.jl` or invoking the file directly with the package loaded.
@@ -115,7 +119,39 @@ julia --project=. examples/test_authentication.jl
    - `_configure_gdal_http()` points GDAL's curl at Julia's CA bundle (`NetworkOptions.ca_roots_path()`)
      — required or `/vsicurl/` TLS handshakes fail on macOS.
 
-8. **`src/simulate/simulate_climate_forcing.jl`** - Synthetic forcing (workflow 4)
+8. **`src/cds_retrieve.jl`** - Generic CDS **Retrieve API** (job) client
+   - `cds_retrieve(dataset, inputs, dest; token, ...)` — submit → poll → download. Plus
+     `cds_estimate_cost` (`/costing`) and `cds_valid_options` (`/constraints`), both cheap
+     and unqueued, so the live catalogue can be consulted instead of a hardcoded table.
+   - **Authenticates with a `PRIVATE-TOKEN` header**, *not* the `Authorization: Bearer`
+     scheme `AuthenticatedHTTPStore` uses for the ARCO Zarr stores. Same key from
+     `get_cds_api_key()`, different header — do not conflate the two.
+   - Dataset-agnostic on purpose, so other archived CDS products can reuse it. CDSAPI.jl was
+     deliberately not adopted (credential-name mismatch, HTTP v2 requirement, collapsed 4xx
+     handling); it is the fallback if the protocol changes.
+
+9. **`src/datasets/copernicus_albedo.jl`** - C3S satellite surface albedo (workflow 5)
+   - `satellite_albedo(; time_range, extent, variable, ...)` → lazy `RasterSeries` over `Ti`.
+   - **This is not an invariant and not a lazy remote read.** The product has no ARCO Zarr
+     copy, no COG bucket and no OPeNDAP endpoint, so data is *ordered* via async CDS jobs
+     (minutes of latency), cached per timestep on disk, then opened `lazy=true`. Do not route
+     it through `climate_model_invariant`: `_open_invariant_raster` deliberately drops `Ti`.
+   - **Cost = variables × |years| × |months| × |nominal_days|, limit 20**, and `area` does
+     *not* reduce it. `_albedo_chunk_timesteps` splits requests accordingly; the cross-product
+     (not date-count) formula is verified against the live `/costing` endpoint — under-counting
+     a month-straddling group gets the request server-rejected.
+   - **One ordered *variable* is a multi-layer NetCDF**, not a single grid: `AL_{DH|BH}_{BB|NI|VI}`
+     plus `_ERR` uncertainties, `QFLAG`, and a scalar `crs`. An unnamed `Raster(path; lazy=true)`
+     silently picks `crs` (a 1-element `Char`, no X/Y), so `_albedo_resolve_layer` /
+     `_albedo_open_layer` always name the layer; `_ALBEDO_DEFAULT_LAYERS` holds the broadband
+     default and the `layer` kwarg overrides it. Multi-variable requests build a `RasterStack`
+     keyed by *variable* symbol, not by internal layer name.
+   - Timesteps are day 10 / day 20 / end-of-month (verified via `/constraints`). Sentinel-3
+     `v3_1` 300 m era only (2018–2024); AVHRR/VGT/PROBA eras use different grids and are out
+     of scope. Longitude is −180…180°E (like the DEM, unlike the ERA5-Land invariants).
+   - Requires one-time licence acceptance in the CDS web UI or every request 403s.
+
+10. **`src/simulate/simulate_climate_forcing.jl`** - Synthetic forcing (workflow 4)
    - `simulate_climate_forcing(set_id, time_step_hours=0)` — generates a full stochastic forcing
      `DimStack` from a named parameter set (`simulation_parameter_sets`, e.g. `"test_1"`), seeded
      RNG (`MersenneTwister`) for MATLAB-matching reproducibility.
@@ -125,7 +161,7 @@ julia --project=. examples/test_authentication.jl
      complete years into a one-year cycle). Convert a `DimStack` with `GEMB.ClimateForcing(ds)`
      first.
 
-9. **`src/fit_climate/`** - Parameter fitting (workflow 4, inverse of simulate)
+11. **`src/fit_climate/`** - Parameter fitting (workflow 4, inverse of simulate)
    - `fit_air_temperature`, `fit_precipitation`, `fit_longwave_irradiance_delta`,
      `fit_seasonal_daily_noise` — estimate `simulate_*` coefficients from observed series.
    - `simulate_coeffs_disp` prints a fitted coefficient NamedTuple as copy-pasteable Julia.
@@ -246,8 +282,11 @@ Tests use conditional integration testing:
 
 - **DimensionalData.jl** — all forcing output is a `DimStack`; the `Ti` (time) dimension is
   required by `climate_adjust_for_elevation` (and by GEMB.jl's `forcing_climatology`).
-- **Rasters.jl** — invariant fields and the DEM are returned as lazy `Raster`/`RasterStack`
+- **Rasters.jl** — invariant fields and the DEM are returned as lazy `Raster`/`RasterStack`;
+  satellite albedo as a lazy `RasterSeries` over `Ti`
   (backends: `RastersNCDatasetsExt` via NCDatasets, `RastersArchGDALExt` via ArchGDAL).
+  Note `RasterSeries` has **no metadata field** — `rebuild(series; metadata=…)` is accepted
+  and silently discarded, so provenance must be attached to the layers instead.
 - **GDAL** (via ArchGDAL) — `/vsicurl/` remote COG reads for the Copernicus DEM.
 - Coordinate reference system: WGS84 (EPSG:4326) throughout.
 

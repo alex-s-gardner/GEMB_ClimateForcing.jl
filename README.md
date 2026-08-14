@@ -10,6 +10,7 @@ Pure Julia — no Python. Reanalysis data is read from Analysis-Ready, Cloud-Opt
 - **Elevation downscaling** — physically-based per-variable correction of a forcing stack to a target elevation for snow/ice surfaces (`climate_adjust_for_elevation`).
 - **Invariant fields** — lazy `Raster`s for land–sea mask, geopotential/orography, vegetation/soil/lake, and a 30 m global DEM (`climate_model_invariant`).
 - **Chunk mapping** — visualize Zarr download locality before batch queries (`climate_chunk_map`).
+- **Satellite albedo** — 10-daily C3S surface albedo (Sentinel-3, 300 m) as a lazy `RasterSeries`, ordered from the CDS Retrieve API (`satellite_albedo`).
 
 ## Installation
 
@@ -128,6 +129,43 @@ dem = climate_model_invariant(model=:copernicus_dem_30m,
 
 > **Grid convention.** ERA5-Land invariants use **0–359.9°E** longitude and **descending** latitude (90→−90°N). The `X = a .. b` / `Y = a .. b` selector takes `min .. max` regardless of axis order.
 
+### `satellite_albedo(; time_range, extent, variable, ...)`
+
+Observed surface albedo from the C3S [Surface albedo 10-daily gridded data](https://cds.climate.copernicus.eu/datasets/satellite-albedo) product (Sentinel-3 OLCI+SLSTR, 300 m, `v3_1`, 2018–2024), returned as a **lazy `RasterSeries`** over `Ti`.
+
+```julia
+using GEMB_ClimateForcing, Rasters, Dates
+
+alb = satellite_albedo(;
+    time_range = (DateTime(2019, 6, 1), DateTime(2019, 6, 30)),
+    extent = Extents.Extent(X = (-48.0, -47.5), Y = (66.5, 67.0)),
+    variable = :albb_dh,
+)
+
+lookup(alb, Ti)      # 2019-06-10, 2019-06-20, 2019-06-30
+read(alb[1])         # materialise the first timestep (albedo fraction, 0–1)
+```
+
+Each ordered variable arrives as a NetCDF holding **several layers**: the broadband (`_BB`), near-infrared (`_NI`) and visible (`_VI`) albedos, a `_ERR` uncertainty for each, and a `QFLAG` quality mask. The full-spectrum broadband layer (`AL_DH_BB` / `AL_BH_BB`) is read by default; select another with `layer=`, and list what a cached file holds with `satellite_albedo_layers(path)`:
+
+```julia
+vis = satellite_albedo(; time_range = (DateTime(2019, 6, 1), DateTime(2019, 6, 30)),
+                       extent = Extents.Extent(X = (-48.0, -47.5), Y = (66.5, 67.0)),
+                       layer = :AL_DH_VI)
+```
+
+Variables (`SATELLITE_ALBEDO_VARIABLES`) combine two axes — `albb` **broadband** vs `alsp` **spectral** (per-band), and `_dh` **directional-hemispherical** (black-sky, direct illumination) vs `_bh` **bi-hemispherical** (white-sky, fully diffuse). For a surface energy-balance model such as GEMB, `:albb_dh` (the default) is usually what you want; true albedo lies between the black- and white-sky values according to the diffuse fraction.
+
+Timesteps follow the 10-daily ("decadal") convention: **day 10, day 20, and the last day of each month** (28/29/30/31). Only timesteps inside `time_range` are returned.
+
+> **This is an order-and-cache pipeline, not a lazy remote read.** Unlike every other source here, this product has no ARCO Zarr copy, no COG bucket, and no OPeNDAP endpoint — the CDS catalogue exposes it only through a job-based Retrieve API. Each call **submits jobs that queue server-side for minutes**, caches the returned NetCDFs on disk, and opens them lazily. Repeat calls for cached timesteps submit no job at all.
+
+> **Requests are size-limited, so long series mean many jobs.** CDS charges one unit per (variable × year × month × nominal-day) combination against a hard limit of 20, and narrowing `extent` reduces the download volume but **not** the cost. Requests are split automatically: one variable for a year is ~3 jobs, five years ~15. Ordering a decade will take a long time.
+
+> **Accept the licence first.** Visit [the dataset's download tab](https://cds.climate.copernicus.eu/datasets/satellite-albedo?tab=download#manage-licences) once and accept the product terms, or every request fails with HTTP 403. This is the most common first-run failure.
+
+> **Longitude is −180…180°E** here (as for the Copernicus DEM), *not* the 0–360°E convention of the ERA5-Land invariants. Omitting `extent` requests global 300 m data — ~120960 × 47040 pixels per variable per timestep — so an extent is strongly recommended.
+
 ## ERA5-Land Details
 
 Data is read from ECMWF's ARCO Zarr stores at `arco.datastores.ecmwf.int`. Variables are loaded from four store groups and converted for GEMB:
@@ -157,6 +195,10 @@ Grid: 0.1° (~9 km), 1801 × 3600 (lat × lon), hourly, 1950–present.
 If you use ERA5-Land data, please cite:
 
 > Muñoz Sabater, J. (2019): ERA5-Land hourly data from 1950 to present. Copernicus Climate Change Service (C3S) Climate Data Store (CDS). DOI: [10.24381/cds.e2161bac](https://doi.org/10.24381/cds.e2161bac)
+
+If you use the satellite surface albedo data, please cite:
+
+> Copernicus Climate Change Service, Climate Data Store (2019): Surface albedo 10-daily gridded data from 1981 to present. Copernicus Climate Change Service (C3S) Climate Data Store (CDS). DOI: [10.24381/cds.ea87ed30](https://doi.org/10.24381/cds.ea87ed30)
 
 ## License
 

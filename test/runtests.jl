@@ -64,6 +64,10 @@ println("="^70)
     # Include geoid / geopotential2height tests (offline physics always; streamed geoid opt-in via GEMB_TEST_GEOID=1)
     include("test_geoid.jl")
 
+    # Include C3S satellite albedo tests (offline logic always; CDS job orders opt-in via
+    # GEMB_TEST_SATELLITE_ALBEDO=1 plus CDS_API_KEY)
+    include("test_copernicus_albedo.jl")
+
     @testset "Input Validation" begin
         # Missing time_range
         @test_throws ArgumentError climate_forcing(:era5land, 72.0, -38.0)
