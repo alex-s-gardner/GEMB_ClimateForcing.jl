@@ -47,12 +47,18 @@ export simulate_climate_forcing, simulation_parameter_sets,
     fit_seasonal_daily_noise, varname2longname, simulate_coeffs_disp,
     geopotential2height, geoid_undulation, GEOID_MODELS, surface_elevation
 
+# Export satellite observations (ordered from the CDS Retrieve API, not a lazy store)
+export satellite_albedo, satellite_albedo_layers, SATELLITE_ALBEDO_VARIABLES
+
 # Include submodules
 include("utils.jl")
 include("authenticated_http_store.jl")
+# CDS Retrieve (job-based) client — needs get_cds_api_key from utils.jl.
+include("cds_retrieve.jl")
 include("interface.jl")
 include("datasets/era5_land.jl")
 include("datasets/copernicus_dem.jl")
+include("datasets/copernicus_albedo.jl")
 include("geoid.jl")
 include("invariant.jl")
 include("elevation_adjustment.jl")
