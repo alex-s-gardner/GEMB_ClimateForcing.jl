@@ -8,6 +8,7 @@ Pure Julia — no Python. Reanalysis data is read from Analysis-Ready, Cloud-Opt
 
 - **Reanalysis loading** — point time-series extraction from ERA5-Land ARCO Zarr stores (`climate_forcing`).
 - **Elevation downscaling** — physically-based per-variable correction of a forcing stack to a target elevation for snow/ice surfaces (`climate_adjust_for_elevation`).
+- **Climate perturbations** — uniform temperature offsets and fractional precipitation scaling for sensitivity/scenario experiments (`temperature_adjust`, `precipitation_adjust`).
 - **Invariant fields** — lazy `Raster`s for land–sea mask, geopotential/orography, vegetation/soil/lake, and a 30 m global DEM (`climate_model_invariant`).
 - **Chunk mapping** — visualize Zarr download locality before batch queries (`climate_chunk_map`).
 - **Satellite albedo** — 10-daily C3S surface albedo (Sentinel-3, 300 m) as a lazy `RasterSeries`, ordered from the CDS Retrieve API (`satellite_albedo`).
@@ -101,6 +102,40 @@ adjusted = climate_adjust_for_elevation(stack, 250.0; lapse_rate=Γ)
 ```
 
 > The scheme follows Glover (1999, *J. Climate* 12, 551–563, Eqs. 15–20) and is the surface-field analogue of TopoSCALE (Fiddes & Gruber 2014); it is consistent with the RACMO2.3p2 studies of Noël et al. (2018, 2019). Near-surface lapse rates over melting ice are markedly shallower than the 6.5 K/km free-air default, so prefer a region-specific table or a locally-fitted rate.
+
+### `temperature_adjust(stack, delta_temperature)`
+
+Apply a **uniform temperature offset** (K) to a forcing `DimStack` and propagate it through the variables that depend on air temperature. Use for warming/cooling sensitivity experiments or to bias-correct a reanalysis against an observed temperature record. For a temperature change that arises from an elevation difference, use `climate_adjust_for_elevation` instead — it derives ΔT from a lapse rate and also corrects surface pressure.
+
+| Variable | Adjustment |
+|----------|-----------|
+| `temperature_air` | `T + ΔT` |
+| `vapor_pressure` | constant relative humidity, recomputed at `T′` (over-ice curve below 0 °C) |
+| `longwave_downward` | Konzelmann (1994) clear-sky emissivity at `(e′, T′)`, preserving the cloud increment Δε |
+| `pressure_air`, `wind_speed`, `precipitation`, `shortwave_downward` | unchanged |
+
+`ΔT = 0` reproduces the input exactly. Metadata records `delta_temperature` and a **cumulative** `temperature_offset`, so repeated calls compose. Physical-range validation re-runs on the result — a large negative ΔT that drives temperature below 180 K (or longwave below 50 W/m²) raises an `ArgumentError` by design.
+
+### `precipitation_adjust(stack, scaling)`
+
+Rescale precipitation by a dimensionless fractional factor (`0.85` = 15 % drier, `1.15` = 15 % wetter), leaving every other variable unchanged. The scaling is uniform in time: it changes totals and event amplitude, not timing or intermittency. Precipitation phase is determined downstream from air temperature, so the scaling applies to whichever phase the temperature implies. `scaling` must be non-negative; `1.0` reproduces the input exactly.
+
+Metadata records a **cumulative, multiplicative** `precipitation_scaling` (two calls of `1.1` record `1.21`) and a recomputed annual `precipitation_mean`.
+
+The two perturbations are independent and commute — a temperature offset applies no implicit Clausius–Clapeyron precipitation response, so the accumulation change stays an explicit choice:
+
+```julia
+stack = climate_forcing(:era5land, 72.58, -38.46;
+                        time_range=(DateTime(2020,1,1), DateTime(2020,12,31)),
+                        token=ENV["CDS_API_KEY"])
+
+warmer = temperature_adjust(stack, 2.0)              # +2 K scenario
+wetter = precipitation_adjust(stack, 1.15)           # 15% more precipitation
+
+# Warm and dry, on top of an elevation downscaling
+scenario = precipitation_adjust(
+    temperature_adjust(climate_adjust_for_elevation(stack, 250.0), 3.0), 0.85)
+```
 
 ### `climate_model_invariant(; model, parameter, ...)`
 

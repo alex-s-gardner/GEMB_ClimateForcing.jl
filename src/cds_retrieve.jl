@@ -50,6 +50,44 @@ const _CDS_REQUESTS_PAGE = "https://cds.climate.copernicus.eu/requests"
 const _CDS_PENDING_STATUSES = ("accepted", "running", "queued", "started")
 
 """
+    CDSQueueLimitError(dataset, job_id, detail)
+
+A job CDS answered with `status: "rejected"` because too many requests for that dataset
+were already queued for this account.
+
+This is a distinct failure from a bad request: the request itself is legal and succeeds
+verbatim once the queue drains, so [`cds_retrieve`](@ref) catches this type and resubmits
+rather than propagating it. It surfaces when several jobs are ordered concurrently — the
+limit is per dataset, not per job — and the rejection is only visible in the *job's*
+status, not in the (HTTP 200) submission response.
+"""
+struct CDSQueueLimitError <: Exception
+    dataset::String
+    job_id::String
+    detail::String
+end
+
+function Base.showerror(io::IO, e::CDSQueueLimitError)
+    print(io, """
+    CDS rejected job $(e.job_id) for "$(e.dataset)": too many requests already queued
+    for this dataset.
+
+    $(e.detail)
+
+    Reduce the number of concurrent jobs, or wait for the queued ones to finish.
+    """)
+end
+
+# Fragment of the CDS rejection message that identifies the per-dataset queue limit, as
+# opposed to any other cause of a "rejected" status.
+const _CDS_QUEUE_LIMIT_HINT = "queued requests for this dataset is temporarily limited"
+
+# Backoff bounds, in seconds, for resubmitting a queue-limited job. Generous because the
+# blocker is other jobs of ours finishing, which takes minutes, not milliseconds.
+const _CDS_QUEUE_RETRY_BASE = 30.0
+const _CDS_QUEUE_RETRY_MAX = 300.0
+
+"""
     _cds_headers(token) -> Vector{Pair{String,String}}
 
 Request headers for the CDS Retrieve API.
@@ -262,6 +300,21 @@ function _cds_wait(dataset::AbstractString, job_id::AbstractString;
         if status == "successful"
             verbose && @info "CDS job complete" dataset job_id elapsed_s=round(time() - started; digits=1)
             return nothing
+        elseif status == "rejected"
+            # A rejection carries its reason in the *results* endpoint, not in the job
+            # body, so fetch it before deciding whether this is retryable.
+            detail = _cds_rejection_detail(dataset, job_id, String(response.body);
+                                           token=token)
+            if occursin(_CDS_QUEUE_LIMIT_HINT, detail)
+                throw(CDSQueueLimitError(String(dataset), String(job_id), detail))
+            end
+            error("""
+            CDS job $(job_id) for "$(dataset)" was rejected.
+
+            $(detail)
+
+            Inspect the request (after login) at $(_CDS_REQUESTS_PAGE)
+            """)
         elseif status in ("failed", "dismissed")
             error("""
             CDS job $(job_id) for "$(dataset)" $(status).
@@ -303,6 +356,27 @@ function _cds_wait(dataset::AbstractString, job_id::AbstractString;
 end
 
 """
+    _cds_rejection_detail(dataset, job_id, job_body; token) -> String
+
+Why a job was rejected. The job document itself reports only `status: "rejected"`, with
+no reason; the explanation (a traceback naming e.g. the per-dataset queue limit) lives on
+the `/results` endpoint, which answers 4xx for a rejected job. So query it, tolerating any
+failure — the caller is already on an error path and a missing reason must not mask it.
+"""
+function _cds_rejection_detail(dataset::AbstractString, job_id::AbstractString,
+                               job_body::AbstractString; token::AbstractString)
+    try
+        url = "$(_CDS_RETRIEVE_BASE)/jobs/$(job_id)/results"
+        response = HTTP.request("GET", url, _cds_headers(token); status_exception=false)
+        detail = _cds_error_detail(String(response.body))
+        isempty(strip(detail)) || return detail
+    catch err
+        @debug "Could not fetch CDS rejection reason" dataset job_id exception = err
+    end
+    return _cds_error_detail(job_body)
+end
+
+"""
     _cds_result_href(dataset, job_id; token) -> String
 
 URL of a successful job's downloadable asset.
@@ -336,11 +410,16 @@ to several minutes. The downloaded file is usually a ZIP of NetCDFs, but CDS may
 return a bare NetCDF for a single-field request, so callers should sniff the content
 rather than assume.
 
+Safe to call from several concurrent tasks: a job CDS rejects for exceeding the
+per-dataset queued-request limit is resubmitted with backoff (see
+[`CDSQueueLimitError`](@ref)) instead of failing.
+
 # Keywords
 - `token`: CDS API key (see [`get_cds_api_key`](@ref)).
 - `poll_interval`: initial seconds between status polls; grows geometrically to 60 s.
-- `timeout`: seconds to wait before giving up. The job is not cancelled — the error
-  reports its id so it can be inspected or collected later.
+- `timeout`: seconds to wait before giving up, covering submission retries as well as the
+  wait itself. The job is not cancelled — the error reports its id so it can be inspected
+  or collected later.
 - `check_cost`: when `true`, call [`cds_estimate_cost`](@ref) first and fail locally
   if the request exceeds the server limit, which gives a clearer message than the
   server's rejection.
@@ -363,10 +442,39 @@ function cds_retrieve(dataset::AbstractString, inputs::AbstractDict, dest::Abstr
         end
     end
 
-    job_id = _cds_submit(dataset, inputs; token=token)
-    verbose && @info "Submitted CDS request" dataset job_id
-    _cds_wait(dataset, job_id; token=token, poll_interval=poll_interval,
-              timeout=timeout, verbose=verbose)
+    # Submit, and resubmit if CDS rejects the job for having too many of this dataset's
+    # requests already queued. That rejection is about account state, not the request, so
+    # the identical submission succeeds once the queue drains — retrying here is what lets
+    # callers order several jobs concurrently without hand-tuning their fan-out. `timeout`
+    # bounds the retry loop as well as each wait, so a saturated queue cannot spin forever.
+    started = time()
+    job_id = ""
+    attempt = 0
+    while true
+        attempt += 1
+        job_id = _cds_submit(dataset, inputs; token=token)
+        verbose && @info "Submitted CDS request" dataset job_id
+        try
+            _cds_wait(dataset, job_id; token=token, poll_interval=poll_interval,
+                      timeout=max(timeout - (time() - started), 0), verbose=verbose)
+            break
+        catch err
+            err isa CDSQueueLimitError || rethrow()
+            elapsed = time() - started
+            backoff = min(_CDS_QUEUE_RETRY_BASE * 2.0^(attempt - 1), _CDS_QUEUE_RETRY_MAX)
+            if elapsed + backoff >= timeout
+                error("""
+                CDS kept rejecting this "$(dataset)" request for exceeding the per-dataset
+                queued-request limit, and $(round(timeout; digits=1))s elapsed without a
+                free slot (attempt $(attempt)).
+
+                Lower the number of concurrent jobs, or raise `timeout`.
+                """)
+            end
+            verbose && @info "CDS queue full; resubmitting after backoff" dataset attempt backoff_s = round(backoff; digits=1)
+            sleep(backoff)
+        end
+    end
     href = _cds_result_href(dataset, job_id; token=token)
 
     mkpath(dirname(dest))

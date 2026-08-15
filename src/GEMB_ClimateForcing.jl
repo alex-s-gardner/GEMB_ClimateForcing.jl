@@ -35,6 +35,7 @@ using OpenSSL
 
 # Export main interface
 export climate_forcing, climate_chunk_map, get_cds_api_key, climate_adjust_for_elevation,
+    temperature_adjust, precipitation_adjust,
     empirical_lapse_rate, climate_model_invariant, ERA5_LAND_INVARIANT_PARAMETERS,
     GREENLAND_LAPSE_RATE, ARCTIC_LAPSE_RATE, ANTARCTICA_LAPSE_RATE
 
@@ -62,6 +63,9 @@ include("datasets/copernicus_albedo.jl")
 include("geoid.jl")
 include("invariant.jl")
 include("elevation_adjustment.jl")
+# Direct temperature / precipitation perturbations — reuses the saturation-vapor
+# and emissivity helpers from elevation_adjustment.jl.
+include("climate_adjustment.jl")
 
 # Synthetic forcing generation
 include("simulate/simulate_climate_forcing.jl")
