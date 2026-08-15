@@ -49,6 +49,9 @@ println("="^70)
     # Include elevation adjustment tests (offline, analytic)
     include("test_elevation_adjustment.jl")
 
+    # Include temperature / precipitation perturbation tests (offline, analytic)
+    include("test_climate_adjustment.jl")
+
     # Include analytical physics cross-checks (offline)
     include("test_elevation_physics.jl")
 
@@ -63,6 +66,9 @@ println("="^70)
 
     # Include geoid / geopotential2height tests (offline physics always; streamed geoid opt-in via GEMB_TEST_GEOID=1)
     include("test_geoid.jl")
+
+    # Include CDS Retrieve client tests (offline: headers, error parsing, queue-limit retry)
+    include("test_cds_retrieve.jl")
 
     # Include C3S satellite albedo tests (offline logic always; CDS job orders opt-in via
     # GEMB_TEST_SATELLITE_ALBEDO=1 plus CDS_API_KEY)

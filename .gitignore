@@ -49,3 +49,6 @@ temp/
 
 # Benchmark golden snapshot
 test/.golden_forcing.jls
+
+# Generated example outputs (NetCDF data products)
+examples/output/

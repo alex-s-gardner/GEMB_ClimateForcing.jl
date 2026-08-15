@@ -555,6 +555,72 @@ function _albedo_check_time_coord(path::AbstractString, layer::Symbol,
 end
 
 """
+    _run_concurrent_jobs(f, n_jobs, max_concurrent, submit_stagger; verbose=true)
+
+Run `f(i, submit_gate)` for `i in 1:n_jobs` concurrently, with at most `max_concurrent`
+in flight and successive calls to `submit_gate()` spaced at least `submit_stagger`
+seconds apart.
+
+**Why this exists.** A CDS job spends nearly all its wall-clock queued and processed
+server-side — tens of minutes, and highly variable (a 3-timestep order has been observed
+finishing in ~30 min while another ran past 2 h). Ordering the jobs one after another
+therefore costs the *sum* of those waits, while CDS will work on several at once.
+
+Measured, six one-month orders submitted together: three finished at 27–32 min, the rest
+at ~79–80 min, all six done in 83 min — versus ~30 min *each*, i.e. ~3 h, in series. So
+the server clearly runs only ~3 of our jobs at a time and the speedup is ~2×, not linear
+in `max_concurrent`; raising the cap past a handful buys little and risks the rejection
+path. Concurrency, not smaller jobs, is nonetheless what makes a multi-month request
+tractable.
+
+Tasks rather than threads: the work is HTTP polling, so it is entirely I/O-bound and
+`@async` imposes no thread-safety requirement on HTTP.jl or the NetCDF/`p7zip` calls.
+
+The two knobs both exist to stay inside CDS's limits:
+- `max_concurrent` bounds in-flight jobs, because CDS *rejects* (rather than queues)
+  submissions past a per-dataset limit.
+- `submit_stagger` spaces submissions out, because a simultaneous burst trips that
+  limiter even at a count that succeeds when spread out. `f` decides when to open the
+  gate, so a job served from cache does not consume a submission slot at all, and only
+  the *waiting* is serialised — polling stays parallel.
+
+Errors propagate: `@sync` rethrows, so a failed job is not silently dropped.
+"""
+function _run_concurrent_jobs(f, n_jobs::Integer, max_concurrent::Integer,
+                              submit_stagger::Real; verbose::Bool=true)
+    n_jobs >= 1 || return nothing
+    limit = max(1, min(max_concurrent, n_jobs))
+    slots = Base.Semaphore(limit)
+    submit_lock = ReentrantLock()
+    # Wall-clock of the last submission. Tracking the real time (rather than sleeping once
+    # per job) means a task that queued behind the semaphore for an hour submits at once
+    # instead of sitting out another `submit_stagger` seconds for nothing. Initialised in
+    # the past so the first job submits immediately.
+    last_submit = Ref(time() - submit_stagger)
+
+    verbose && n_jobs > 1 &&
+        @info "Running up to $(limit) CDS jobs concurrently" n_jobs = n_jobs
+
+    submit_gate = () -> lock(submit_lock) do
+        wait_s = submit_stagger - (time() - last_submit[])
+        wait_s > 0 && sleep(wait_s)
+        last_submit[] = time()
+    end
+
+    @sync for i in 1:n_jobs
+        @async begin
+            Base.acquire(slots)
+            try
+                f(i, submit_gate)
+            finally
+                Base.release(slots)
+            end
+        end
+    end
+    return nothing
+end
+
+"""
     satellite_albedo(; time_range, extent=nothing, variable=:albb_dh, layer=nothing,
                        nominal_day=nothing, token=nothing, cache_path=nothing,
                        force_download=false, verbose=true, poll_interval=10,
@@ -586,13 +652,26 @@ below before requesting long series.
 - `cache_path`: cache directory; defaults to a per-user temp directory. Cached timesteps
   are reused without submitting a job.
 - `force_download`: re-order timesteps already cached.
-- `poll_interval`, `timeout`: job polling cadence and give-up time, in seconds.
+- `poll_interval`, `timeout`: job polling cadence and give-up time, in seconds. `timeout`
+  is **per job**, measured from that job's own submission. With more chunks than
+  `max_concurrent_jobs` the later ones start their clock only once a slot frees, so the
+  call as a whole can exceed `timeout`.
+- `max_concurrent_jobs`: how many CDS jobs to keep in flight (default 6). Jobs spend
+  nearly all their time waiting server-side, so this is the main throughput lever — though
+  CDS appears to process only ~3 of an account's jobs at a time, so the gain saturates
+  (~2× measured, not linear). CDS also rejects submissions past a per-dataset queue limit,
+  hence the cap.
+- `submit_stagger`: seconds between successive submissions (default 15). A simultaneous
+  burst trips the queue limiter even at counts that succeed when spread out.
 
 # Size limits
 CDS charges one unit per (variable × year × month × nominal-day) combination and rejects
 requests above 20. Narrowing `extent` shrinks the download but **not** the cost, so
 requests are split automatically into as many jobs as needed — one variable for a year is
-~3 jobs, five years ~15. Ordering many years in one call will take a long time.
+~3 jobs, five years ~15. Those jobs are submitted and polled **concurrently**
+(`max_concurrent_jobs`), which roughly halves wall-clock versus ordering them in series,
+but expect tens of minutes regardless: a single job routinely queues that long, and CDS
+runs only a few of an account's jobs at once.
 
 # Prerequisite
 Accept the dataset licence once at
@@ -628,6 +707,8 @@ function satellite_albedo(;
     verbose::Bool=true,
     poll_interval::Real=10,
     timeout::Real=1800,
+    max_concurrent_jobs::Integer=6,
+    submit_stagger::Real=15,
 )
     variables = _albedo_normalize_variables(variable)
     dates = _albedo_timesteps(time_range; nominal_day=nominal_day)
@@ -660,18 +741,23 @@ function satellite_albedo(;
         chunks = _albedo_chunk_timesteps(missing_dates, length(variables))
         verbose && @info "Ordering albedo from CDS" n_timesteps=length(missing_dates) n_variables=length(variables) n_jobs=length(chunks)
 
-        for (i, chunk) in enumerate(chunks)
+        n_jobs = length(chunks)
+        completed = Threads.Atomic{Int}(0)
+
+        _run_concurrent_jobs(n_jobs, max_concurrent_jobs, submit_stagger;
+                             verbose=verbose) do i, submit_gate
+            chunk = chunks[i]
             request = _albedo_request(variables, chunk; area=area)
             job_dir = joinpath(cache, "jobs", _albedo_request_hash(request))
             mkpath(job_dir)
             archive = joinpath(job_dir, "download")
 
-            verbose && @info "CDS albedo job $(i)/$(length(chunks))" dates=chunk
             if force_download || !isfile(archive)
                 write(joinpath(job_dir, "request.json"), JSON3.write(request))
+                submit_gate()
                 cds_retrieve(_ALBEDO_DATASET, request, archive;
-                             token=tok, poll_interval=poll_interval, timeout=timeout,
-                             verbose=verbose)
+                             token=tok, poll_interval=poll_interval,
+                             timeout=timeout, verbose=verbose)
             end
 
             extract_dir = joinpath(job_dir, "extract")
@@ -684,6 +770,10 @@ function satellite_albedo(;
             # per-timestep store is now authoritative.
             rm(extract_dir; recursive=true, force=true)
             rm(archive; force=true)
+
+            n = Threads.atomic_add!(completed, 1) + 1
+            verbose && @info "CDS albedo job $(n)/$(n_jobs) complete" dates=chunk
+            return nothing
         end
         cached = _albedo_cached_files(store_dir)
     end

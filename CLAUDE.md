@@ -4,10 +4,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-GEMB_ClimateForcing.jl provides climate forcing for the GEMB surface mass/energy balance model as a `DimStack` of climate variables. It covers four largely independent workflows, all pure Julia (no Python):
+GEMB_ClimateForcing.jl provides climate forcing for the GEMB surface mass/energy balance model as a `DimStack` of climate variables. It covers five largely independent workflows, all pure Julia (no Python):
 
 1. **Reanalysis loading** — point extraction from cloud-optimized ARCO Zarr stores (ERA5-Land) via authenticated HTTPS (`climate_forcing`).
-2. **Elevation downscaling** — physically-based per-variable correction of a forcing stack to a target elevation (`climate_adjust_for_elevation`).
+2. **Elevation downscaling + climate perturbation** — physically-based per-variable correction of a forcing stack to a target elevation (`climate_adjust_for_elevation`), plus direct temperature/precipitation perturbations for scenario experiments (`temperature_adjust`, `precipitation_adjust`).
 3. **Static/invariant fields** — lazy `Raster`s for land-sea mask, geopotential, vegetation, and a 30 m global DEM (`climate_model_invariant`).
 4. **Synthetic forcing + fitting** — generate stochastic forcing from parameter sets, and fit those parameters from observed data (`simulate_climate_forcing`, `fit_*`). These are Julia translations of GEMB's MATLAB `simulate_*` / `fit_*` functions and validate against them.
 5. **Satellite observations** — 10-daily C3S surface albedo, *ordered* from the CDS Retrieve API rather than read from a cloud store (`satellite_albedo`).
@@ -40,7 +40,8 @@ GEMB_TEST_INVARIANT=1 julia --project=. -e 'using Pkg; Pkg.test()'
 
 **Test gating.** `test/runtests.jl` always runs offline tests (input validation, unit
 conversions, elevation physics, synthetic forcing, chunk-map formulas, DEM tile
-geometry). Network-dependent tests are opt-in via environment variables so CI stays
+geometry, CDS client error/retry classification and job-concurrency scheduling).
+Network-dependent tests are opt-in via environment variables so CI stays
 offline by default:
 - `CDS_API_KEY` — enables ERA5-Land Zarr integration tests
 - `GEMB_TEST_INVARIANT=1` — enables ERA5-Land invariant NetCDF downloads
@@ -54,6 +55,18 @@ offline by default:
 
 There is no per-file test runner; run a single suite by editing `include`s in
 `test/runtests.jl` or invoking the file directly with the package loaded.
+
+**Standalone scripts** (not included by `runtests.jl`, each needs a CDS token):
+```bash
+# Benchmark the load hot path. --check gates numerics against a golden snapshot
+# (test/.golden_forcing.jls, gitignored) — run this before/after any optimization.
+julia --project=. -t auto test/benchmark_load.jl            # run + record baseline
+julia --project=. -t auto test/benchmark_load.jl --check    # run + assert vs golden
+julia --project=. -t auto test/benchmark_load.jl --cpu-only # no network
+
+julia --project=. test/verify_chunk_alignment.jl  # confirm chunk-ID formula vs live store
+julia --project=. test/test_caching.jl            # Zarr.CachingStore cold/warm timing
+```
 
 ### Running Examples
 ```bash
@@ -91,7 +104,10 @@ julia --project=. examples/test_authentication.jl
    - Returns `DimStack` with all climate variables as DimArrays
    - Physical validation via `validate_climate_forcing_units()`
 
-4. **`src/utils.jl`** - Vapor-pressure conversions shared across all workflows
+4. **`src/utils.jl`** - Credentials + vapor-pressure conversions shared across all workflows
+   - `get_cds_api_key()` — resolves the CDS token from `ENV["CDS_API_KEY"]`, else the
+     `key:` line of `~/.cdsapirc`. Both the Zarr (Bearer) and Retrieve API (`PRIVATE-TOKEN`)
+     paths take their token from here.
    - `dewpoint_to_vapor_pressure()`, `vapor_pressure_to_relative_humidity()`,
      `relative_humidity_to_vapor_pressure()` — Magnus/Buck formulas
 
@@ -102,6 +118,19 @@ julia --project=. examples/test_authentication.jl
    - `empirical_lapse_rate()` fits a local rate from neighbouring grid cells (RACMO-style).
    - Exported climatological monthly tables: `GREENLAND_LAPSE_RATE`, `ARCTIC_LAPSE_RATE`,
      `ANTARCTICA_LAPSE_RATE` (K/km, Jan→Dec). See README for the full per-variable table and references.
+   - Sibling **`src/climate_adjustment.jl`** holds the *direct* (non-elevation) perturbations,
+     reusing this file's `saturation_vapor_pressure` / `konzelmann_clear_sky_emissivity` /
+     `_SIGMA_SB` rather than redefining them:
+     - `temperature_adjust(stack, ΔT)` — uniform offset in K, propagated into `vapor_pressure`
+       (constant RH) and `longwave_downward` (Konzelmann ε_cs, cloud increment Δε preserved).
+       Deliberately leaves `pressure_air` alone (set by elevation/synoptics, not by warming).
+     - `precipitation_adjust(stack, scaling)` — fractional multiplier, non-negative; nothing else
+       depends on the precipitation rate.
+     - Both are scalar-argument only (no monthly/per-step vectors, unlike `lapse_rate`), record
+       **cumulative** metadata so repeated calls compose — `"temperature_offset"` additive,
+       `"precipitation_scaling"` multiplicative — and re-run `validate_climate_forcing_units`.
+       The identity perturbation (`ΔT=0`, `scaling=1`) is exact. The two are independent by
+       design: no implicit Clausius–Clapeyron precipitation response to ΔT.
 
 6. **`src/invariant.jl`** - Time-invariant fields (workflow 3)
    - `climate_model_invariant(; model, parameter, ...)` — returns lazy `Raster`/`RasterStack`.
@@ -119,7 +148,23 @@ julia --project=. examples/test_authentication.jl
    - `_configure_gdal_http()` points GDAL's curl at Julia's CA bundle (`NetworkOptions.ca_roots_path()`)
      — required or `/vsicurl/` TLS handshakes fail on macOS.
 
-8. **`src/cds_retrieve.jl`** - Generic CDS **Retrieve API** (job) client
+8. **`src/geoid.jl`** - Geopotential → height, and model surface elevation
+   - `geopotential2height(Φ, lat, lon; height_reference)` — full conversion, *not* the crude
+     `z / 9.80665`: latitude-dependent gravity + effective Earth radius (List 1968, as in NCL's
+     `gp2gmh`) gives orthometric height, then the geoid undulation `N` is added for `:wgs84`
+     (default) ellipsoidal height. `height_reference=:orthometric` skips the geoid entirely, so
+     it needs no network. A `Raster` method broadcasts over the grid via `_axis_vector`, which
+     reshapes lon/lat per their own dimension — correct for either axis order.
+   - `geoid_undulation` / `GEOID_MODELS` — EGM96 (15′, default) and EGM2008 (2.5′) grids
+     **streamed** from the PROJ CDN (`cdn.proj.org`) as COGs over `/vsicurl/`, sharing
+     `_configure_gdal_http()` with the DEM loader. Nothing is bundled. Longitude −180…180°E.
+   - `surface_elevation(model, lat, lon)` — elevation of the model grid cell nearest a point,
+     from the `:z` invariant. Defaults to `:orthometric` (comparable to sea-level DEMs).
+     Accepts either symbol spelling: `:era5land` (dataset) or `:era5_land` (invariant registry),
+     normalized by `_invariant_model`. Maps negative longitude into the invariant's native
+     0–360°E before the `Near` lookup.
+
+9. **`src/cds_retrieve.jl`** - Generic CDS **Retrieve API** (job) client
    - `cds_retrieve(dataset, inputs, dest; token, ...)` — submit → poll → download. Plus
      `cds_estimate_cost` (`/costing`) and `cds_valid_options` (`/constraints`), both cheap
      and unqueued, so the live catalogue can be consulted instead of a hardcoded table.
@@ -129,8 +174,15 @@ julia --project=. examples/test_authentication.jl
    - Dataset-agnostic on purpose, so other archived CDS products can reuse it. CDSAPI.jl was
      deliberately not adopted (credential-name mismatch, HTTP v2 requirement, collapsed 4xx
      handling); it is the fallback if the protocol changes.
+   - **Safe to call concurrently.** CDS enforces a *per-dataset* queued-request limit and
+     answers an over-limit job with HTTP 200 + `status: "rejected"` — the reason appears only
+     on `/results`, not in the job body. `_cds_rejection_detail` fetches it and
+     `CDSQueueLimitError` marks it retryable, so `cds_retrieve` resubmits with backoff
+     (30 s → 300 s) rather than failing. Note `"rejected"` is deliberately *not* in
+     `_CDS_PENDING_STATUSES`: it must terminate the poll loop so the retry decision is made
+     once. `timeout` bounds retries plus waiting, so a saturated queue cannot spin forever.
 
-9. **`src/datasets/copernicus_albedo.jl`** - C3S satellite surface albedo (workflow 5)
+10. **`src/datasets/copernicus_albedo.jl`** - C3S satellite surface albedo (workflow 5)
    - `satellite_albedo(; time_range, extent, variable, ...)` → lazy `RasterSeries` over `Ti`.
    - **This is not an invariant and not a lazy remote read.** The product has no ARCO Zarr
      copy, no COG bucket and no OPeNDAP endpoint, so data is *ordered* via async CDS jobs
@@ -150,8 +202,20 @@ julia --project=. examples/test_authentication.jl
      `v3_1` 300 m era only (2018–2024); AVHRR/VGT/PROBA eras use different grids and are out
      of scope. Longitude is −180…180°E (like the DEM, unlike the ERA5-Land invariants).
    - Requires one-time licence acceptance in the CDS web UI or every request 403s.
+   - **Jobs run concurrently, and that is the whole performance story.** Latency is queue
+     time, not compute — tens of minutes per job, and only loosely related to job size (a
+     3-timestep order has finished in ~30 min while another ran past 2 h). So
+     `_run_concurrent_jobs` fans the chunks out over `@async` tasks (I/O-bound, no threads
+     needed): `max_concurrent_jobs=6` in flight, submissions spaced `submit_stagger=15` s
+     apart because a simultaneous burst trips the queue limiter even at counts that succeed
+     when spread out. Measured: 6 concurrent one-month orders — 3 done at 27–32 min, the
+     rest at ~79 min, all 6 in 83 min, vs ~3 h serially. **The gain saturates**: CDS runs
+     only ~3 of an account's jobs at a time, so this is ~2×, not 6×, and raising the cap
+     mostly courts rejections. **Do not "optimize" by splitting a request into per-month
+     calls** — that re-serialises the ordering and is slower; pass the full range and let
+     the chunker do it.
 
-10. **`src/simulate/simulate_climate_forcing.jl`** - Synthetic forcing (workflow 4)
+11. **`src/simulate/simulate_climate_forcing.jl`** - Synthetic forcing (workflow 4)
    - `simulate_climate_forcing(set_id, time_step_hours=0)` — generates a full stochastic forcing
      `DimStack` from a named parameter set (`simulation_parameter_sets`, e.g. `"test_1"`), seeded
      RNG (`MersenneTwister`) for MATLAB-matching reproducibility.
@@ -161,7 +225,7 @@ julia --project=. examples/test_authentication.jl
      complete years into a one-year cycle). Convert a `DimStack` with `GEMB.ClimateForcing(ds)`
      first.
 
-11. **`src/fit_climate/`** - Parameter fitting (workflow 4, inverse of simulate)
+12. **`src/fit_climate/`** - Parameter fitting (workflow 4, inverse of simulate)
    - `fit_air_temperature`, `fit_precipitation`, `fit_longwave_irradiance_delta`,
      `fit_seasonal_daily_noise` — estimate `simulate_*` coefficients from observed series.
    - `simulate_coeffs_disp` prints a fitted coefficient NamedTuple as copy-pasteable Julia.
@@ -248,7 +312,9 @@ To add support for a new reanalysis dataset (e.g., ERA5, MERRA-2):
    ```
 6. Update README and tests
 
-Use `src/datasets/era5_land.jl` as a template.
+Use `src/datasets/era5_land.jl` as a template. Note that `CONTRIBUTING.md` still describes
+step 3 as returning a `GEMB.ClimateForcing` struct — that is stale; loaders return a
+`DimStack` and the struct conversion lives in GEMB.jl.
 
 ## Important Implementation Notes
 
@@ -287,7 +353,8 @@ Tests use conditional integration testing:
   (backends: `RastersNCDatasetsExt` via NCDatasets, `RastersArchGDALExt` via ArchGDAL).
   Note `RasterSeries` has **no metadata field** — `rebuild(series; metadata=…)` is accepted
   and silently discarded, so provenance must be attached to the layers instead.
-- **GDAL** (via ArchGDAL) — `/vsicurl/` remote COG reads for the Copernicus DEM.
+- **GDAL** (via ArchGDAL) — `/vsicurl/` remote COG reads for the Copernicus DEM and the
+  EGM96/EGM2008 geoid grids.
 - Coordinate reference system: WGS84 (EPSG:4326) throughout.
 
 ### Grid-orientation gotcha
