@@ -270,6 +270,8 @@ Quality control runs per observation before any statistic is formed — missing/
 
 > **Budget 30–90 minutes per cold year** (~3 CDS jobs, ordered concurrently); cached years are nearly free. Pass a durable `cache_path`, since the default is under `tempdir()` and a lost cache means reordering everything. Request the full year range in one call — looping over months by hand re-serialises the ordering and is much slower.
 
+See `examples/glacier_ice_albedo_example.jl` for a runnable workflow — per-year summary, the multi-year mean GEMB consumes, and a NetCDF write. It runs on `include` and leaves `run_example(years; kwargs...)` callable for other settings.
+
 The albedo, `QFLAG` and `_ERR` layers all live in the same product file, so all three are read in a single `satellite_albedo` call per year at no extra CDS cost. The annual reduction streams the timesteps, keeping only the darkest few values per pixel, so peak memory is set by the percentile rather than by the number of observations in the year. Loader keywords (`timeout`, `max_concurrent_jobs`, `force_download`, …) are forwarded to `satellite_albedo`.
 
 ## ERA5-Land Details
