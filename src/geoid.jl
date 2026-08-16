@@ -132,9 +132,6 @@ function geoid_undulation(latitude, longitude; geoid::Symbol=:egm96, geoid_raste
     return _sample_geoid.(Ref(g), Float64.(latitude), _wrap_longitude.(Float64.(longitude)))
 end
 
-# Normalize longitude to the geoid grid's −180…180°E convention (accepts 0–360°E).
-_wrap_longitude(lon) = lon > 180 ? lon - 360 : lon
-
 # Nearest-neighbour sample of the geoid grid at one (lat, lon) point.
 function _sample_geoid(g, lat, lon)
     return Float64(g[X(Near(lon)), Y(Near(lat))])

@@ -111,3 +111,50 @@ function relative_humidity_to_vapor_pressure(temperature_air, relative_humidity)
     es = A .* exp.((B .* Tc) ./ (Tc .+ C))
     return es .* (relative_humidity ./ 100.0)
 end
+
+# ----------------------------------------------------------------------------
+# Shared helpers for the forcing-adjustment functions
+# (elevation_adjustment.jl, climate_adjustment.jl, glacier_adjustment.jl).
+# ----------------------------------------------------------------------------
+
+"""
+    _rebuild_forcing(stack, new_metadata; changed_layers...) -> DimStack
+
+Rebuild a forcing `DimStack` with new stack metadata, replacing only the named layers.
+
+Every adjustment function changes a different subset of the seven forcing variables; this
+carries the rest through untouched rather than making each call site re-enumerate them.
+`rebuild` preserves each layer's own metadata, so broadcast results (which drop it) come
+back correctly annotated without threading it by hand.
+
+Values may be `DimArray`s or plain arrays — only the underlying data is used.
+"""
+function _rebuild_forcing(stack::DimStack, new_metadata; changed_layers...)
+    changed = map(parent, NamedTuple(changed_layers))
+    unknown = setdiff(keys(changed), keys(stack))
+    isempty(unknown) ||
+        throw(ArgumentError("not a layer of this forcing stack: $(join(unknown, ", "))"))
+    return rebuild(stack; data=merge(NamedTuple(stack), changed), metadata=new_metadata)
+end
+
+"""
+    _adjust_longwave(LW, e, T, e′, T′)
+
+Recompute downwelling longwave irradiance [W/m²] for adjusted temperature `T′` and vapor
+pressure `e′`, preserving the cloud/aerosol emissivity increment diagnosed from the input.
+
+`Δε = LW/(σT⁴) − ε_cs(e, T)` is the departure of the observed irradiance from the
+Konzelmann et al. (1994) clear-sky value; holding it fixed means only the clear-sky
+response and the `σT⁴` scaling change. Exact identity when `(e′, T′) == (e, T)`.
+"""
+function _adjust_longwave(LW, e, T, e′, T′)
+    ε_cs  = konzelmann_clear_sky_emissivity.(e, T)
+    ε_cs′ = konzelmann_clear_sky_emissivity.(e′, T′)
+    Δε = @. LW / (_SIGMA_SB * T^4) - ε_cs
+    return @. (ε_cs′ + Δε) * _SIGMA_SB * T′^4
+end
+
+# Normalize longitude to the −180…180°E convention (accepts 0–360°E, or any multiple
+# wrap: 540 → 180, −190 → 170). Used by the geoid grid and the glacier lookup table,
+# both of which are −180…180 while the ERA5-Land grids are 0–360.
+_wrap_longitude(lon::Real) = mod(lon + 180.0, 360.0) - 180.0

@@ -32,14 +32,11 @@ using DimensionalData
 using Statistics
 
 # ----------------------------------------------------------------------------
-# Shared helpers. `_SIGMA_SB`, `saturation_vapor_pressure` and
-# `konzelmann_clear_sky_emissivity` are defined in elevation_adjustment.jl;
-# `validate_climate_forcing_units` in datasets/era5_land.jl. Both are included
-# earlier in the module, so they are reused here rather than redefined.
+# Shared helpers, all reused rather than redefined: `_SIGMA_SB`,
+# `saturation_vapor_pressure` and `konzelmann_clear_sky_emissivity` from
+# elevation_adjustment.jl; `_rebuild_forcing` and `_adjust_longwave` from
+# utils.jl; `validate_climate_forcing_units` from datasets/era5_land.jl.
 # ----------------------------------------------------------------------------
-
-# Re-attach a variable's original layer metadata (broadcasting drops it).
-_withmeta(da, stack, var) = rebuild(da; metadata=copy(metadata(stack[var])))
 
 """
     temperature_adjust(climate_forcing_original::DimStack,
@@ -135,10 +132,7 @@ function temperature_adjust(climate_forcing_original::DimStack, delta_temperatur
     e′ = @. RH * es_T′
 
     # 3. Longwave down: recompute from adjusted T, e; preserve cloud increment Δε.
-    ε_cs  = konzelmann_clear_sky_emissivity.(e, T)
-    ε_cs′ = konzelmann_clear_sky_emissivity.(e′, T′)
-    Δε = @. LW / (_SIGMA_SB * T^4) - ε_cs
-    LW′ = @. (ε_cs′ + Δε) * _SIGMA_SB * T′^4
+    LW′ = _adjust_longwave(LW, e, T, e′, T′)
 
     src_meta = metadata(climate_forcing_original)
     new_meta = merge(copy(src_meta), Dict(
@@ -149,15 +143,10 @@ function temperature_adjust(climate_forcing_original::DimStack, delta_temperatur
         "temperature_air_mean" => Statistics.mean(T′),
     ))
 
-    adjusted = DimStack((
-        temperature_air = _withmeta(T′, climate_forcing_original, :temperature_air),
-        pressure_air = climate_forcing_original[:pressure_air],              # unchanged
-        vapor_pressure = _withmeta(e′, climate_forcing_original, :vapor_pressure),
-        wind_speed = climate_forcing_original[:wind_speed],                  # unchanged
-        precipitation = climate_forcing_original[:precipitation],            # unchanged
-        shortwave_downward = climate_forcing_original[:shortwave_downward],  # unchanged
-        longwave_downward = _withmeta(LW′, climate_forcing_original, :longwave_downward),
-    ); metadata=new_meta)
+    # Pressure, wind, precipitation and shortwave are carried through untouched.
+    adjusted = _rebuild_forcing(climate_forcing_original, new_meta;
+                                temperature_air=T′, vapor_pressure=e′,
+                                longwave_downward=LW′)
 
     # Re-validate physical ranges after adjustment.
     validate_climate_forcing_units(adjusted)
@@ -239,15 +228,8 @@ function precipitation_adjust(climate_forcing_original::DimStack, scaling::Real)
         "precipitation_mean" => Statistics.mean(precip′) * 8760.0,
     ))
 
-    adjusted = DimStack((
-        temperature_air = climate_forcing_original[:temperature_air],        # unchanged
-        pressure_air = climate_forcing_original[:pressure_air],              # unchanged
-        vapor_pressure = climate_forcing_original[:vapor_pressure],          # unchanged
-        wind_speed = climate_forcing_original[:wind_speed],                  # unchanged
-        precipitation = _withmeta(precip′, climate_forcing_original, :precipitation),
-        shortwave_downward = climate_forcing_original[:shortwave_downward],  # unchanged
-        longwave_downward = climate_forcing_original[:longwave_downward],    # unchanged
-    ); metadata=new_meta)
+    # Precipitation is the only variable this touches.
+    adjusted = _rebuild_forcing(climate_forcing_original, new_meta; precipitation=precip′)
 
     # Re-validate physical ranges after adjustment.
     validate_climate_forcing_units(adjusted)

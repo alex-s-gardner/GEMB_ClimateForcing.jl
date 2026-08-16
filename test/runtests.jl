@@ -52,6 +52,12 @@ println("="^70)
     # Include temperature / precipitation perturbation tests (offline, analytic)
     include("test_climate_adjustment.jl")
 
+    # Include glacier decoupling lookup tests (offline, vendored table)
+    include("test_glacier_decoupling.jl")
+
+    # Include ambient → on-glacier correction tests (offline, analytic)
+    include("test_glacier_adjustment.jl")
+
     # Include analytical physics cross-checks (offline)
     include("test_elevation_physics.jl")
 

@@ -421,17 +421,11 @@ function climate_adjust_for_elevation(
     e′ = @. RH * es_T′
 
     # 4. Longwave down: recompute from adjusted T, e; preserve cloud increment Δε.
-    ε_cs  = konzelmann_clear_sky_emissivity.(e, T)
-    ε_cs′ = konzelmann_clear_sky_emissivity.(e′, T′)
-    Δε = @. LW / (_SIGMA_SB * T^4) - ε_cs
-    LW′ = @. (ε_cs′ + Δε) * _SIGMA_SB * T′^4
+    LW′ = _adjust_longwave(LW, e, T, e′, T′)
 
     # 5. Precipitation: unchanged by default; Clausius–Clapeyron scaling if asked
     #    (Glover 1999, Eq. 19). eₛ ratio proxies q_sat(T′)/q_sat(T); exact at Δz=0.
     precip′ = precip_scaling_method === :clausius_clapeyron ? (@. precip * (es_T′ / es_T)) : precip
-
-    # Re-attach each variable's original metadata (broadcasting drops it).
-    withmeta(da, var) = rebuild(da; metadata=copy(metadata(climate_forcing_original[var])))
 
     src_meta = metadata(climate_forcing_original)
     z_reanalysis = get(src_meta, "elevation", nothing)
@@ -450,15 +444,10 @@ function climate_adjust_for_elevation(
         new_meta["elevation"] = z_reanalysis + Δz
     end
 
-    adjusted = DimStack((
-        temperature_air = withmeta(T′, :temperature_air),
-        pressure_air = withmeta(P′, :pressure_air),
-        vapor_pressure = withmeta(e′, :vapor_pressure),
-        wind_speed = climate_forcing_original[:wind_speed],              # unchanged
-        precipitation = withmeta(precip′, :precipitation),
-        shortwave_downward = climate_forcing_original[:shortwave_downward],  # unchanged
-        longwave_downward = withmeta(LW′, :longwave_downward),
-    ); metadata=new_meta)
+    # Wind speed and shortwave are carried through untouched.
+    adjusted = _rebuild_forcing(climate_forcing_original, new_meta;
+                                temperature_air=T′, pressure_air=P′, vapor_pressure=e′,
+                                precipitation=precip′, longwave_downward=LW′)
 
     # Re-validate physical ranges after adjustment.
     validate_climate_forcing_units(adjusted)

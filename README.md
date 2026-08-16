@@ -9,6 +9,7 @@ Pure Julia — no Python. Reanalysis data is read from Analysis-Ready, Cloud-Opt
 - **Reanalysis loading** — point time-series extraction from ERA5-Land ARCO Zarr stores (`climate_forcing`).
 - **Elevation downscaling** — physically-based per-variable correction of a forcing stack to a target elevation for snow/ice surfaces (`climate_adjust_for_elevation`).
 - **Climate perturbations** — uniform temperature offsets and fractional precipitation scaling for sensitivity/scenario experiments (`temperature_adjust`, `precipitation_adjust`).
+- **On-glacier correction** — ambient → on-glacier air temperature via the Shaw et al. (2025) per-glacier decoupling factor (`climate_adjust_for_glacier`, `glacier_decoupling`).
 - **Invariant fields** — lazy `Raster`s for land–sea mask, geopotential/orography, vegetation/soil/lake, and a 30 m global DEM (`climate_model_invariant`).
 - **Chunk mapping** — visualize Zarr download locality before batch queries (`climate_chunk_map`).
 - **Satellite albedo** — 10-daily C3S surface albedo (Sentinel-3, 300 m) as a lazy `RasterSeries`, ordered from the CDS Retrieve API (`satellite_albedo`).
@@ -136,6 +137,43 @@ wetter = precipitation_adjust(stack, 1.15)           # 15% more precipitation
 scenario = precipitation_adjust(
     temperature_adjust(climate_adjust_for_elevation(stack, 250.0), 3.0), 0.85)
 ```
+
+### `climate_adjust_for_glacier(stack, k)` / `climate_adjust_for_glacier(stack; rgi_id)`
+
+Correct an **ambient** (off-glacier) forcing to **on-glacier** conditions. A melting surface pinned at 0 °C cools the air above it, and the resulting stable layer suppresses turbulent mixing and drives a katabatic wind. Reanalysis 2 m temperature carries none of this — ERA5-Land grid cells dwarf a valley glacier — so feeding it straight to a surface energy balance model overestimates melt (22 % of the mass-balance change per +1 °C; Greuell & Böhm 1998).
+
+Applies the Shaw et al. (2025) decoupling factor `k` from the published **per-glacier lookup table** (186,792 RGI v6 glaciers, vendored in `data/`, no network needed). The paper's five-predictor regression is deliberately not re-implemented: its Table S2 has sign errors in `a4`/`a5`, and even a corrected refit reaches only R² = 0.54 against the authors' own published `k`. See [`docs/on_glacier_temperature_correction.md`](docs/on_glacier_temperature_correction.md).
+
+| Variable | Adjustment |
+|----------|-----------|
+| `temperature_air` | `T + (k−1)·max(T − T_ref, 0)`, i.e. cooling proportional to how far ambient sits above melting |
+| `longwave_downward` | Konzelmann (1994) clear-sky emissivity at the cooled `T′`, unchanged `e`, preserving the cloud increment Δε |
+| `vapor_pressure`, `pressure_air`, `wind_speed`, `precipitation`, `shortwave_downward` | unchanged |
+
+**Run `climate_adjust_for_elevation` first.** `k` multiplies an ambient temperature *at the glacier's elevation*; the reverse order is wrong.
+
+`k` must be in `(0, 1]`; `1.0` reproduces the input exactly. Metadata records a **cumulative, multiplicative** `glacier_decoupling_factor` plus the lookup provenance (`glacier_decoupling_rgi_id`, `k_lower`, match distance).
+
+```julia
+stack = climate_forcing(:era5land, 45.97, 7.53;
+                        time_range=(DateTime(2020,1,1), DateTime(2020,12,31)),
+                        token=ENV["CDS_API_KEY"])
+
+# Elevation correction to the glacier surface first, glacier correction second.
+at_glacier = climate_adjust_for_elevation(stack, 2900.0 - metadata(stack)["elevation"])
+
+on_glacier = climate_adjust_for_glacier(at_glacier; rgi_id="RGI60-11.02810")  # by RGI id
+on_glacier = climate_adjust_for_glacier(at_glacier)                            # nearest centroid
+on_glacier = climate_adjust_for_glacier(at_glacier, 0.83)                      # k directly
+
+# Per-glacier k and its lower CI bound, for a sensitivity range.
+row = glacier_decoupling("RGI60-11.02810")   # (; k, k_lower, lat, lon, ele, …)
+```
+
+Two limits to know:
+
+- **`vapor_pressure` is left untouched by design.** This is *not* `temperature_adjust`'s constant-RH propagation. Shea & Moore (2010, Eq. 4) show `e_gla` pivots about 6.11 hPa (saturation over ice at 0 °C), so the boundary layer *adds* moisture when ambient air is drier than that — the opposite sign to constant-RH scaling. The correct scheme needs a flowpath-length raster.
+- **RGI regions 05 (Greenland periphery) and 19 (Antarctic) are absent** from the Shaw table, so the lookup forms fail there; pass `k` explicitly. Cooling is gated to steps above melting by default (`apply_below_freezing=false`), since a bare `k` multiplier would *warm* sub-freezing air, and the regression is ablation-season only.
 
 ### `climate_model_invariant(; model, parameter, ...)`
 
