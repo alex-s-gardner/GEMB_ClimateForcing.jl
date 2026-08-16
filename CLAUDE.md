@@ -10,7 +10,7 @@ GEMB_ClimateForcing.jl provides climate forcing for the GEMB surface mass/energy
 2. **Elevation downscaling + climate perturbation** — physically-based per-variable correction of a forcing stack to a target elevation (`climate_adjust_for_elevation`), plus direct temperature/precipitation perturbations for scenario experiments (`temperature_adjust`, `precipitation_adjust`).
 3. **Static/invariant fields** — lazy `Raster`s for land-sea mask, geopotential, vegetation, and a 30 m global DEM (`climate_model_invariant`).
 4. **Synthetic forcing + fitting** — generate stochastic forcing from parameter sets, and fit those parameters from observed data (`simulate_climate_forcing`, `fit_*`). These are Julia translations of GEMB's MATLAB `simulate_*` / `fit_*` functions and validate against them.
-5. **Satellite observations** — 10-daily C3S surface albedo, *ordered* from the CDS Retrieve API rather than read from a cloud store (`satellite_albedo`).
+5. **Satellite observations** — 10-daily C3S surface albedo, *ordered* from the CDS Retrieve API rather than read from a cloud store (`satellite_albedo`), plus its glacier bare-ice reduction (`compute_glacier_ice_albedo`).
 
 **No GEMB dependency**: GEMB.jl provides a package extension that converts the `DimStack` to `GEMB.ClimateForcing`. The conversion code lives in GEMB.jl, *not* here — there is no `ext/` directory in this repo. This lets the forcing be used by other models without requiring GEMB.
 
@@ -40,8 +40,9 @@ GEMB_TEST_INVARIANT=1 julia --project=. -e 'using Pkg; Pkg.test()'
 
 **Test gating.** `test/runtests.jl` always runs offline tests (input validation, unit
 conversions, elevation physics, synthetic forcing, chunk-map formulas, DEM tile
-geometry, CDS client error/retry classification and job-concurrency scheduling, and the
-glacier-decoupling lookup + adjustment against the vendored table).
+geometry, CDS client error/retry classification and job-concurrency scheduling, the
+glacier-decoupling lookup + adjustment against the vendored table, and the bare-ice albedo
+reduction kernel / QC mask / QFLAG legend parsing).
 Network-dependent tests are opt-in via environment variables so CI stays
 offline by default:
 - `CDS_API_KEY` — enables ERA5-Land Zarr integration tests
@@ -245,6 +246,46 @@ julia --project=. examples/test_authentication.jl
      mostly courts rejections. **Do not "optimize" by splitting a request into per-month
      calls** — that re-serialises the ordering and is slower; pass the full range and let
      the chunker do it.
+   - Sibling **`src/glacier_ice_albedo.jl`** reduces that record to GEMB's **bare-ice albedo**:
+     `compute_glacier_ice_albedo(years; extent, ...)` → `RasterStack` over (`X`, `Y`, `Ti`) with
+     `:glacier_ice_albedo` (Float32, NaN where unresolved) and `:n_valid_observations`.
+     Per pixel-year it averages the darkest `percentile` (default 5 %) of valid broadband
+     retrievals — on a glacier the annual albedo *minimum* is the bare-ice state, and averaging
+     a low percentile rather than taking the single minimum stops one bad retrieval from setting
+     the answer (~36 obs/yr, so 5 % is the darkest 1–2).
+   - Loaded **after** `datasets/copernicus_albedo.jl` in `GEMB_ClimateForcing.jl` — it calls
+     `satellite_albedo`, aliases its `_ALBEDO_YEARS`, and reads the backing product file out of
+     each layer's `"file"` metadata key to find the QFLAG legend. It does **not** re-derive the
+     private cache layout; if you need the file behind a layer, read that key.
+   - **One `satellite_albedo` call per year, with `layer = [layer, :QFLAG, err_layer]`.** All
+     three live in the same product NetCDF, so the extra layers cost no extra CDS job, and one
+     call keeps the timesteps aligned by construction instead of by matching positional indices
+     across three separate series. Every loader knob (`timeout`, `max_concurrent_jobs`,
+     `poll_interval`, `force_download`) is forwarded via `albedo_kwargs...` rather than restated
+     with its own default.
+   - **The annual reduction streams** (`_LowPercentileTopK` / `_accumulate!` / `_finalize`):
+     only the `ceil(percentile · n)` darkest values per pixel are retained, so a year holds ~3
+     grids of state instead of all ~36 masked grids — 49 → 5.5 MiB at 600×600, and the
+     saving grows with the extent, which is the point (a Greenland-scale extent is where this
+     otherwise OOMs). Kernel *time* is unchanged (~45 ms either way); this is a memory
+     change, not a speed one. Bit-identical to sorting every valid value — the same `k` values
+     reach the same `mean` in the same order — and `_low_percentile_mean` remains as the batch
+     wrapper the tests compare against.
+   - Three deliberate QC choices, each a trap to re-check before "fixing":
+     - **`albedo_range`'s 0.3 floor is glaciological, not physical.** Exposed ice rarely goes
+       below ~0.3 broadband, so darker pixels are usually rock/water/shadow/failed inversion.
+       Heavily dust- or algae-darkened ablation zones need it lowered (~0.15) or the default
+       clips the signal being measured.
+     - **`snow_presence` is deliberately kept, not rejected.** A bright snow-covered timestep is
+       discarded by the low percentile anyway; rejecting it up front only biases the sample count
+       against `min_samples`. Do not add it to `GLACIER_ICE_ALBEDO_QFLAG_REJECT`.
+     - **`brdf_warning_*` rejection is off by default** (`qflag_reject_brdf_warning=false`) — a
+       warning, not a failure, and over snow/ice it fires often enough to thin the sample
+       materially.
+   - QFLAG bits are read from each file's own `flag_masks`/`flag_meanings` (`_qflag_table`),
+     never hardcoded — the convention is version-specific — and an unreadable legend degrades to
+     range-only QC with a warning rather than erroring.
+   - Was formerly `examples/albedo_annual_low_percentile.jl`; the example is gone, don't restore it.
 
 11. **`src/simulate/simulate_climate_forcing.jl`** - Synthetic forcing (workflow 4)
    - `simulate_climate_forcing(set_id, time_step_hours=0)` — generates a full stochastic forcing

@@ -13,6 +13,7 @@ Pure Julia — no Python. Reanalysis data is read from Analysis-Ready, Cloud-Opt
 - **Invariant fields** — lazy `Raster`s for land–sea mask, geopotential/orography, vegetation/soil/lake, and a 30 m global DEM (`climate_model_invariant`).
 - **Chunk mapping** — visualize Zarr download locality before batch queries (`climate_chunk_map`).
 - **Satellite albedo** — 10-daily C3S surface albedo (Sentinel-3, 300 m) as a lazy `RasterSeries`, ordered from the CDS Retrieve API (`satellite_albedo`).
+- **Glacier bare-ice albedo** — observed bare-ice albedo per pixel-year, as the mean of each year's darkest few percent of albedo retrievals (`compute_glacier_ice_albedo`).
 
 ## Installation
 
@@ -238,6 +239,38 @@ Timesteps follow the 10-daily ("decadal") convention: **day 10, day 20, and the 
 > **Accept the licence first.** Visit [the dataset's download tab](https://cds.climate.copernicus.eu/datasets/satellite-albedo?tab=download#manage-licences) once and accept the product terms, or every request fails with HTTP 403. This is the most common first-run failure.
 
 > **Longitude is −180…180°E** here (as for the Copernicus DEM), *not* the 0–360°E convention of the ERA5-Land invariants. Omitting `extent` requests global 300 m data — ~120960 × 47040 pixels per variable per timestep — so an extent is strongly recommended.
+
+### `compute_glacier_ice_albedo(years; extent, ...)`
+
+Observed **glacier bare-ice albedo**, reduced from the `satellite_albedo` record: for each pixel and calendar year, the mean of the darkest 5 % of that year's valid broadband retrievals. Returns a `RasterStack` over (`X`, `Y`, `Ti`).
+
+```julia
+using GEMB_ClimateForcing, Rasters, Dates, Statistics
+
+ice = compute_glacier_ice_albedo(2019:2020;
+    extent = Extents.Extent(X = (-48.0, -47.5), Y = (66.5, 67.0)))
+
+ice[:glacier_ice_albedo]        # (X, Y, Ti) Float32, NaN where too few observations
+ice[:n_valid_observations]      # how many retrievals each pixel-year drew on
+
+# One bare-ice albedo per pixel, for GEMB:
+albedo_ice = map(eachslice(ice[:glacier_ice_albedo]; dims=(X, Y))) do px
+    v = filter(!isnan, collect(px))
+    isempty(v) ? NaN32 : mean(v)
+end
+```
+
+On a glacier the annual albedo minimum *is* the bare-ice state — seasonal snow has ablated, exposing ice at its most darkened by dust, black carbon and algae. This is the observational substitute for GEMB's bare-ice albedo, which is otherwise a tuned regional constant (~0.35–0.55). Averaging a low percentile rather than taking the single annual minimum keeps one bad retrieval from setting the answer: the 10-daily product gives ~36 observations a year, so 5 % averages the darkest 1–2.
+
+Quality control runs per observation before any statistic is formed — missing/`_FillValue` pixels (which is what removes sea, cloud and shadow), albedo outside `albedo_range`, rejected `QFLAG` classes (read from each file's own `flag_masks`/`flag_meanings`, not hardcoded), and retrievals whose `_ERR` uncertainty exceeds `max_error`. Pixel-years below `min_samples` surviving observations are left `NaN` rather than computed from a handful of cloudy scenes.
+
+> **The `albedo_range` floor of 0.3 is glaciological, not physical.** Exposed glacier ice rarely falls below ~0.3 broadband, so darker retrievals over a glacier pixel are usually rock, water, shadow or a failed inversion. For heavily dust- or algae-darkened ablation zones, lower it (toward ~0.15) or the default will clip the very signal being measured.
+
+> **`snow_presence` is deliberately *not* rejected** by the QFLAG filter — a snow-covered timestep is a bright observation that the low percentile discards on its own, and rejecting it up front would bias the sample count instead. The v3.1 QFLAG legend is not a cloud mask at all; see `GLACIER_ICE_ALBEDO_QFLAG_REJECT`.
+
+> **Budget 30–90 minutes per cold year** (~3 CDS jobs, ordered concurrently); cached years are nearly free. Pass a durable `cache_path`, since the default is under `tempdir()` and a lost cache means reordering everything. Request the full year range in one call — looping over months by hand re-serialises the ordering and is much slower.
+
+The albedo, `QFLAG` and `_ERR` layers all live in the same product file, so all three are read in a single `satellite_albedo` call per year at no extra CDS cost. The annual reduction streams the timesteps, keeping only the darkest few values per pixel, so peak memory is set by the percentile rather than by the number of observations in the year. Loader keywords (`timeout`, `max_concurrent_jobs`, `force_download`, …) are forwarded to `satellite_albedo`.
 
 ## ERA5-Land Details
 

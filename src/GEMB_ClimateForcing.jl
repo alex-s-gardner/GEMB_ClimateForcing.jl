@@ -53,6 +53,10 @@ export simulate_climate_forcing, simulation_parameter_sets,
 # Export satellite observations (ordered from the CDS Retrieve API, not a lazy store)
 export satellite_albedo, satellite_albedo_layers, SATELLITE_ALBEDO_VARIABLES
 
+# Export glacier bare-ice albedo derived from the satellite albedo record
+export compute_glacier_ice_albedo, GLACIER_ICE_ALBEDO_YEARS,
+    GLACIER_ICE_ALBEDO_QFLAG_REJECT
+
 # Export on-glacier temperature decoupling (Shaw et al. 2025 lookup table)
 export glacier_decoupling, glacier_decoupling_table, GlacierDecoupling,
     climate_adjust_for_glacier
@@ -66,6 +70,9 @@ include("interface.jl")
 include("datasets/era5_land.jl")
 include("datasets/copernicus_dem.jl")
 include("datasets/copernicus_albedo.jl")
+# Glacier bare-ice albedo (darkest-percentile annual reduction of the albedo record).
+# Must follow copernicus_albedo.jl — reuses satellite_albedo and its cache-layout helpers.
+include("glacier_ice_albedo.jl")
 include("geoid.jl")
 include("invariant.jl")
 include("elevation_adjustment.jl")
