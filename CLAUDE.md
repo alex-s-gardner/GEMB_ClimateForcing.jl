@@ -40,7 +40,8 @@ GEMB_TEST_INVARIANT=1 julia --project=. -e 'using Pkg; Pkg.test()'
 
 **Test gating.** `test/runtests.jl` always runs offline tests (input validation, unit
 conversions, elevation physics, synthetic forcing, chunk-map formulas, DEM tile
-geometry, CDS client error/retry classification and job-concurrency scheduling).
+geometry, CDS client error/retry classification and job-concurrency scheduling, and the
+glacier-decoupling lookup + adjustment against the vendored table).
 Network-dependent tests are opt-in via environment variables so CI stays
 offline by default:
 - `CDS_API_KEY` — enables ERA5-Land Zarr integration tests
@@ -110,6 +111,16 @@ julia --project=. examples/test_authentication.jl
      paths take their token from here.
    - `dewpoint_to_vapor_pressure()`, `vapor_pressure_to_relative_humidity()`,
      `relative_humidity_to_vapor_pressure()` — Magnus/Buck formulas
+   - Shared by **all three** forcing-adjustment functions (elevation, temperature/precip,
+     glacier), which otherwise duplicate the same boilerplate four ways:
+     - `_rebuild_forcing(stack, meta; changed_layers...)` — rebuild a forcing `DimStack`
+       replacing only the named layers. `rebuild` preserves per-layer metadata, so
+       broadcast results come back annotated without threading it by hand; unchanged
+       variables are never enumerated at the call site.
+     - `_adjust_longwave(LW, e, T, e′, T′)` — Konzelmann ε_cs recomputation preserving the
+       diagnosed cloud increment Δε. Exact identity when `(e′,T′) == (e,T)`.
+     - `_wrap_longitude(lon)` — → −180…180°E, for the geoid grid and the glacier table
+       (both −180…180, unlike the 0–360 ERA5-Land grids). Handles any multiple wrap.
 
 5. **`src/elevation_adjustment.jl`** - Elevation downscaling (workflow 2)
    - `climate_adjust_for_elevation(stack, Δz; lapse_rate, precip_scaling_method)` — per-variable
@@ -120,7 +131,8 @@ julia --project=. examples/test_authentication.jl
      `ANTARCTICA_LAPSE_RATE` (K/km, Jan→Dec). See README for the full per-variable table and references.
    - Sibling **`src/climate_adjustment.jl`** holds the *direct* (non-elevation) perturbations,
      reusing this file's `saturation_vapor_pressure` / `konzelmann_clear_sky_emissivity` /
-     `_SIGMA_SB` rather than redefining them:
+     `_SIGMA_SB` plus `utils.jl`'s `_rebuild_forcing` / `_adjust_longwave` rather than
+     redefining any of them:
      - `temperature_adjust(stack, ΔT)` — uniform offset in K, propagated into `vapor_pressure`
        (constant RH) and `longwave_downward` (Konzelmann ε_cs, cloud increment Δε preserved).
        Deliberately leaves `pressure_air` alone (set by elevation/synoptics, not by warming).
@@ -131,6 +143,25 @@ julia --project=. examples/test_authentication.jl
        `"precipitation_scaling"` multiplicative — and re-run `validate_climate_forcing_units`.
        The identity perturbation (`ΔT=0`, `scaling=1`) is exact. The two are independent by
        design: no implicit Clausius–Clapeyron precipitation response to ΔT.
+   - Sibling **`src/glacier_decoupling.jl`** + **`src/glacier_adjustment.jl`** hold the
+     *ambient → on-glacier* correction (Shaw et al. 2025). Reanalysis 2 m T is an ambient
+     temperature: no glacier boundary layer, so a SEB model fed it overestimates melt.
+     - `glacier_decoupling_table()` / `glacier_decoupling(rgi_id)` / `glacier_decoupling(lat, lon)`
+       read the **vendored** `data/shaw2025_glacier_decoupling.csv.gz` (186,792 RGI v6 glaciers,
+       gzipped CSV, no network). Regenerate with `data/make_shaw2025_decoupling.jl` from the
+       Zenodo `.mat` — that script needs HDF5.jl, which is why **HDF5 is deliberately not a
+       package dependency**. The paper's 5-predictor regression is *not* re-implemented:
+       Table S2 has sign errors in `a4`/`a5` and a corrected refit still only reaches R²=0.54
+       against the authors' own `k`. `k_lower` is the upstream `K_CI`, an absolute **lower
+       bound** (not a half-width) and unclamped, so it can be negative.
+     - `climate_adjust_for_glacier(stack, k)` / `(stack; rgi_id)` applies
+       `T′ = T + (k−1)·max(T − T_ref, 0)` — increment form so `k=1` is bit-exact, **gated at
+       the melting point** by default because a bare `k` multiplier *warms* sub-freezing air.
+       Recomputes `longwave_downward` only. **Leaves `vapor_pressure` untouched on purpose** —
+       do *not* "fix" this by reusing `temperature_adjust`'s constant-RH propagation: SM10
+       Eq. 4 pivots `e` about 6.11 hPa, the opposite sign. Wind is likewise untouched.
+     - **Order matters**: `climate_adjust_for_elevation` first, then this. **RGI regions 05 and
+       19 are absent** from the table, so lookups fail there — pass `k` explicitly.
 
 6. **`src/invariant.jl`** - Time-invariant fields (workflow 3)
    - `climate_model_invariant(; model, parameter, ...)` — returns lazy `Raster`/`RasterStack`.

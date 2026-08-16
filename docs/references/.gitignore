@@ -1,0 +1,5 @@
+# Reference PDFs and datasets are held locally for development, not committed.
+# Provenance and download URLs are recorded in ../on_glacier_temperature_correction.md
+*.pdf
+*.mat
+shaw2025_decoupling/

@@ -32,6 +32,7 @@ using Statistics
 using Zarr
 using HTTP
 using OpenSSL
+using CodecZlib
 
 # Export main interface
 export climate_forcing, climate_chunk_map, get_cds_api_key, climate_adjust_for_elevation,
@@ -51,6 +52,10 @@ export simulate_climate_forcing, simulation_parameter_sets,
 # Export satellite observations (ordered from the CDS Retrieve API, not a lazy store)
 export satellite_albedo, satellite_albedo_layers, SATELLITE_ALBEDO_VARIABLES
 
+# Export on-glacier temperature decoupling (Shaw et al. 2025 lookup table)
+export glacier_decoupling, glacier_decoupling_table, GlacierDecoupling,
+    climate_adjust_for_glacier
+
 # Include submodules
 include("utils.jl")
 include("authenticated_http_store.jl")
@@ -66,6 +71,12 @@ include("elevation_adjustment.jl")
 # Direct temperature / precipitation perturbations — reuses the saturation-vapor
 # and emissivity helpers from elevation_adjustment.jl.
 include("climate_adjustment.jl")
+# Shaw et al. (2025) per-glacier decoupling factors, read from the vendored
+# data/shaw2025_glacier_decoupling.csv.gz lookup table.
+include("glacier_decoupling.jl")
+# Ambient → on-glacier correction, applying the decoupling factor to a forcing stack.
+# Shares _rebuild_forcing / _adjust_longwave (utils.jl) with the two siblings above.
+include("glacier_adjustment.jl")
 
 # Synthetic forcing generation
 include("simulate/simulate_climate_forcing.jl")
