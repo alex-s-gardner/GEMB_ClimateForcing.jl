@@ -112,13 +112,20 @@ function fit_air_temperature(dec_year::Vector{Float64},
 
     day_indices = floor.(Int, dec_year .* 365.25)
 
-    # Compute daily mean of residuals
-    unique_days = sort(unique(day_indices))
-    daily_res = Float64[]
-    for day in unique_days
-        mask = day_indices .== day
-        push!(daily_res, mean(residuals[mask]))
+    # Compute daily mean of residuals. Binning by day offset in a single pass over
+    # the record; masking per unique day (`residuals[day_indices .== day]`) is
+    # O(n_days × n) and allocates a mask and a copy per day.
+    day_lo, day_hi = extrema(day_indices)
+    nbins = day_hi - day_lo + 1
+    bin_sum = zeros(Float64, nbins)
+    bin_count = zeros(Int, nbins)
+    @inbounds for i in eachindex(residuals, day_indices)
+        b = day_indices[i] - day_lo + 1
+        bin_sum[b] += residuals[i]
+        bin_count[b] += 1
     end
+    # Ascending day order, occupied bins only — same sequence as sort(unique(days)).
+    daily_res = [bin_sum[b] / bin_count[b] for b in 1:nbins if bin_count[b] > 0]
 
     # --- weather_sigma_scale ---
     # Model: sigma = 8.0 * scale

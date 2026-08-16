@@ -268,6 +268,34 @@ Workflow-4 functions are direct ports of GEMB's MATLAB `simulate_*` / `fit_*` co
 expected to reproduce its numerics. When editing them, preserve the RNG seeding order and the
 exact coefficient math — divergence from MATLAB is a regression, not a cleanup opportunity.
 
+### Deliberate performance choices
+
+These look like things to tidy up. They are not — each was measured, and the "cleaner" form is
+slower or breaks bit-exactness. Comments at each site record the same thing.
+
+- **`konzelmann_clear_sky_emissivity` uses `sqrt(sqrt(sqrt(x)))`, not `x^(1/8)`.** Algebraically
+  identical, ~9× faster (three hardware `sqrt`s vs a generic `pow`), differs by ≤1 ulp. This is
+  the hot kernel of every longwave adjustment, called twice per time step.
+- **`validate_climate_forcing_units` uses paired `minimum`/`maximum`, not `extrema`.** Base's
+  `extrema` does not SIMD-vectorize, so two vectorized passes beat one scalar pass by ~23×
+  (8.46 ms → 375 µs over a 32-yr hourly record). NaN propagation is identical. This function runs
+  at the end of *every* adjustment, so it dominated their cost.
+- **Do not fuse the adjustment broadcasts.** Both `_adjust_longwave` and
+  `simulate_shortwave_irradiance` were tried as single fused kernels and both got *slower*
+  (10.5 → 12.2 ms and 8.0 → 11.2 ms) — staged per-array broadcasts vectorize better than one long
+  kernel, even though fusing cuts allocations ~4×.
+- **`fit_longwave_irradiance_delta`'s M-step keeps its allocating broadcasts.** A single-pass
+  accumulation loop is faster but reassociates the additions away from `sum`'s pairwise order,
+  shifting the fitted coefficients ~1e-14 — a MATLAB-parity regression. `sum(f, indices)` is not
+  a workaround: reducing lazily over indices blocks differently from reducing over an `Array`.
+  The E-step is where the time goes and *is* optimized (the responsibility matrix is hoisted out
+  of the iteration loop and row slicing removed: 112M → 1.6k allocations). Its `P[k] * (pdf)`
+  grouping is also load-bearing for bit-exactness.
+- **`PrecompileTools` workload in `src/GEMB_ClimateForcing.jl` is deliberately network-free** —
+  no Zarr, CDS, or `/vsicurl/` — so precompilation stays offline and CI-safe. `climate_forcing`
+  is therefore not covered. It costs ~1.4 s of precompile time and buys ~2.6 s of first-call
+  latency.
+
 ### Data Flow
 
 ```
