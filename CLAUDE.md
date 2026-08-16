@@ -78,6 +78,10 @@ julia --project=. examples/era5_land_example.jl
 
 # Test authentication only
 julia --project=. examples/test_authentication.jl
+
+# Glacier bare-ice albedo from C3S satellite albedo. SLOW on a cold cache (CDS job
+# queue latency, 30–90 min/year) and needs the satellite-albedo licence accepted.
+julia --project=. examples/glacier_ice_albedo_example.jl
 ```
 
 ## Architecture
@@ -285,7 +289,10 @@ julia --project=. examples/test_authentication.jl
    - QFLAG bits are read from each file's own `flag_masks`/`flag_meanings` (`_qflag_table`),
      never hardcoded — the convention is version-specific — and an unreadable legend degrades to
      range-only QC with a warning rather than erroring.
-   - Was formerly `examples/albedo_annual_low_percentile.jl`; the example is gone, don't restore it.
+   - Was formerly `examples/albedo_annual_low_percentile.jl`; that CLI script is gone, don't
+     restore it. `examples/glacier_ice_albedo_example.jl` is its replacement: a thin driver
+     over the package function (summary + NetCDF write), runnable on `include` with no
+     `ARGS`/`PROGRAM_FILE` handling, keeping no analysis logic of its own.
 
 11. **`src/simulate/simulate_climate_forcing.jl`** - Synthetic forcing (workflow 4)
    - `simulate_climate_forcing(set_id, time_step_hours=0)` — generates a full stochastic forcing
