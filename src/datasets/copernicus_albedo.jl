@@ -91,6 +91,13 @@ const _ALBEDO_YEARS = 2018:2024
 # Confirmed against the live costing endpoint.
 const _ALBEDO_COST_LIMIT = 20
 
+# Per-job give-up time, in seconds. Far above the generic `cds_retrieve` default because
+# this product queues for a long time: a 12-timestep order was measured still `running`
+# after 1840 s, so a 1800 s timeout aborts jobs that would have succeeded. A timeout is
+# especially expensive here — it kills the wait *before* the finished result is cached, so
+# the work is lost and the order must be resubmitted for another 30–90 min of queue time.
+const _ALBEDO_JOB_TIMEOUT = 10800
+
 # Filename token per variable, as used in the C3S product filenames. Verified against a
 # delivered file: `c3s_ALBB-DH_20190610000000_GLOBE_SENTINEL3_V3.1.0.area-subset.….nc`
 const _ALBEDO_FILE_TOKENS = Dict(
@@ -485,6 +492,19 @@ function satellite_albedo_layers(path::AbstractString)
 end
 
 """
+    _albedo_resolve_layers(path, variable, layer) -> Vector{Symbol}
+
+Decide which NetCDF layer(s) to read, as a vector. `layer` may be a `Symbol`, a vector of
+them, or `nothing`; see [`_albedo_resolve_layer`](@ref) for the single-layer resolution
+each entry goes through.
+"""
+function _albedo_resolve_layers(path::AbstractString, variable::Symbol, layer)
+    layers = isnothing(layer) || layer isa Symbol ? [layer] : collect(layer)
+    isempty(layers) && throw(ArgumentError("`layer` must name at least one layer"))
+    return unique(_albedo_resolve_layer(path, variable, l) for l in layers)
+end
+
+"""
     _albedo_resolve_layer(path, variable, layer) -> Symbol
 
 Decide which NetCDF layer to read. An explicit `layer` is validated against the file;
@@ -624,7 +644,7 @@ end
     satellite_albedo(; time_range, extent=nothing, variable=:albb_dh, layer=nothing,
                        nominal_day=nothing, token=nothing, cache_path=nothing,
                        force_download=false, verbose=true, poll_interval=10,
-                       timeout=1800) -> RasterSeries
+                       timeout=$(_ALBEDO_JOB_TIMEOUT)) -> RasterSeries
 
 Surface albedo from the C3S `satellite-albedo` product (Sentinel-3 OLCI+SLSTR, 300 m,
 10-daily), as a **lazy** `RasterSeries` over the `Ti` (time) dimension.
@@ -641,12 +661,15 @@ below before requesting long series.
   `nothing` (default) for global. Global 300 m data is ~120960 × 47040 pixels *per
   variable per timestep*, so an extent is strongly recommended.
 - `variable`: one `Symbol` (default `:albb_dh`, broadband black-sky) or a vector of them.
-  See [`SATELLITE_ALBEDO_VARIABLES`](@ref). A single variable returns a series of
-  `Raster`s; several return a series of `RasterStack`s.
-- `layer`: which NetCDF layer to read from each ordered file. Defaults to the variable's
-  full-spectrum broadband albedo (`AL_DH_BB` / `AL_BH_BB`). Each file also holds
-  near-infrared (`_NI`) and visible (`_VI`) bands, per-band `_ERR` uncertainties, and
-  `QFLAG` — use [`satellite_albedo_layers`](@ref) to list them.
+  See [`SATELLITE_ALBEDO_VARIABLES`](@ref). One variable and one layer returns a series of
+  `Raster`s; several of either return a series of `RasterStack`s.
+- `layer`: which NetCDF layer(s) to read from each ordered file — one `Symbol`, a vector
+  of them, or `nothing` for the variable's full-spectrum broadband albedo (`AL_DH_BB` /
+  `AL_BH_BB`). Each file also holds near-infrared (`_NI`) and visible (`_VI`) bands,
+  per-band `_ERR` uncertainties, and `QFLAG`; list them with
+  [`satellite_albedo_layers`](@ref). Several layers of one variable come back as a
+  `RasterStack` keyed by *layer* name, from the same cached file and with **no extra CDS
+  job** — much cheaper than one call per layer.
 - `nominal_day`: override the standard `[10, 20, end-of-month]` cycle.
 - `token`: CDS API key; defaults to [`get_cds_api_key()`](@ref).
 - `cache_path`: cache directory; defaults to a per-user temp directory. Cached timesteps
@@ -693,20 +716,26 @@ read(alb[1])                    # materialise the first timestep (albedo fractio
 vis = satellite_albedo(; time_range = (DateTime(2019, 6, 1), DateTime(2019, 6, 30)),
                        extent = Extent(X = (-50.0, -45.0), Y = (66.0, 68.0)),
                        layer = :AL_DH_VI)
+
+# Albedo, its uncertainty and the quality flag together — one call, one set of jobs:
+qc = satellite_albedo(; time_range = (DateTime(2019, 6, 1), DateTime(2019, 6, 30)),
+                      extent = Extent(X = (-50.0, -45.0), Y = (66.0, 68.0)),
+                      layer = [:AL_DH_BB, :AL_DH_BB_ERR, :QFLAG])
+qc[1][:QFLAG]                   # a RasterStack keyed by layer name per timestep
 ```
 """
 function satellite_albedo(;
     time_range::Tuple{DateTime,DateTime},
     extent=nothing,
     variable::Union{Symbol,AbstractVector{Symbol}}=:albb_dh,
-    layer::Union{Nothing,Symbol}=nothing,
+    layer::Union{Nothing,Symbol,AbstractVector{Symbol}}=nothing,
     nominal_day::Union{Nothing,AbstractVector{<:Integer}}=nothing,
     token::Union{String,Nothing}=nothing,
     cache_path::Union{String,Nothing}=nothing,
     force_download::Bool=false,
     verbose::Bool=true,
     poll_interval::Real=10,
-    timeout::Real=1800,
+    timeout::Real=_ALBEDO_JOB_TIMEOUT,
     max_concurrent_jobs::Integer=6,
     submit_stagger::Real=15,
 )
@@ -797,11 +826,13 @@ function satellite_albedo(;
     # uncertainties, QFLAG, and a scalar `crs`), so the layer has to be named explicitly —
     # an unnamed `Raster(path)` picks `crs` and yields a dimensionless Char. Resolve once
     # per variable from its first file; all timesteps of a variable share a layout.
-    resolved = Dict(v => _albedo_resolve_layer(cached[(first(available), v)], v, layer)
+    resolved = Dict(v => _albedo_resolve_layers(cached[(first(available), v)], v, layer)
                     for v in variables)
+    multi_layer = length(resolved[first(variables)]) > 1
 
     _albedo_check_time_coord(cached[(first(available), first(variables))],
-                             resolved[first(variables)], first(available); verbose=verbose)
+                             first(resolved[first(variables)]), first(available);
+                             verbose=verbose)
 
     meta = Dict{String,Any}(
         "source" => "C3S satellite surface albedo (CDS dataset $(_ALBEDO_DATASET))",
@@ -811,31 +842,46 @@ function satellite_albedo(;
         "product_version" => _ALBEDO_VERSION,
         "resolution" => _ALBEDO_RESOLUTION,
         "variable" => length(variables) == 1 ? first(variables) : Tuple(variables),
-        "layer" => length(variables) == 1 ? resolved[first(variables)] :
-                   Tuple(resolved[v] for v in variables),
+        "layer" => let ls = length(variables) == 1 ? resolved[first(variables)] :
+                            [l for v in variables for l in resolved[v]]
+            length(ls) == 1 ? only(ls) : Tuple(ls)
+        end,
         "extent" => isnothing(extent) ? "global" : string(extent),
         "n_timesteps" => length(available),
         "units" => "1 (dimensionless reflectance fraction, 0–1)",
         "long_name" => "Surface albedo",
     )
 
-    # Build the lazy series: one Raster per timestep for a single variable, or a
-    # RasterStack when several were requested (mirrors `climate_model_invariant`).
+    # Build the lazy series: one Raster per timestep in the single-variable, single-layer
+    # case, otherwise a RasterStack (mirrors `climate_model_invariant`).
     #
     # `RasterSeries` has no metadata field — `rebuild(series; metadata=...)` is accepted
     # but silently discarded — so the provenance Dict is attached to each layer instead,
     # where `view` preserves it through the lazy crop.
     layers = map(available) do d
         layer_meta = merge(meta, Dict{String,Any}("time" => d))
-        rasters = map(variables) do v
-            r = _albedo_open_layer(cached[(d, v)], resolved[v])
-            return _crop_to_extent(rebuild(r; metadata=layer_meta), extent)
+        # A stack is keyed by the *ordered variable* name when one layer per variable was
+        # requested, so `stack[:albb_dh]` works regardless of which band was read — but by
+        # *layer* name when several layers of one variable were asked for, since that is
+        # what distinguishes them.
+        pairs = Pair{Symbol,Any}[]
+        for v in variables
+            for l in resolved[v]
+                r = _albedo_open_layer(cached[(d, v)], l)
+                # `"file"` is the product NetCDF this layer reads. Callers needing
+                # something the `Raster` does not expose — CF attributes such as the
+                # `QFLAG` legend — can open it directly instead of re-deriving the cache
+                # layout from private helpers. Exact per (date, variable), unlike a
+                # directory scan.
+                r = rebuild(r; metadata=merge(layer_meta,
+                                              Dict{String,Any}("file" => cached[(d, v)],
+                                                               "layer" => l)))
+                key = multi_layer ? l : v
+                push!(pairs, key => _crop_to_extent(r, extent))
+            end
         end
-        # Stack keyed by the *ordered variable* names, not the internal layer names, so
-        # `stack[:albb_dh]` works regardless of which spectral band was read.
-        return length(variables) == 1 ? only(rasters) :
-               RasterStack(NamedTuple{Tuple(variables)}(Tuple(rasters));
-                           metadata=layer_meta)
+        length(pairs) == 1 && return last(only(pairs))
+        return RasterStack(NamedTuple(pairs); metadata=layer_meta)
     end
 
     return RasterSeries(layers, Ti(available))
