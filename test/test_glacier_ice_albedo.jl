@@ -338,15 +338,19 @@ using GEMB_ClimateForcing: _low_percentile_mean, _LowPercentileTopK, _accumulate
             end
             got, got_counts = _finalize(acc2)
             @test got == want                     # bit-identical, not merely close
+            # `copy`, because `_finalize` returns the count layer as a reshaped *view* of
+            # the mmap — deliberately, so a global grid is not pulled into RAM. Holding the
+            # view here would keep the scratch file mapped past the `rm` below.
+            got_counts = copy(got_counts)
             @test got_counts == want_counts
 
             # `n_seen` is restored, so the declared-count guard still spans the whole year:
             # a fifth observation is rejected rather than silently accepted.
             @test_throws ArgumentError _accumulate!(acc2, obs[1])
         finally
-            # Windows will not delete a directory whose files are still mapped, so the
-            # accumulator's mmaps must be collected before `rm` — same ordering the
-            # driver's `discard_after_fold` needs, and for the same reason.
+            # Windows will not delete a directory whose files are still mapped, so every
+            # reference to the accumulator's mmaps must be collected before `rm` — the same
+            # ordering the driver's `discard_after_fold` needs, and for the same reason.
             acc2 = nothing
             GC.gc()
             rm(dir; recursive=true, force=true)
