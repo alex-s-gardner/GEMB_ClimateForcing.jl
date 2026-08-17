@@ -250,6 +250,18 @@ julia --project=. examples/glacier_ice_albedo_example.jl
      mostly courts rejections. **Do not "optimize" by splitting a request into per-month
      calls** — that re-serialises the ordering and is slower; pass the full range and let
      the chunker do it.
+   - **A job's `timeout` is not what makes big orders fail.** `_ALBEDO_JOB_TIMEOUT` was raised
+     3 h → **24 h** because real orders routinely run past 3 h server-side, and giving up
+     happens *before* anything is cached, so the abandoned queue time is pure loss. But
+     waiting longer does not rescue a *too-large* order: a global `area`
+     (`[90,-180,-90,180]`) and a hemisphere band (`[90,-180,30,180]`) each ran 10–30 min and
+     then came back `status:"failed"` with an **empty traceback** on `/results` — no
+     diagnosable reason, just a server-side death. Treat wide-`area` failure as a size limit
+     to work around by tiling, not as something to retry.
+   - **Killing a run abandons its server-side jobs permanently.** Nothing persists job IDs, so
+     an interrupted call leaves `running` jobs consuming the account's ~3 concurrent slots
+     until they are dismissed by hand (`DELETE /jobs/{id}`; `GET /jobs?limit=N` lists them).
+     A follow-on run then queues behind ghosts of the one that was killed.
    - Sibling **`src/glacier_ice_albedo.jl`** reduces that record to GEMB's **bare-ice albedo**:
      `compute_glacier_ice_albedo(years; extent, ...)` → `RasterStack` over (`X`, `Y`, `Ti`) with
      `:glacier_ice_albedo` (Float32, NaN where unresolved) and `:n_valid_observations`.
@@ -275,6 +287,29 @@ julia --project=. examples/glacier_ice_albedo_example.jl
      change, not a speed one. Bit-identical to sorting every valid value — the same `k` values
      reach the same `mean` in the same order — and `_low_percentile_mean` remains as the batch
      wrapper the tests compare against.
+   - **Four keywords exist only for grids far larger than a glacier basin**, all off or no-ops
+     by default so regional behaviour is untouched. Measured product size is **9.2 B/px**
+     across a file's seven layers, at a measured spacing of **1/336°** in both axes. The
+     documented global shape 120960 × 47040 is 360° of longitude but only 140° of latitude
+     (so presumably 80°N–60°S, not the full sphere) — that latitude bound is *not* verified
+     here, and a full-sphere grid would instead be 120960 × 60480. Either way a global
+     timestep is ~52–67 GB and a year's 36 is ~1.9–2.4 TB — hence all of this:
+     - `block_rows=512` reads each timestep in Y-slabs instead of whole (a global timestep's
+       three layers are ~110 GB read at once). **Bit-identical at any block size** — verified
+       against the whole-grid path on real files at block_rows ∈ {1,7,13,17,30,512}.
+     - `scratch_dir` / `scratch_threshold_pixels=200_000_000`: past that pixel count the
+       accumulator (`kmax·npx·4 + 2·npx·4` bytes — ~117 GB globally, vs 103 GB of RAM) is
+       `Mmap`-backed on disk. Also bit-identical to the in-memory path.
+     - `batch_timesteps` + `discard_after_fold`: order a year in batches and **delete each
+       batch's product files once folded**, bounding peak disk to one batch. `batch_timesteps`
+       is a *deliberate pessimisation* — batches order serially, so wall-clock grows with the
+       batch count, against the concurrent single call the default uses. Only reach for it
+       when the year's files genuinely do not fit. `discard_after_fold` is destructive: it
+       gives up the cache, so a re-run reorders from CDS. It must `GC.gc()` before `rm`,
+       because NCDatasets holds each file open until its handles are collected.
+     - `n_expected` comes from `_albedo_timesteps` over the *whole year*, not from the batch,
+       so `kmax` is identical however the year is split. Batched folding is verified
+       bit-identical to the single call on real cached files (1, 2 and 4 batches).
    - Three deliberate QC choices, each a trap to re-check before "fixing":
      - **`albedo_range`'s 0.3 floor is glaciological, not physical.** Exposed ice rarely goes
        below ~0.3 broadband, so darker pixels are usually rock/water/shadow/failed inversion.

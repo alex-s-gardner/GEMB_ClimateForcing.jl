@@ -223,21 +223,57 @@ mutable struct _LowPercentileTopK
     n_expected::Int
     n_seen::Int
     sz::Tuple{Int,Int}
-    vals::Matrix{Float32}    # kmax × npixel, the retained smallest values (unsorted)
-    nfilled::Vector{Int32}   # how many of the kmax slots are in use
-    counts::Vector{Int32}    # valid observations per pixel
+    # Field types are abstract so the same struct can hold either plain in-memory arrays
+    # (the default) or `Mmap.mmap` views backed by scratch files (`scratch_dir`), which is
+    # what makes a global grid possible at all — see `_topk_scratch_arrays`. The kernels
+    # below are the hot path, so they take these as typed arguments rather than reading the
+    # fields repeatedly.
+    vals::AbstractMatrix{Float32}    # kmax × npixel, the retained smallest values (unsorted)
+    nfilled::AbstractVector{Int32}   # how many of the kmax slots are in use
+    counts::AbstractVector{Int32}    # valid observations per pixel
+end
+
+"""
+    _topk_scratch_arrays(dir, kmax, npixel) -> (vals, nfilled, counts)
+
+Allocate the accumulator's three arrays as `Mmap.mmap` views over files in `dir`.
+
+At global 300 m (120960 × 60480 = 7.32 Gpx) the in-memory form needs
+`kmax·npixel·4 + 2·npixel·4` ≈ 117 GB, which does not fit in RAM. Paging the same bytes
+through the filesystem trades that for ~95 GB of scratch disk and lets the OS keep only
+the working set resident. Values stay `Float32` and counts `Int32`, so results are
+bit-identical to the in-memory path — this is a *placement* change, not a numeric one.
+
+`nfilled`/`counts` are zero-filled because `Mmap.mmap` guarantees a new file reads as
+zeros, which is exactly the required initial state; `vals` is written before it is read
+(guarded by `nfilled`), so it is left undefined.
+"""
+function _topk_scratch_arrays(dir::AbstractString, kmax::Int, npixel::Int)
+    mkpath(dir)
+    open_map(name, T, dims) = open(joinpath(dir, name), "w+") do io
+        Mmap.mmap(io, Array{T,length(dims)}, dims)
+    end
+    vals = open_map("topk_vals.bin", Float32, (kmax, npixel))
+    nfilled = open_map("topk_nfilled.bin", Int32, (npixel,))
+    counts = open_map("topk_counts.bin", Int32, (npixel,))
+    return vals, nfilled, counts
 end
 
 function _LowPercentileTopK(sz::Tuple{Int,Int}, n_expected::Integer,
-                            percentile::Real, min_samples::Integer)
+                            percentile::Real, min_samples::Integer;
+                            scratch_dir::Union{Nothing,AbstractString}=nothing)
     (0 < percentile <= 1) || throw(ArgumentError(
         "percentile must be in (0, 1]; got $(percentile)"))
     n_expected >= 1 || throw(ArgumentError("no observations supplied"))
     kmax = max(1, ceil(Int, percentile * n_expected))
     npixel = prod(sz)
+    vals, nfilled, counts = if isnothing(scratch_dir)
+        Matrix{Float32}(undef, kmax, npixel), zeros(Int32, npixel), zeros(Int32, npixel)
+    else
+        _topk_scratch_arrays(scratch_dir, kmax, npixel)
+    end
     return _LowPercentileTopK(Float64(percentile), Int(min_samples), kmax, Int(n_expected),
-                              0, sz, Matrix{Float32}(undef, kmax, npixel),
-                              zeros(Int32, npixel), zeros(Int32, npixel))
+                              0, sz, vals, nfilled, counts)
 end
 
 """
@@ -251,16 +287,36 @@ function _accumulate!(acc::_LowPercentileTopK, m::AbstractMatrix{Float32})
     acc.n_seen += 1
     acc.n_seen <= acc.n_expected || throw(ArgumentError(
         "more observations accumulated than the $(acc.n_expected) declared"))
-    kmax = acc.kmax
-    vals = acc.vals
-    @inbounds for p in eachindex(m)
-        v = m[p]
+    # Offset 0: a whole-grid fold writes pixel p of the accumulator from element p of `m`.
+    _accumulate_block!(acc.vals, acc.nfilled, acc.counts, m, 0, acc.kmax)
+    return acc
+end
+
+"""
+    _accumulate_block!(vals, nfilled, counts, m, offset, kmax)
+
+Fold `m` into the accumulator arrays starting at linear pixel `offset`, i.e. element `i`
+of `m` updates pixel `offset + i`.
+
+Split out of [`_accumulate!`](@ref) for two reasons. It takes the three arrays as
+*concretely typed* parameters, so the loop specializes on whether they are `Array`s or
+`Mmap` views instead of dynamically dispatching every element access through
+`_LowPercentileTopK`'s abstract fields — that indirection would otherwise cost far more
+than the mmap paging it enables. And the `offset` lets a caller fold one Y-block of a
+grid at a time ([`_accumulate_blockwise!`](@ref)) without materialising the whole grid.
+"""
+function _accumulate_block!(vals::AbstractMatrix{Float32}, nfilled::AbstractVector{Int32},
+                            counts::AbstractVector{Int32}, m::AbstractArray{Float32},
+                            offset::Int, kmax::Int)
+    @inbounds for i in eachindex(m)
+        v = m[i]
         isnan(v) && continue
-        acc.counts[p] += Int32(1)
-        nf = Int(acc.nfilled[p])
+        p = offset + i
+        counts[p] += Int32(1)
+        nf = Int(nfilled[p])
         if nf < kmax
             vals[nf + 1, p] = v
-            acc.nfilled[p] = Int32(nf + 1)
+            nfilled[p] = Int32(nf + 1)
         else
             # Evict the largest of the retained values, if this one is smaller. kmax is
             # tiny (2 at the defaults), so a linear scan beats any heap bookkeeping.
@@ -273,7 +329,7 @@ function _accumulate!(acc::_LowPercentileTopK, m::AbstractMatrix{Float32})
             v < worst_v && (vals[worst, p] = v)
         end
     end
-    return acc
+    return nothing
 end
 
 """
@@ -288,21 +344,88 @@ but their count is still reported, so a caller can see *why* a pixel is missing.
 """
 function _finalize(acc::_LowPercentileTopK)
     result = fill(NaN32, acc.sz)
-    buf = Vector{Float32}(undef, acc.kmax)
+    _finalize_into!(result, acc.vals, acc.nfilled, acc.counts,
+                    acc.kmax, acc.percentile, acc.min_samples)
+    # `reshape` of an mmap view stays an mmap view, so a global-grid count layer is not
+    # copied into RAM here; `Raster` construction later decides what to materialise.
+    return result, reshape(acc.counts, acc.sz)
+end
+
+"""
+    _finalize_into!(result, vals, nfilled, counts, kmax, percentile, min_samples)
+
+Write the per-pixel statistic into `result`, whose length is the number of pixels.
+
+Typed-argument inner kernel for the same reason as [`_accumulate_block!`](@ref): reading
+`_LowPercentileTopK`'s abstract fields elementwise would dynamically dispatch on every
+access.
+"""
+function _finalize_into!(result::AbstractArray{Float32}, vals::AbstractMatrix{Float32},
+                         nfilled::AbstractVector{Int32}, counts::AbstractVector{Int32},
+                         kmax::Int, percentile::Float64, min_samples::Int)
+    buf = Vector{Float32}(undef, kmax)
     @inbounds for p in eachindex(result)
-        n = Int(acc.counts[p])
-        n >= acc.min_samples || continue
-        nf = Int(acc.nfilled[p])
+        n = Int(counts[p])
+        n >= min_samples || continue
+        nf = Int(nfilled[p])
         nf >= 1 || continue
-        k = min(max(1, ceil(Int, acc.percentile * n)), nf)
+        k = min(max(1, ceil(Int, percentile * n)), nf)
         for j in 1:nf
-            buf[j] = acc.vals[j, p]
+            buf[j] = vals[j, p]
         end
         kept = view(buf, 1:nf)
         sort!(kept)
         result[p] = mean(view(kept, 1:k))
     end
-    return result, reshape(acc.counts, acc.sz)
+    return result
+end
+
+"""
+    _accumulate_blockwise!(acc, alb, qflag, err; block_rows, qc...) -> n_valid
+
+Read one timestep in horizontal blocks of `block_rows` grid rows and fold each block into
+`acc`, returning the number of observations that survived QC.
+
+**Why blocks.** `_accumulate!`'s caller normally does `parent(read(layer))`, materialising
+the whole grid. At global 300 m one layer is 7.32 Gpx — 37 GB as
+`Union{Missing,Float32}`, and three layers (albedo, `QFLAG`, `_ERR`) is ~110 GB, which
+exceeds RAM before any statistic is formed. Reading a slab of rows at a time bounds that
+by `block_rows / ny`: at the default 512 rows a global block is ~0.9 GB across all three
+layers, and a small extent is read in a single block, so nothing changes for regional runs.
+
+Blocks are taken along the **second** (Y) dimension because the product's chunk layout is
+`(nx, ny, 1)` — full rows of X — so a Y-slab is contiguous in the file and reads without
+random access. The linear pixel offset works because Julia is column-major: block `j0:j1`
+of an `(nx, ny)` grid is exactly linear pixels `(j0-1)·nx + 1 … j1·nx`, contiguous and in
+the same order the accumulator indexes.
+"""
+function _accumulate_blockwise!(acc::_LowPercentileTopK, alb, qflag, err;
+                                block_rows::Integer=512,
+                                bitmask::Integer=0,
+                                values::AbstractVector{<:Integer}=Int[],
+                                max_error::Union{Nothing,Real}=nothing,
+                                albedo_range::Tuple{Real,Real}=_ICE_ALBEDO_RANGE)
+    nx, ny = size(alb)
+    (nx, ny) == acc.sz || throw(ArgumentError(
+        "observation grid $((nx, ny)) does not match $(acc.sz)"))
+    acc.n_seen += 1
+    acc.n_seen <= acc.n_expected || throw(ArgumentError(
+        "more observations accumulated than the $(acc.n_expected) declared"))
+
+    n_valid = 0
+    step = max(1, Int(block_rows))
+    for j0 in 1:step:ny
+        j1 = min(j0 + step - 1, ny)
+        rows = j0:j1
+        a = alb[:, rows]
+        q = isnothing(qflag) ? nothing : qflag[:, rows]
+        e = isnothing(err) ? nothing : err[:, rows]
+        m = _valid_albedo(a, q, e; bitmask=bitmask, values=values,
+                          max_error=max_error, albedo_range=albedo_range)
+        n_valid += count(!isnan, m)
+        _accumulate_block!(acc.vals, acc.nfilled, acc.counts, m, (j0 - 1) * nx, acc.kmax)
+    end
+    return n_valid
 end
 
 """
@@ -382,6 +505,24 @@ Applied per observation, before any statistic is formed:
 - `timeout`, `max_concurrent_jobs`, `verbose`: passed through to
   [`satellite_albedo`](@ref), whose defaults apply.
 
+## Very large grids
+Four keywords exist only for grids far larger than a glacier basin. All are no-ops or
+off by default, so a regional run behaves exactly as before:
+- `block_rows = 512`: read each timestep in Y-slabs of this many rows rather than whole,
+  so a global timestep (~67 GB across its three layers) never materialises. Results are
+  bit-identical to a whole-grid read at any block size.
+- `scratch_dir`, `scratch_threshold_pixels = 200_000_000`: past that pixel count the
+  accumulator (`kmax·npx·4 + 2·npx·4` bytes — ~117 GB globally) is backed by `Mmap`
+  scratch files instead of RAM. Pass `scratch_dir` to force it, and to control *where*.
+- `batch_timesteps`: order the year in batches of this many timesteps instead of one
+  call. **This is a deliberate pessimisation** — batches are ordered serially, so
+  wall-clock grows with the batch count, whereas the default single call orders the
+  year's ~3 jobs concurrently. Use it only with:
+- `discard_after_fold = false`: **delete each batch's product files once folded.**
+  Destructive: it gives up the cache, so a re-run reorders from CDS. Together these two
+  bound peak disk to one batch, which is the only way a global year (~36 × 67 GB, far
+  past any normal free space) fits at all.
+
 # Cost
 A cold year is ~3 CDS jobs, ordered and polled concurrently, so budget **30–90 minutes
 per year**; cached years are nearly free. The whole year is requested in one
@@ -430,6 +571,16 @@ function compute_glacier_ice_albedo(years=GLACIER_ICE_ALBEDO_YEARS;
                                     token::Union{Nothing,String}=nothing,
                                     cache_path::Union{Nothing,String}=nothing,
                                     verbose::Bool=true,
+                                    # Large-grid controls. Both are no-ops at regional size:
+                                    # a small grid is read in one block and kept in RAM, so
+                                    # results and cost are unchanged from before.
+                                    block_rows::Integer=512,
+                                    scratch_dir::Union{Nothing,AbstractString}=nothing,
+                                    scratch_threshold_pixels::Real=200_000_000,
+                                    # Disk-constrained ordering. `nothing` = one call for
+                                    # the whole year, the concurrent fast path.
+                                    batch_timesteps::Union{Nothing,Integer}=nothing,
+                                    discard_after_fold::Bool=false,
                                     # `timeout`, `max_concurrent_jobs`, `poll_interval`,
                                     # `force_download`, … go straight to the loader rather
                                     # than being restated here with defaults that could drift.
@@ -450,68 +601,159 @@ function compute_glacier_ice_albedo(years=GLACIER_ICE_ALBEDO_YEARS;
     # read from the first year's files and reused.
     legend = nothing
 
+    want = Symbol[layer, :QFLAG]
+    isnothing(err_layer) || push!(want, err_layer)
+
     for y in year_list
         verbose && @info "Loading $(y) albedo (ordering from CDS if not cached)"
-        time_range = (DateTime(y, 1, 1), DateTime(y, 12, 31, 23, 59, 59))
 
-        # One call for the whole year *and* all three layers. `satellite_albedo` splits the
-        # year into the ~3 jobs the cost limit allows and runs them **concurrently**, so
-        # the year costs about one job's queue time rather than three in series. Do not
-        # "help" by looping over months — that serialises the ordering and is much slower.
-        # The extra layers live in the same product files, so they cost no extra CDS job.
-        want = Symbol[layer, :QFLAG]
-        isnothing(err_layer) || push!(want, err_layer)
-        series = try
-            satellite_albedo(; time_range, extent, variable, layer=want, verbose,
-                             token, cache_path, albedo_kwargs...)
-        catch err
-            @warn """
-            Could not open all of $(want) — falling back to the albedo layer alone, so QC \
-            degrades to missing/out-of-range only.
-            """ exception = err
-            satellite_albedo(; time_range, extent, variable, layer, verbose,
-                             token, cache_path, albedo_kwargs...)
-        end
-        dates = lookup(series, Ti)
-        isempty(dates) && error("No albedo timesteps returned for $(y)")
+        # Every timestep the year *should* yield, known before any ordering, so the
+        # accumulator's `n_expected` (hence `kmax`) is right even when the year is
+        # ordered in several batches.
+        year_dates = _albedo_timesteps((DateTime(y, 1, 1), DateTime(y, 12, 31, 23, 59, 59)))
+        isempty(year_dates) && error("No albedo timesteps fall in $(y)")
 
-        # A single surviving layer comes back as a series of `Raster`s rather than
-        # `RasterStack`s, so name the accessors once instead of branching per timestep.
-        multi = first(series) isa AbstractRasterStack
-        _layer_of(st, l) = multi ? st[l] : st
-        has(l) = multi && haskey(first(series), l)
-        qflag_key = has(:QFLAG) ? :QFLAG : nothing
-        err_key = (!isnothing(err_layer) && has(err_layer)) ? err_layer : nothing
+        # One batch = one `satellite_albedo` call. The default is a single batch for the
+        # whole year, which is the fast path: that call splits the year into the ~3 jobs
+        # the cost limit allows and runs them **concurrently**, so the year costs about
+        # one job's queue time rather than three in series.
+        #
+        # `batch_timesteps` exists only for grids whose *product files* do not fit on
+        # disk — a global year is ~36 × 67 GB — and it is a deliberate pessimisation:
+        # batches are ordered one after another, so wall-clock grows roughly with the
+        # batch count. Do not set it to work around anything else.
+        batches = isnothing(batch_timesteps) ? [year_dates] :
+                  [year_dates[i:min(i + Int(batch_timesteps) - 1, end)]
+                   for i in 1:Int(batch_timesteps):length(year_dates)]
 
-        if isnothing(legend)
-            path = isnothing(qflag_key) ? nothing :
-                   get(metadata(_layer_of(first(series), qflag_key)), "file", nothing)
-            legend = isnothing(qflag_key) ? (0, Int[], String[]) :
-                     _albedo_qflag_legend(path; patterns=qflag_reject,
-                                          brdf_warning=qflag_reject_brdf_warning)
-            verbose && !isempty(legend[3]) && @info "Rejecting QFLAG classes" classes =
-                legend[3] bitmask = legend[1] values = legend[2]
-        end
-        bitmask, values, _ = legend
-
-        # Stream the timesteps into the accumulator rather than holding the year's masked
-        # grids: only the darkest `ceil(percentile * n)` values per pixel are ever needed.
+        # Two independent scale problems, both only biting on very large grids, so both are
+        # switched on by pixel count rather than changing behaviour for regional runs:
+        #  * the accumulator itself is `kmax·npx·4 + 2·npx·4` bytes — 117 GB globally — so
+        #    past `scratch_threshold_pixels` it is mmap-backed on disk instead of in RAM.
+        #  * each timestep's three layers are ~110 GB globally if read whole, so they are
+        #    read and folded in Y-blocks (`_accumulate_blockwise!`).
         acc = nothing
-        for (i, d) in enumerate(dates)
-            st = series[i]
-            a = parent(read(_layer_of(st, layer)))
-            q = isnothing(qflag_key) ? nothing : parent(read(st[qflag_key]))
-            e = isnothing(err_key) ? nothing : parent(read(st[err_key]))
-            m = _valid_albedo(a, q, e; bitmask, values, max_error, albedo_range)
-            isnothing(acc) && (acc = _LowPercentileTopK(size(m), length(dates),
-                                                        percentile, min_samples))
-            _accumulate!(acc, m)
-            if verbose
-                nvalid = count(!isnan, m)
-                @info "  $(d)  valid $(round(100 * nvalid / length(m); digits=1))%"
+        scratch = nothing
+        n_folded = 0
+
+        for (bi, batch) in enumerate(batches)
+            length(batches) > 1 && verbose &&
+                @info "  batch $(bi)/$(length(batches)): $(first(batch)) … $(last(batch))" n_timesteps=length(batch)
+            time_range = (DateTime(first(batch)),
+                          DateTime(last(batch)) + Hour(23) + Minute(59) + Second(59))
+
+            # All three layers in one call: they live in the same product files, so the
+            # extra layers cost no extra CDS job, and one call keeps the timesteps
+            # aligned by construction.
+            series = try
+                satellite_albedo(; time_range, extent, variable, layer=want, verbose,
+                                 token, cache_path, albedo_kwargs...)
+            catch err
+                # ONLY a layer-availability failure may fall through to the retry. That
+                # error is raised by `_albedo_resolve_layer` *after* the CDS jobs have
+                # completed and their files are cached, so re-calling `satellite_albedo`
+                # re-reads the cache and orders nothing — which is what makes the
+                # fallback cheap.
+                #
+                # Every other failure must propagate. A job timeout, a queue-limit give-up
+                # or an HTTP error all arrive here mid-order, with nothing cached;
+                # retrying then re-submits the *same* request (`layer` is not part of the
+                # request hash, so it reuses the same job dir, finds no archive and orders
+                # again). That turned a 3 h timeout into an endless 3-hourly resubmit loop
+                # that never cached a byte and steadily filled the account's job queue.
+                # `_cds_wait` raises timeouts and rejections via `error(...)` →
+                # `ErrorException`, while the layer error is an `ArgumentError`, so the
+                # type alone separates them.
+                err isa ArgumentError || rethrow()
+                @warn """
+                Could not open all of $(want) — falling back to the albedo layer alone, so \
+                QC degrades to missing/out-of-range only.
+                """ exception = err
+                satellite_albedo(; time_range, extent, variable, layer, verbose,
+                                 token, cache_path, albedo_kwargs...)
             end
-            isnothing(xy) && (xy = dims(_layer_of(st, layer), (X, Y)))
+            dates = lookup(series, Ti)
+            isempty(dates) && error("No albedo timesteps returned for $(first(batch)) … $(last(batch))")
+
+            # A single surviving layer comes back as a series of `Raster`s rather than
+            # `RasterStack`s, so name the accessors once instead of branching per timestep.
+            multi = first(series) isa AbstractRasterStack
+            _layer_of(st, l) = multi ? st[l] : st
+            has(l) = multi && haskey(first(series), l)
+            qflag_key = has(:QFLAG) ? :QFLAG : nothing
+            err_key = (!isnothing(err_layer) && has(err_layer)) ? err_layer : nothing
+
+            if isnothing(legend)
+                path = isnothing(qflag_key) ? nothing :
+                       get(metadata(_layer_of(first(series), qflag_key)), "file", nothing)
+                legend = isnothing(qflag_key) ? (0, Int[], String[]) :
+                         _albedo_qflag_legend(path; patterns=qflag_reject,
+                                              brdf_warning=qflag_reject_brdf_warning)
+                verbose && !isempty(legend[3]) && @info "Rejecting QFLAG classes" classes =
+                    legend[3] bitmask = legend[1] values = legend[2]
+            end
+            bitmask, values, _ = legend
+
+            # Stream the timesteps into the accumulator rather than holding the batch's
+            # masked grids: only the darkest `ceil(percentile * n)` values per pixel are
+            # ever needed.
+            spent = String[]
+            for (i, d) in enumerate(dates)
+                st = series[i]
+                alb = _layer_of(st, layer)
+                if isnothing(acc)
+                    sz = size(alb)
+                    npx = prod(sz)
+                    use_scratch = !isnothing(scratch_dir) ||
+                                  npx > scratch_threshold_pixels
+                    if use_scratch
+                        scratch = isnothing(scratch_dir) ?
+                                  mktempdir(; prefix="gemb_ice_albedo_") : String(scratch_dir)
+                        kmax = max(1, ceil(Int, percentile * length(year_dates)))
+                        gib = npx * (kmax * 4 + 8) / 2^30
+                        verbose && @info "Large grid: backing the accumulator with scratch files" pixels=npx scratch_gib=round(gib; digits=1) dir=scratch
+                    end
+                    acc = _LowPercentileTopK(sz, length(year_dates), percentile, min_samples;
+                                             scratch_dir=use_scratch ? scratch : nothing)
+                end
+                # Lazy `Raster`s: index the block rather than `read`ing the whole layer, so
+                # a global timestep never materialises in full.
+                q = isnothing(qflag_key) ? nothing : st[qflag_key]
+                e = isnothing(err_key) ? nothing : st[err_key]
+                nvalid = _accumulate_blockwise!(acc, alb, q, e; block_rows=block_rows,
+                                                bitmask, values, max_error, albedo_range)
+                n_folded += 1
+                if verbose
+                    @info "  $(d)  valid $(round(100 * nvalid / prod(size(alb)); digits=1))%"
+                end
+                isnothing(xy) && (xy = dims(alb, (X, Y)))
+                # The backing file is recorded per layer by the loader; collect it now,
+                # while the layer is still open, and delete only after the whole batch has
+                # been folded (all three layers share one file).
+                discard_after_fold && for l in (layer, qflag_key, err_key)
+                    isnothing(l) && continue
+                    p = get(metadata(_layer_of(st, l)), "file", nothing)
+                    isnothing(p) || push!(spent, String(p))
+                end
+            end
+
+            # Free the batch's product files before ordering the next one. Destructive and
+            # opt-in: it trades the cache (and so any cheap re-run) for peak disk, which is
+            # the only way a global year fits at all.
+            if discard_after_fold
+                series = nothing
+                GC.gc()   # NCDatasets holds the file open until the handles are collected
+                freed = 0
+                for p in unique(spent)
+                    isfile(p) || continue
+                    freed += filesize(p)
+                    rm(p; force=true)
+                end
+                verbose && @info "  discarded batch product files" n=length(unique(spent)) freed_gib=round(freed / 2^30; digits=2)
+            end
         end
+
+        n_folded == length(year_dates) || @warn "Fewer timesteps folded than $(y) should have" folded=n_folded expected=length(year_dates)
 
         stat, counts = _finalize(acc)
         push!(annual, stat)

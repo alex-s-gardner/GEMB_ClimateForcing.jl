@@ -27,6 +27,7 @@ module GEMB_ClimateForcing
 
 using Dates
 using DimensionalData
+using Mmap   # scratch-file backing for the global-scale albedo accumulator
 using PrecompileTools
 using Random
 using Statistics

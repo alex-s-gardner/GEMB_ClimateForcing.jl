@@ -96,7 +96,14 @@ const _ALBEDO_COST_LIMIT = 20
 # after 1840 s, so a 1800 s timeout aborts jobs that would have succeeded. A timeout is
 # especially expensive here — it kills the wait *before* the finished result is cached, so
 # the work is lost and the order must be resubmitted for another 30–90 min of queue time.
-const _ALBEDO_JOB_TIMEOUT = 10800
+#
+# 24 h, raised from 3 h. Large orders (wide `area`, many timesteps) routinely run far past
+# 3 h server-side: measured jobs have taken 1 h 49 m for a *subset*, and globe-wide orders
+# were still `running` after 7 h. The old 3 h value gave up on jobs that would have
+# succeeded, and because giving up happens before anything is cached, the abandoned queue
+# time is pure loss. Prefer waiting: a job left alone finishes, whereas a resubmission
+# starts the queue wait over *and* consumes one of the account's ~3 concurrent slots.
+const _ALBEDO_JOB_TIMEOUT = 86400
 
 # Filename token per variable, as used in the C3S product filenames. Verified against a
 # delivered file: `c3s_ALBB-DH_20190610000000_GLOBE_SENTINEL3_V3.1.0.area-subset.….nc`
