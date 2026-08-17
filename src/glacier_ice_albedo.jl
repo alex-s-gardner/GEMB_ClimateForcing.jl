@@ -532,15 +532,23 @@ function _checkpoint_read(path::AbstractString)
         kmax = 0
         n_expected = 0
         dates = Date[]
-        for line in eachline(path)
-            isempty(strip(line)) && continue
-            key, _, value = partition_kv(line)
-            if key == "kmax"
-                kmax = parse(Int, value)
-            elseif key == "n_expected"
-                n_expected = parse(Int, value)
-            elseif key == "folded"
-                push!(dates, Date(value))
+        # `open(...) do` rather than bare `eachline(path)`: the latter's handle is only
+        # closed once the iterator is exhausted, and a corrupt checkpoint throws out of the
+        # loop from `parse`/`Date`. The leaked handle is invisible on POSIX but locks the
+        # file on Windows, so the next `_checkpoint_write`'s `mv(...; force=true)` fails
+        # with EBUSY — i.e. a corrupt checkpoint would take the whole run down, which is
+        # exactly what this function's degrade-to-"start over" contract forbids.
+        open(path, "r") do io
+            for line in eachline(io)
+                isempty(strip(line)) && continue
+                key, _, value = partition_kv(line)
+                if key == "kmax"
+                    kmax = parse(Int, value)
+                elseif key == "n_expected"
+                    n_expected = parse(Int, value)
+                elseif key == "folded"
+                    push!(dates, Date(value))
+                end
             end
         end
         return (kmax, n_expected, dates)

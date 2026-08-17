@@ -302,6 +302,13 @@ using GEMB_ClimateForcing: _low_percentile_mean, _LowPercentileTopK, _accumulate
             # error, which would leave the run unable to start at all.
             write(path, "kmax = not-a-number\n")
             @test (@test_logs (:warn,) _checkpoint_read(path)) == (0, 0, Date[])
+
+            # ...and it must leave no file handle behind when it degrades. A reader that
+            # threw out of `eachline(path)` keeps the file open, which on Windows locks it
+            # and makes the very next checkpoint write fail with EBUSY — turning a corrupt
+            # checkpoint into a dead run.
+            _checkpoint_write(path, 2, 36, dates)
+            @test _checkpoint_read(path) == (2, 36, dates)
         finally
             rm(dir; recursive=true, force=true)
         end
@@ -337,6 +344,11 @@ using GEMB_ClimateForcing: _low_percentile_mean, _LowPercentileTopK, _accumulate
             # a fifth observation is rejected rather than silently accepted.
             @test_throws ArgumentError _accumulate!(acc2, obs[1])
         finally
+            # Windows will not delete a directory whose files are still mapped, so the
+            # accumulator's mmaps must be collected before `rm` — same ordering the
+            # driver's `discard_after_fold` needs, and for the same reason.
+            acc2 = nothing
+            GC.gc()
             rm(dir; recursive=true, force=true)
         end
     end

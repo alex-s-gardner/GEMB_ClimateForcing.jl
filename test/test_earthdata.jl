@@ -52,13 +52,17 @@ end
         # An empty variable is treated as absent, not as an empty token — otherwise a
         # shell that exports it unset would produce a 401 instead of a setup message.
         mktempdir() do dir
-            withenv("EARTHDATA_TOKEN" => "", "HOME" => dir) do
+            # Both variables, not just HOME: `homedir()` is libuv's `uv_os_homedir`, which
+            # reads USERPROFILE on Windows and HOME elsewhere. Setting only HOME leaves the
+            # Windows runner reading the real home directory, where the fallback file does
+            # not exist.
+            withenv("EARTHDATA_TOKEN" => "", "HOME" => dir, "USERPROFILE" => dir) do
                 @test_throws ErrorException get_earthdata_token()
             end
 
             # Falls back to ~/.edl_token, skipping comments and blank lines.
             write(joinpath(dir, ".edl_token"), "# my token\n\ntok-from-file\n")
-            withenv("EARTHDATA_TOKEN" => nothing, "HOME" => dir) do
+            withenv("EARTHDATA_TOKEN" => nothing, "HOME" => dir, "USERPROFILE" => dir) do
                 @test get_earthdata_token() == "tok-from-file"
             end
         end
@@ -66,7 +70,7 @@ end
         # The error must name both the mint page and the two-token limit — the single most
         # common first-run failure is trying to create a third token.
         mktempdir() do dir
-            withenv("EARTHDATA_TOKEN" => nothing, "HOME" => dir) do
+            withenv("EARTHDATA_TOKEN" => nothing, "HOME" => dir, "USERPROFILE" => dir) do
                 msg = try
                     get_earthdata_token()
                     ""
