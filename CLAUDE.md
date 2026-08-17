@@ -217,15 +217,32 @@ julia --project=. examples/glacier_ice_albedo_example.jl
      (30 s → 300 s) rather than failing. Note `"rejected"` is deliberately *not* in
      `_CDS_PENDING_STATUSES`: it must terminate the poll loop so the retry decision is made
      once. `timeout` bounds retries plus waiting, so a saturated queue cannot spin forever.
-   - **5xx is retried; 4xx is not.** A CDS 5xx (or a connection-level fault) throws
-     `CDSTransientError` and goes through `_cds_retry` — 5 s → 120 s backoff, 8 attempts,
-     bounded by the caller's deadline — wrapping *every* step: costing, submit, status polls,
-     results, download. Not defensive padding: one **HTTP 502 from `/costing`**, the cheap
-     unqueued pre-check, killed an 11 h global albedo run that had folded 8 timesteps and
-     downloaded 86 GB. Keep 4xx (bad request, licence, over-limit) and server-reported
+   - **5xx (plus 408/429) is retried; the rest of 4xx is not.** A CDS 5xx, a 408/429
+     (`_CDS_TRANSIENT_STATUSES` — legal request, service asking us to come back), or a
+     connection-level fault throws `CDSTransientError` and goes through `_cds_retry` —
+     5 s → 120 s backoff, `_CDS_TRANSIENT_ATTEMPTS` attempts, bounded by the caller's
+     deadline — wrapping *every* step: costing, submit, status polls, results, download.
+     A `Retry-After` header (429) overrides the backoff curve, clamped to 300 s. Not
+     defensive padding: one **HTTP 502 from `/costing`**, the cheap unqueued pre-check,
+     killed an 11 h global albedo run that had folded 8 timesteps and downloaded 86 GB.
+     Keep the remaining 4xx (bad request, licence, over-limit) and server-reported
      `failed`/`dismissed` jobs **non**-retryable — retrying *those* is what produced the
      endless resubmit loop described above. `_cds_is_transient` encodes the split and
      `test_cds_retrieve.jl` asserts both directions.
+   - **The attempt cap must not be the binding limit** — `deadline` is. It was 8, i.e. only
+     ~6.6 min of total backoff, which a CDS maintenance window outlasts; it is now 60.
+     ECMWF's own `cdsapi` uses `retry_max=500` at `sleep_max=120` (~16 h), effectively
+     "never give up", and relies on the caller's timeout. A test asserts
+     `attempts × max_backoff ≥ 1 h`.
+   - **The `/costing` pre-check is advisory, never a gate** (`_cds_advisory_cost`). It exists
+     only to turn an eventual server rejection into a clearer local error, and **ECMWF's
+     `cdsapi` does not call the endpoint at all** — so a costing *outage* returns
+     `(NaN, Inf)` with a warning and the request is submitted anyway, letting the server
+     judge it. Making the call merely *retry* is not enough: exhausting the attempts would
+     still abort a multi-hour run over a check whose answer isn't needed. That is exactly
+     how the 11 h run died. A **non**-transient costing error still propagates (a 4xx means
+     the request or licence is wrong, and submitting would fail worse). Do not "simplify"
+     this back into a bare `cds_estimate_cost` call.
 
 10. **`src/datasets/copernicus_albedo.jl`** - C3S satellite surface albedo (workflow 5)
    - `satellite_albedo(; time_range, extent, variable, ...)` → lazy `RasterSeries` over `Ti`.
