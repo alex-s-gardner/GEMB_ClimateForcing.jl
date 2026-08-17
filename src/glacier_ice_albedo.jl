@@ -488,7 +488,10 @@ Applied per observation, before any statistic is formed:
 
 # Keywords
 - `extent`: an `Extents.Extent` or `(; X, Y)` NamedTuple in −180…180 longitude. Defaults
-  to `nothing` (global), which is ~120960 × 47040 pixels *per timestep* — pass an extent.
+  to `nothing` (global): 120960 × 47040 px and 10.9 GB per timestep, ~392 GB a year. A
+  *small* extent is much cheaper, but a **large one fails** — CDS rejects `area` subsets
+  above roughly a Greenland-sized box, whereas an unsubset global order succeeds. For
+  continental coverage pass `nothing` and use the large-grid keywords below.
 - `percentile = $(_ICE_ALBEDO_PERCENTILE)`: fraction of darkest observations to average.
 - `min_samples = $(_ICE_ALBEDO_MIN_SAMPLES)`: minimum valid observations per pixel-year.
 - `max_error = $(_ICE_ALBEDO_MAX_ERROR)`: reject observations whose `_ERR` exceeds this;

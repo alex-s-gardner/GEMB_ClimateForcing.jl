@@ -665,8 +665,12 @@ below before requesting long series.
 - `time_range::Tuple{DateTime,DateTime}`: inclusive start/stop. Timesteps fall on day 10,
   day 20 and the last day of each month; only those inside the range are returned.
 - `extent`: an `Extents.Extent` or `(; X, Y)` NamedTuple in −180…180 longitude, or
-  `nothing` (default) for global. Global 300 m data is ~120960 × 47040 pixels *per
-  variable per timestep*, so an extent is strongly recommended.
+  `nothing` (default) for global. The global grid is 120960 × 47040 (lat 80°N…−60°S) —
+  10.9 GB per variable per timestep — so a *small* extent saves a great deal.
+  **But a large `extent` is worse than none**: CDS fails `area` subsets above roughly a
+  Greenland-sized box (`status:"failed"`, empty traceback), while the same request with no
+  `area` at all succeeds. For continental-or-larger coverage pass `extent=nothing` and
+  subset the returned rasters locally.
 - `variable`: one `Symbol` (default `:albb_dh`, broadband black-sky) or a vector of them.
   See [`SATELLITE_ALBEDO_VARIABLES`](@ref). One variable and one layer returns a series of
   `Raster`s; several of either return a series of `RasterStack`s.
@@ -752,8 +756,10 @@ function satellite_albedo(;
 
     area = _albedo_area(extent)
     isnothing(area) && verbose && @warn """
-    Ordering global 300 m albedo (~120960 × 47040 pixels per variable per timestep). \
-    Pass `extent` to subset server-side and download far less.
+    Ordering global 300 m albedo: 120960 × 47040 px, ~10.9 GB per variable per timestep. \
+    A *small* `extent` downloads far less — but note that `area` subsets larger than about \
+    a Greenland-sized box fail server-side, so global-and-subset-locally is the correct \
+    approach for continental coverage.
     """
 
     cache = isnothing(cache_path) ? _default_albedo_cache() : cache_path

@@ -238,7 +238,7 @@ Timesteps follow the 10-daily ("decadal") convention: **day 10, day 20, and the 
 
 > **Accept the licence first.** Visit [the dataset's download tab](https://cds.climate.copernicus.eu/datasets/satellite-albedo?tab=download#manage-licences) once and accept the product terms, or every request fails with HTTP 403. This is the most common first-run failure.
 
-> **Longitude is −180…180°E** here (as for the Copernicus DEM), *not* the 0–360°E convention of the ERA5-Land invariants. Omitting `extent` requests global 300 m data — ~120960 × 47040 pixels per variable per timestep — so an extent is strongly recommended.
+> **Longitude is −180…180°E** here (as for the Copernicus DEM), *not* the 0–360°E convention of the ERA5-Land invariants. Omitting `extent` requests global 300 m data — 120960 × 47040 pixels (lat 80°N…−60°S), ~10.9 GB per variable per timestep — so a *small* extent saves a great deal. A *large* extent, however, is worse than none: CDS fails `area` subsets above roughly a Greenland-sized box, while the same request with no `area` succeeds, so continental-scale work should order globally and subset locally.
 
 ### `compute_glacier_ice_albedo(years; extent, ...)`
 
