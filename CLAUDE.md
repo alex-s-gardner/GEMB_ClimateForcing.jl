@@ -23,6 +23,11 @@ julia --project=. -e 'using Pkg; Pkg.instantiate()'
 
 # Set up CDS API key for ERA5-Land access
 export CDS_API_KEY="your-token-here"
+
+# Set up NASA Earthdata token for MODIS MCD43A3 access. Entirely unrelated to the CDS key.
+# Mint at https://urs.earthdata.nasa.gov/profile/edit/user_tokens — 60-day life, MAX TWO
+# concurrent (a third request 403s). `earthdata_token_from_netrc()` mints one from ~/.netrc.
+export EARTHDATA_TOKEN="your-token-here"
 ```
 
 ### Testing
@@ -41,8 +46,11 @@ GEMB_TEST_INVARIANT=1 julia --project=. -e 'using Pkg; Pkg.test()'
 **Test gating.** `test/runtests.jl` always runs offline tests (input validation, unit
 conversions, elevation physics, synthetic forcing, chunk-map formulas, DEM tile
 geometry, CDS client error/retry classification and job-concurrency scheduling, the
-glacier-decoupling lookup + adjustment against the vendored table, and the bare-ice albedo
-reduction kernel / QC mask / QFLAG legend parsing).
+glacier-decoupling lookup + adjustment against the vendored table, the bare-ice albedo
+reduction kernel / QC mask / QFLAG legend parsing, the Earthdata token resolution and
+transient/permanent split, the CMR granule search run end-to-end against a trimmed real
+UMM-G response injected through `EarthData.jl`'s `requester` hook, and the MODIS
+sinusoidal tile/cell arithmetic, granule-id parsing and point deduplication).
 Network-dependent tests are opt-in via environment variables so CI stays
 offline by default:
 - `CDS_API_KEY` — enables ERA5-Land Zarr integration tests
@@ -54,6 +62,10 @@ offline by default:
 - `GEMB_TEST_SATELLITE_ALBEDO=1` (plus `CDS_API_KEY`) — enables `satellite_albedo` CDS
   job orders. Slow (jobs queue server-side for minutes) and requires the dataset licence
   to have been accepted in the CDS web UI.
+- `GEMB_TEST_MODIS_ALBEDO=1` (plus `EARTHDATA_TOKEN`) — enables MCD43A3 granule downloads:
+  a live CMR query, the geotransform-vs-`_modis_tile_origin` check, the `/vsicurl/` HDF4
+  false-positive guard, and two end-to-end `compute_glacier_ice_albedo_modis` runs (one per
+  `keep_granules` setting). ~1 min and ~500 MB — no queue latency, unlike the CDS suites.
 
 There is no per-file test runner; run a single suite by editing `include`s in
 `test/runtests.jl` or invoking the file directly with the package loaded.
@@ -82,6 +94,11 @@ julia --project=. examples/test_authentication.jl
 # Glacier bare-ice albedo from C3S satellite albedo. SLOW on a cold cache (CDS job
 # queue latency, 30–90 min/year) and needs the satellite-albedo licence accepted.
 julia --project=. examples/glacier_ice_albedo_example.jl
+
+# Black-sky / white-sky bare-ice albedo at a point list from MODIS MCD43A3. No queue
+# latency, but ~70 MB downloaded per tile-date — the example's 41-day window is ~3 GB.
+export EARTHDATA_TOKEN="your-token-here"
+julia --project=. examples/glacier_ice_albedo_modis_example.jl
 ```
 
 ## Architecture
@@ -378,6 +395,165 @@ julia --project=. examples/glacier_ice_albedo_example.jl
      restore it. `examples/glacier_ice_albedo_example.jl` is its replacement: a thin driver
      over the package function (summary + NetCDF write), runnable on `include` with no
      `ARGS`/`PROGRAM_FILE` handling, keeping no analysis logic of its own.
+   - **A second, independent source for the same statistic** lives in `src/earthdata.jl` +
+     `src/datasets/modis_albedo.jl` + `src/glacier_ice_albedo_modis.jl` (item 10b below).
+     `compute_glacier_ice_albedo` itself is **untouched** by it — the two share only
+     `_valid_albedo` and the reduction kernels.
+
+10b. **MODIS MCD43A3 bare-ice albedo** (workflow 5, second source) — three files:
+   `src/earthdata.jl` (NASA access), `src/datasets/modis_albedo.jl` (product + grid),
+   `src/glacier_ice_albedo_modis.jl` (`compute_glacier_ice_albedo_modis`).
+   - Same statistic as item 10 (darkest-`percentile` annual mean), from MCD43A3 v061 — 500 m,
+     **daily**, 2000-02-16→present — evaluated at a **point list**, returning **black-sky**
+     (`:albedo_bsa`) and **white-sky** (`:albedo_wsa`) as separate layers. Output is a
+     `DimStack` over `(Dim{:point}, Ti)` in input point order, plus `:latitude`/`:longitude`
+     of the *sampled cell centre* and `:cell_id`.
+   - **A separate exported function, not a `source=` keyword** on `compute_glacier_ice_albedo`.
+     The signatures genuinely differ (point list vs extent) and the keyword sets barely
+     overlap; a fused body would forward MODIS-only keywords into `albedo_kwargs...` →
+     `satellite_albedo` and produce nonsense errors.
+   - **`/vsicurl/` cannot read HDF4, and the failure is a false positive** — the open returns a
+     null dataset that only throws on first metadata access. HDF4 does its own POSIX I/O, so no
+     byte-range access is possible: granules are **downloaded in full**, full stop.
+     `_modis_subdataset` therefore *refuses* a `/vsi`- or `://`-bearing path rather than letting
+     that surface later as an unrelated GDAL message, and a live test pins the negative.
+     Julia's `GDAL_jll` has the HDF4 driver (Homebrew's `gdalinfo` does not), so
+     `_modis_assert_hdf4_driver` is a runtime guard, not a dependency.
+   - **Filter granules on the granule id's `A<YYYYDDD>` field, never on the temporal extent.**
+     A granule's extent spans the full **16-day retrieval window**, so a one-day CMR
+     `temporal` query returns 16 nominal dates (measured: `cmr-hits: 32` for one day and one
+     tile). `mcd43a3_granules` filters on nominal date **and** tile — the tile bbox overlaps
+     its neighbours too. A trimmed real UMM-G response
+     (`test/fixtures/cmr_mcd43a3_granules.json`) pins the trap offline, driven through
+     `EarthData.jl`'s `requester` injection hook.
+   - **Granule size needs its unit read, not assumed.** `_granule_bytes` prefers
+     `SizeInBytes` and otherwise converts `Size` by `SizeUnit`; UMM-G's own schema docs warn a
+     provider reporting MegaBytes may have meant 1000² or 1024². (The legacy `granules.json`
+     `granule_size` field, no longer used, was megabytes-as-a-float despite the name.) So the
+     figure is only ever used with `_EARTHDATA_SIZE_TOLERANCE` slack — it catches a truncated
+     download and is not an exact expected length. Real sizes vary hugely by tile: 1.04 MB for
+     a mostly-ocean h15v03 up to 87 MB for h16v01, so no "~70 MB" assumption holds.
+   - **`_granule_data_url` filters on `RelatedUrls[].Type == "GET DATA"`.** An MCD43A3 granule
+     carries **eight** related URLs; the DOI landing page, the `.cmr.xml` sidecar, browse
+     imagery and an `s3credentials` endpoint are all `VIEW RELATED INFORMATION`, and the
+     `s3://` copy of the data is `GET DATA VIA DIRECT ACCESS` — so the `Type` test already
+     excludes S3 and the `https://` check is a second guard, not the mechanism. AppEEARS is
+     deliberately **not** used.
+   - **`_granule_id` reads `DataGranule.Identifiers`' `ProducerGranuleId`, not `GranuleUR`.**
+     For MCD43A3 the two are identical, but that is a per-provider convention rather than a
+     schema guarantee, so a live test asserts the equality instead of the code assuming it.
+   - **Earthdata auth sends `Authorization: Bearer` — same header as `AuthenticatedHTTPStore`,
+     an entirely unrelated token.** Do not conflate the two, nor either with the CDS Retrieve
+     API's `PRIVATE-TOKEN`. `get_earthdata_token()` is **offline only** (`EARTHDATA_TOKEN` →
+     `~/.edl_token` → actionable error); `earthdata_token_from_netrc()` is a separate,
+     explicit network call, kept out of the resolver because tokens have a **max of two
+     concurrent** (a third 403s) and creation must never be reachable from a retry loop.
+   - **LP DAAC answers a bearer-authenticated GET with a single 303 to CloudFront, and
+     `Downloads.download` follows it and returns the full body — verified live.** Do not add
+     redirect handling "to be safe"; it was measured. A short read *is* checked
+     (`_EARTHDATA_SIZE_TOLERANCE`) because a truncated 200 corrupts an HDF4 file and GDAL's
+     message for that is unhelpful.
+   - **Granule discovery is delegated to [`EarthData.jl`](https://github.com/evetion/EarthData.jl)
+     (JuliaGeo), not reimplemented** — unlike `CDSAPI.jl`, which *was* evaluated and rejected
+     for `cds_retrieve`. `_cmr_granules` is a shim over `EarthData.request`: pagination, the
+     typed UMM-G schema and CMR error parsing are upstream's. Its schema is strictly better
+     than hand-parsing the legacy `granules.json` — `RelatedUrls[].Type == "GET DATA"` picks
+     the file out of **eight** related URLs, and `ArchiveAndDistributionInformation` gives
+     `Size` with an explicit `SizeUnit` instead of the legacy `granule_size`'s
+     unit-less-but-actually-megabytes float.
+     - **Pinned to `main` via `[sources]`, and that pin is not optional.** The registered
+       v0.1.0 is the 2023 tree and **cannot parse a present-day CMR response at all** (a
+       `MethodError` out of the UMM-G schema on any real query). Consequence, accepted: this
+       package cannot be registered in General until upstream tags a release, and the julia
+       compat is **1.11** (not the 1.10 LTS) solely because `[sources]` needs it. See the
+       comment in `Project.toml`.
+     - **Five upstream gaps are mirrored locally, each marked `PR <n>` in `src/earthdata.jl`
+       and each to be deleted when its PR lands** — they are contributions in flight, not a
+       fork, and none should grow features here: (1) spatial query params, (2) `Type`-based
+       URL selection + unit-aware size, (3) EDL bearer auth (upstream is netrc-only),
+       (4) transient/permanent split + size-verified download, (5) the `all=true` pagination
+       bug below.
+     - **Do not "simplify" the paging to `all=true`.** Upstream's search-after loop leaves
+       `page_num` in the query and CMR rejects the pair: page 1 returns 200, page 2 returns
+       **HTTP 400 `page_num is not allowed with search-after`**. Reproduced live. The shim
+       pages with plain `page_num`, which is one request at the default `page_size=2000`.
+     - Upstream converts *every* error status into a plain `ErrorException`, which
+       `_earthdata_is_transient` correctly calls permanent — so a CMR 503 would abort a run.
+       `_classifying_requester` restores the split at the injected `requester`, the one place
+       the status is still visible. That same hook drives the offline fixture test.
+   - **QA is a small-integer class, not a bitmask, and there is no per-pixel `_ERR`.** Hence
+     `qa_keep` is a **whitelist** (`[0]` = full BRDF inversion; `1` = magnitude inversion,
+     opt-in; `2`–`7` = v061 Terra detector-failure cases; `255` = fill) and there is no
+     `max_error`. A whitelist rejects fill *and* any class a later version adds; a reject-list
+     cannot. Snow flags live in a separate granule (**MCD43A2**) — out of scope, and
+     unnecessary: bright snowy days are discarded by the low percentile, as in item 10.
+   - **The 0.001 scale is applied by us, not GDAL** (`_valid_albedo`'s `scale` keyword). Valid
+     range reaches 32766, so albedo **can legitimately exceed 1.0** — `albedo_range`'s upper
+     bound is QC and **no physical clamp should be added**. Fill 32767 × 0.001 = 32.767 is
+     rejected by the range check *by arithmetic, not luck*.
+   - **Points, not grids, on purpose.** Dedup to unique `(h, v, row, col)` cells
+     (`_modis_dedup_points`) makes the accumulator a *vector*, which is why there is no VRT
+     mosaic, no reprojection, no `Mmap` scratch, no blockwise folding and no fold checkpoint
+     here — `_LowPercentileTopK` is reused verbatim with `sz = (n_unique, 1)`. **Do not add a
+     gridded mode by warping**: an `:average` resample of an individual day mixes neighbouring
+     pixels' albedo *before* the percentile is taken, biasing the darkest tail toward the local
+     mean — the very quantity being measured. Sampling the native cell is strictly more faithful.
+   - **Tile edges are computed per grid line, not per tile** (`_modis_tile_edge_x/_y`). `ulx + T`
+     and `ULX + (h+1)·T` round differently in Float64, and a one-ulp gap between tiles would
+     leave a boundary point in neither. Tests assert `===` adjacency for every h and v. The
+     forward sinusoidal is closed form (`x = R·λ·cos φ`, `y = R·φ`, `R = 6371007.181`),
+     validated against PROJ, so there is no `Proj` dependency and no per-point reprojection.
+     `_modis_tile_origin(15,2)` matches a real granule's geotransform to ~1 nm.
+   - **`_modis_read_window` returns `(row, col)`, and that needs a `permutedims`.**
+     `ArchGDAL.read(ds, band, rows, cols)` takes the ranges in that order but returns an
+     **x-major** array of size `(ncol, nrow)`. A live test pins the convention.
+   - **Volume is the cost and is not reducible**: no server-side subsetting, so the unit of
+     transfer is a whole ~70 MB granule of which ~85 % is layers never read. Cost ≈
+     `n_tiles × n_dates × 70 MB` — 8 Greenland tiles for a year is ~200 GB. **`doy_range` is
+     the fix, not `stride`**: polar night yields no usable retrieval, so a melt-season window
+     removes ~2.5× of the download at ~zero cost in samples. Requesting more *layers* is free
+     (same granules).
+   - **`doy_range` is hemisphere-aware, and a bare northern window is a trap.** The melt
+     season is the opposite half of the year south of the equator, so `(180, 220)` samples
+     austral *midwinter* in Patagonia/Antarctica and resolves nothing. Hence:
+     - **`lo > hi` wraps New Year** (`_modis_doys`) — `(300, 110)` is 27 Oct → 20 Apr, the
+       southern window. Validation checks only that both days are in 1…366, *not* `lo ≤ hi`;
+       `lo == hi + 1` is rejected as a whole-year mistake. Dates come back **ascending**, not
+       in seasonal order: the accumulator is order-independent and ascending keeps the
+       progress bar and per-date cache in date order. `stride` thins the selected days
+       *across* the wrap.
+     - **`doy_range = :melt_season`** (`_resolve_doy_range`) picks
+       `_MODIS_MELT_SEASON_NORTH = (120, 290)` or `_MODIS_MELT_SEASON_SOUTH = (300, 110)` from
+       the sign of the points' latitudes, resolved to an explicit window *before* validation.
+       A list **straddling the equator returns `nothing`** (whole year) rather than sampling
+       the wrong season for half the points — split by hemisphere and call twice.
+     - **A wrapping window pools two melt seasons' tails into one calendar year** (end of
+       2018/19 plus start of 2019/20 in "2019"). Accepted deliberately: both are bare-ice
+       states of the same glacier and the statistic is a darkest-percentile mean. The
+       alternative — melt-year buckets via a `year_start` keyword — was considered and
+       rejected as invasive (`Ti` labelling, per-year date lists, cache keys and the
+       accumulator all shift). Do not add it without a reason beyond tidiness.
+   - **Defaults that deliberately differ from item 10**, and why:
+     - `min_samples = 30`, not 10 — daily cadence, so ten valid days out of 365 is pathological.
+     - `percentile = 0.05` **unchanged** — 5 % of ~365 retains ~19 values, *more* robust than
+       C3S's darkest 1–2, not less.
+     - `keep_granules = false`, **inverted** from C3S's `discard_after_fold=false`: a re-order
+       there is hours of queue latency, a re-download here is bandwidth-bound minutes. Must
+       `GC.gc()` before `rm` — GDAL holds the HDF4 file open until its handle is collected.
+   - **Resumability is per-(date, cell-set) sample caching, not accumulator checkpointing** —
+     a date's samples are a few kB of TSV keyed by a SHA of the cell list, so a re-run never
+     re-downloads and a killed run resumes for free. Deliberately plain text: these files
+     outlive package versions. This replaces the mmap-scratch + `fold_state.txt` machinery,
+     which exists only because a global grid cannot be held in RAM.
+   - **Lessons from item 10 that do NOT transfer**: the "large `area` fails but global
+     succeeds" trap (MODIS has no server-side subsetting at all); the queue-limit /
+     `submit_stagger` / `max_concurrent_jobs` / `batch_timesteps` model (downloads are
+     bandwidth-bound — `_run_concurrent_jobs` is reused with `submit_stagger=0`);
+     `_grid_cache_*`; the QFLAG-legend-from-file machinery.
+   - `_retry_transient` in `utils.jl` is the shared retry mechanism; `_cds_retry` and
+     `_earthdata_retry` are both thin wrappers supplying their own transient predicate and
+     backoff constants. All `_CDS_*` constants stayed put, so `test_cds_retrieve.jl` needed
+     zero edits.
 
 11. **`src/simulate/simulate_climate_forcing.jl`** - Synthetic forcing (workflow 4)
    - `simulate_climate_forcing(set_id, time_step_hours=0)` — generates a full stochastic forcing
@@ -546,8 +722,11 @@ Tests use conditional integration testing:
   Note `RasterSeries` has **no metadata field** — `rebuild(series; metadata=…)` is accepted
   and silently discarded, so provenance must be attached to the layers instead.
 - **GDAL** (via ArchGDAL) — `/vsicurl/` remote COG reads for the Copernicus DEM and the
-  EGM96/EGM2008 geoid grids.
-- Coordinate reference system: WGS84 (EPSG:4326) throughout.
+  EGM96/EGM2008 geoid grids. **Not** for MCD43A3: `/vsicurl/` cannot read HDF4 (see item 10b),
+  so those granules are downloaded and read locally through the `HDF4_EOS:EOS_GRID:` driver.
+- Coordinate reference system: WGS84 (EPSG:4326) throughout, **except** MCD43A3, which is read
+  in its native MODIS sinusoidal grid and never reprojected — points are mapped *into* it
+  analytically instead, so no resampling ever touches the albedo values.
 
 ### Grid-orientation gotcha
 Both the ERA5-Land ARCO grid and the invariant NetCDFs use **0–359.9°E longitude** and

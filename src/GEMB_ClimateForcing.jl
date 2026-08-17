@@ -54,9 +54,16 @@ export simulate_climate_forcing, simulation_parameter_sets,
 # Export satellite observations (ordered from the CDS Retrieve API, not a lazy store)
 export satellite_albedo, satellite_albedo_layers, SATELLITE_ALBEDO_VARIABLES
 
+# Export NASA Earthdata credential helpers (an EDL token, unrelated to the CDS key)
+export get_earthdata_token, earthdata_token_from_netrc
+
 # Export glacier bare-ice albedo derived from the satellite albedo record
 export compute_glacier_ice_albedo, GLACIER_ICE_ALBEDO_YEARS,
     GLACIER_ICE_ALBEDO_QFLAG_REJECT
+
+# Export the MODIS MCD43A3 (black-sky / white-sky) point-list equivalent
+export compute_glacier_ice_albedo_modis, MCD43A3_ALBEDO_LAYERS, MCD43A3_LAYERS,
+    MCD43A3_YEARS, MCD43A3_QA_KEEP
 
 # Export on-glacier temperature decoupling (Shaw et al. 2025 lookup table)
 export glacier_decoupling, glacier_decoupling_table, GlacierDecoupling,
@@ -67,13 +74,23 @@ include("utils.jl")
 include("authenticated_http_store.jl")
 # CDS Retrieve (job-based) client — needs get_cds_api_key from utils.jl.
 include("cds_retrieve.jl")
+# NASA Earthdata (CMR discovery + DAAC bearer download) — shares _retry_transient with
+# cds_retrieve.jl but uses an entirely unrelated token. Must follow utils.jl.
+include("earthdata.jl")
 include("interface.jl")
 include("datasets/era5_land.jl")
 include("datasets/copernicus_dem.jl")
 include("datasets/copernicus_albedo.jl")
+# MODIS MCD43A3 (500 m daily BSA/WSA albedo) — needs _configure_gdal_http from
+# copernicus_dem.jl, _run_concurrent_jobs from copernicus_albedo.jl, and earthdata.jl.
+include("datasets/modis_albedo.jl")
 # Glacier bare-ice albedo (darkest-percentile annual reduction of the albedo record).
 # Must follow copernicus_albedo.jl — reuses satellite_albedo and its cache-layout helpers.
 include("glacier_ice_albedo.jl")
+# The same statistic from MODIS MCD43A3, at a point list rather than a gridded extent.
+# Must follow both glacier_ice_albedo.jl (reduction kernels, _valid_albedo) and
+# datasets/modis_albedo.jl (grid math, granule access).
+include("glacier_ice_albedo_modis.jl")
 include("geoid.jl")
 include("invariant.jl")
 include("elevation_adjustment.jl")

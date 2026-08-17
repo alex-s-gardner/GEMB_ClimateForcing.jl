@@ -43,6 +43,52 @@ function get_cds_api_key()
 end
 
 """
+    _retry_transient(f; is_transient, context, attempts, base, max_backoff,
+                     deadline=Inf, verbose=true, retry_after=_ -> 0.0,
+                     on_retry=(attempt, backoff, err) -> nothing) -> f()
+
+Call `f`, retrying while it fails *transiently* with exponential backoff from `base` to
+`max_backoff`. Non-transient errors propagate on the first attempt, unchanged.
+
+The transient/permanent split is supplied by the caller as `is_transient`, because it is
+service-specific and getting it wrong is expensive in both directions: retrying a
+permanent error produces an endless resubmit loop, while failing fast on a service hiccup
+throws away however much work the run had already done.
+
+`deadline` (an absolute `time()` value) bounds the retrying so a caller's own timeout is
+still respected — and it, not `attempts`, is what should normally bind. The final failure
+is rethrown rather than wrapped, so the message the user sees is the service's own.
+
+`retry_after(err)` lets a server-supplied wait (HTTP `Retry-After`, e.g. on 429) override
+the backoff curve upward; it knows better than we do. `on_retry` is called before each
+sleep, for logging.
+
+Shared by the CDS Retrieve client (`_cds_retry`) and the NASA Earthdata client
+(`_earthdata_retry`), which differ only in their error taxonomy and constants.
+"""
+function _retry_transient(f; is_transient, context::AbstractString,
+                          attempts::Integer, base::Real, max_backoff::Real,
+                          deadline::Float64=Inf, verbose::Bool=true,
+                          retry_after=_ -> 0.0,
+                          on_retry=(attempt, backoff, err) -> nothing)
+    attempt = 0
+    while true
+        attempt += 1
+        try
+            return f()
+        catch err
+            (is_transient(err) && attempt < attempts) || rethrow()
+            backoff = min(base * 2.0^(attempt - 1), max_backoff)
+            requested = retry_after(err)
+            requested > 0 && (backoff = max(backoff, requested))
+            time() + backoff >= deadline && rethrow()
+            verbose && on_retry(attempt, backoff, err)
+            sleep(backoff)
+        end
+    end
+end
+
+"""
     dewpoint_to_vapor_pressure(T_dewpoint::AbstractVector)
 
 Convert dewpoint temperature (K) to vapor pressure (Pa) using the Magnus formula.

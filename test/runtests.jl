@@ -84,6 +84,15 @@ println("="^70)
     # legend, input validation — the CDS ordering it sits on is covered above)
     include("test_glacier_ice_albedo.jl")
 
+    # Include NASA Earthdata client tests (offline: token resolution, transient/permanent
+    # split, CMR parsing against a trimmed real response)
+    include("test_earthdata.jl")
+
+    # Include MODIS MCD43A3 albedo tests (offline: tile/cell math, granule-id parsing, point
+    # dedup, driver validation; granule downloads opt-in via GEMB_TEST_MODIS_ALBEDO=1 plus
+    # EARTHDATA_TOKEN)
+    include("test_modis_albedo.jl")
+
     @testset "Input Validation" begin
         # Missing time_range
         @test_throws ArgumentError climate_forcing(:era5land, 72.0, -38.0)

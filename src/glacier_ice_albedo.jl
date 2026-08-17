@@ -151,25 +151,53 @@ _albedo_isbad(::Missing) = true
 _albedo_isbad(x::Number) = !isfinite(x)
 
 """
-    _valid_albedo(alb, qflag, err; bitmask, values, max_error, albedo_range) -> Matrix{Float32}
+    _valid_albedo(alb, qflag, err; bitmask, values, keep_values, scale, max_error,
+                  albedo_range) -> Matrix{Float32}
 
 One timestep's albedo as a plain `Float32` matrix with every rejected observation set to
 `NaN`. `qflag` and `err` may be `nothing` when those layers are unavailable.
 
 Rejects, in order: missing/`_FillValue` pixels (NCDatasets surfaces these as `missing` or
-`NaN`), albedo outside `albedo_range`, flagged QFLAG classes, and observations whose
+`NaN`), albedo outside `albedo_range`, disallowed quality classes, and observations whose
 companion uncertainty exceeds `max_error`. A *missing* uncertainty is not itself
 disqualifying; an oversized one is.
+
+Two products share this kernel, and the keywords cover both quality conventions:
+
+- `bitmask`/`values` — **reject**-lists, for a CF `flag_masks`/`flag_values` legend like
+  the C3S product's `QFLAG` (see [`_qflag_rejects`](@ref)).
+- `keep_values` — a **whitelist**, for a product whose quality band is a small-integer
+  *class* rather than a bitfield, as MCD43A3's
+  `BRDF_Albedo_Band_Mandatory_Quality_shortwave` is (`0` = full BRDF inversion, `1` =
+  magnitude inversion, `2`–`7` = v061 detector-failure cases, `255` = fill). A whitelist is
+  the right shape there: it rejects fill *and* every unforeseen class for free, whereas a
+  reject-list has to enumerate them and silently admits any class added by a later version.
+
+`scale` multiplies the raw value **before** the range check, for a product stored as scaled
+integers (MCD43A3 albedo is `Int16` × 0.001). `scale=1` is exact in IEEE, so the C3S path
+is bit-identical whether or not it passes the keyword.
+
+!!! note "Fill values need no special case when scaled"
+    MCD43A3's albedo fill is `32767`, which scales to `32.767` — far outside any sane
+    `albedo_range`, so the range check already rejects it. That is by arithmetic, not by
+    luck, but it *is* the reason no explicit fill comparison appears below.
 """
 function _valid_albedo(alb::AbstractMatrix, qflag, err;
                        bitmask::Integer=0, values::AbstractVector{<:Integer}=Int[],
+                       keep_values::Union{Nothing,AbstractVector{<:Integer}}=nothing,
+                       scale::Real=1,
                        max_error::Union{Nothing,Real}=nothing,
                        albedo_range::Tuple{Real,Real}=_ICE_ALBEDO_RANGE)
     lo, hi = albedo_range
     out = Matrix{Float32}(undef, size(alb))
     @inbounds for i in eachindex(out, alb)
         a = alb[i]
-        if _albedo_isbad(a) || a < lo || a > hi
+        if _albedo_isbad(a)
+            out[i] = NaN32
+            continue
+        end
+        a = a * scale
+        if a < lo || a > hi
             out[i] = NaN32
             continue
         end
@@ -181,6 +209,10 @@ function _valid_albedo(alb::AbstractMatrix, qflag, err;
             end
             qi = Int(q)
             if (bitmask != 0 && (qi & bitmask) != 0) || (!isempty(values) && qi in values)
+                out[i] = NaN32
+                continue
+            end
+            if !isnothing(keep_values) && !(qi in keep_values)
                 out[i] = NaN32
                 continue
             end

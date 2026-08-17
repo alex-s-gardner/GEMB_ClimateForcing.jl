@@ -190,34 +190,26 @@ attempt, unchanged.
 still respected; the final failure is rethrown rather than wrapped, so the message the
 user sees is the service's own.
 
+The mechanism itself lives in [`_retry_transient`](@ref) (`utils.jl`) and is shared with
+the NASA Earthdata client; this wrapper supplies only what is CDS-specific — the error
+taxonomy, the `_CDS_*` constants, the `Retry-After` accessor, and the log record.
+
 !!! note "Resubmission may duplicate a job"
     A 5xx on *submission* can in principle mean the job was created and only the
     response was lost, in which case the retry queues a second identical job. That is
     tolerable — a duplicate is dismissible and costs one queue slot — and far cheaper
     than failing a run that has hours of folded state behind it.
 """
-function _cds_retry(f; dataset::AbstractString, context::AbstractString,
-                    attempts::Integer=_CDS_TRANSIENT_ATTEMPTS, verbose::Bool=true,
-                    deadline::Float64=Inf)
-    attempt = 0
-    while true
-        attempt += 1
-        try
-            return f()
-        catch err
-            (_cds_is_transient(err) && attempt < attempts) || rethrow()
-            backoff = min(_CDS_TRANSIENT_RETRY_BASE * 2.0^(attempt - 1),
-                          _CDS_TRANSIENT_RETRY_MAX)
-            # A server-supplied `Retry-After` (429) knows better than our curve does.
-            if err isa CDSTransientError && err.retry_after > 0
-                backoff = max(backoff, err.retry_after)
-            end
-            time() + backoff >= deadline && rethrow()
-            verbose && @warn "Transient CDS failure; retrying" dataset context attempt backoff_s = round(backoff; digits=1) error = sprint(showerror, err)
-            sleep(backoff)
-        end
-    end
-end
+_cds_retry(f; dataset::AbstractString, context::AbstractString,
+           attempts::Integer=_CDS_TRANSIENT_ATTEMPTS, verbose::Bool=true,
+           deadline::Float64=Inf) =
+    _retry_transient(f; is_transient=_cds_is_transient, context=context,
+        attempts=attempts, base=_CDS_TRANSIENT_RETRY_BASE,
+        max_backoff=_CDS_TRANSIENT_RETRY_MAX, deadline=deadline, verbose=verbose,
+        # A server-supplied `Retry-After` (429) knows better than our curve does.
+        retry_after = err -> err isa CDSTransientError ? err.retry_after : 0.0,
+        on_retry = (attempt, backoff, err) ->
+            @warn "Transient CDS failure; retrying" dataset context attempt backoff_s = round(backoff; digits=1) error = sprint(showerror, err))
 
 # Backoff bounds, in seconds, for resubmitting a queue-limited job. Generous because the
 # blocker is other jobs of ours finishing, which takes minutes, not milliseconds.

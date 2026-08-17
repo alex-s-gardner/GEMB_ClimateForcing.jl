@@ -144,6 +144,51 @@ using GEMB_ClimateForcing: _low_percentile_mean, _LowPercentileTopK, _accumulate
         @test all(≈(0.5f0), m)
     end
 
+    @testset "Per-observation QC — scaled integers + QA whitelist" begin
+        # MCD43A3 shape: Int16 albedo × 0.001, quality as a small-integer class.
+        # Columns: (500→0.5, QA 0), (620→0.62, QA 1), (450→0.45, QA 255 fill),
+        #          (32767 fill → 32.767, QA 0), (200→0.2 below floor, QA 0).
+        alb = [500 620 450 32767 200]
+        qa = UInt8[0 1 255 0 0]
+
+        m = _valid_albedo(alb, qa, nothing; scale=0.001, keep_values=[0])
+        @test m[1] ≈ 0.5f0
+        @test isnan(m[2])            # QA 1 not in the whitelist
+        @test isnan(m[3])            # QA 255 (fill) not in the whitelist
+        # Albedo fill needs no special case: 32767 × 0.001 = 32.767 fails the range check.
+        @test isnan(m[4])
+        @test isnan(m[5])            # below the 0.3 glaciological floor
+
+        # Admitting magnitude inversions (QA 1) is a one-keyword change.
+        m2 = _valid_albedo(alb, qa, nothing; scale=0.001, keep_values=[0, 1])
+        @test m2[1] ≈ 0.5f0
+        @test m2[2] ≈ 0.62f0
+        @test isnan(m2[3]) && isnan(m2[4]) && isnan(m2[5])
+
+        # The whitelist alone rejects every class it does not name, including ones a later
+        # product version might add — this is why it is a whitelist and not a reject-list.
+        @test all(isnan, _valid_albedo(alb, qa, nothing; scale=0.001, keep_values=Int[]))
+
+        # `scale` is applied before the range check, so the floor is in albedo units.
+        m3 = _valid_albedo([200 500], nothing, nothing;
+                           scale=0.001, albedo_range=(0.15, 1.0))
+        @test m3[1] ≈ 0.2f0 && m3[2] ≈ 0.5f0
+
+        # The C3S path must be untouched by the generalization: `scale=1` is exact in IEEE
+        # and `keep_values=nothing` disables the whitelist, so results match bit-for-bit.
+        for (a, q, e, kw) in ((Any[0.5 missing; NaN 0.7], nothing, nothing, (;)),
+                              ([0.5 0.5 0.5], [0 2 5], nothing, (; bitmask=2)),
+                              ([0.5 0.5 0.5], [1 7 missing], nothing, (; values=[7])),
+                              ([0.5 0.5 0.5], nothing, [0.1 0.9 missing],
+                               (; max_error=0.2)),
+                              ([0.2 0.5 0.95], [0 1 0], [0.05 0.05 0.05],
+                               (; bitmask=1, max_error=0.2, albedo_range=(0.15, 1.0))))
+            base = _valid_albedo(a, q, e; kw...)
+            # `isequal`, not `≈`: NaN-to-NaN must match too, and the values must be exact.
+            @test isequal(base, _valid_albedo(a, q, e; kw..., scale=1, keep_values=nothing))
+        end
+    end
+
     @testset "QFLAG legend → reject mask" begin
         # The real v3.1 legend shape: snow_presence, then per-band no-obs and BRDF bits.
         table = [(meaning="snow_presence", mask=1, is_value=false),
