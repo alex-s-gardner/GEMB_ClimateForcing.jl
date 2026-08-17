@@ -247,10 +247,31 @@ bit-identical to the in-memory path — this is a *placement* change, not a nume
 `nfilled`/`counts` are zero-filled because `Mmap.mmap` guarantees a new file reads as
 zeros, which is exactly the required initial state; `vals` is written before it is read
 (guarded by `nfilled`), so it is left undefined.
+
+With `resume=true` the existing files are reopened (`r+`) **without truncating**, so a
+run that died partway through a year continues folding into the state it already built.
+The caller is responsible for pairing this with a checkpoint that says which timesteps are
+already in there; mismatched geometry is rejected here, since silently reusing arrays of
+the wrong shape would corrupt every pixel.
 """
-function _topk_scratch_arrays(dir::AbstractString, kmax::Int, npixel::Int)
+function _topk_scratch_arrays(dir::AbstractString, kmax::Int, npixel::Int;
+                              resume::Bool=false)
     mkpath(dir)
-    open_map(name, T, dims) = open(joinpath(dir, name), "w+") do io
+    expected = Dict("topk_vals.bin" => kmax * npixel * sizeof(Float32),
+                    "topk_nfilled.bin" => npixel * sizeof(Int32),
+                    "topk_counts.bin" => npixel * sizeof(Int32))
+    if resume
+        for (name, nbytes) in expected
+            path = joinpath(dir, name)
+            isfile(path) || throw(ArgumentError(
+                "cannot resume: scratch file $(path) is missing"))
+            filesize(path) == nbytes || throw(ArgumentError(
+                "cannot resume: $(path) is $(filesize(path)) bytes, expected $(nbytes) " *
+                "— the scratch directory belongs to a different grid or percentile"))
+        end
+    end
+    mode = resume ? "r+" : "w+"
+    open_map(name, T, dims) = open(joinpath(dir, name), mode) do io
         Mmap.mmap(io, Array{T,length(dims)}, dims)
     end
     vals = open_map("topk_vals.bin", Float32, (kmax, npixel))
@@ -261,19 +282,24 @@ end
 
 function _LowPercentileTopK(sz::Tuple{Int,Int}, n_expected::Integer,
                             percentile::Real, min_samples::Integer;
-                            scratch_dir::Union{Nothing,AbstractString}=nothing)
+                            scratch_dir::Union{Nothing,AbstractString}=nothing,
+                            resume::Bool=false, n_seen::Integer=0)
     (0 < percentile <= 1) || throw(ArgumentError(
         "percentile must be in (0, 1]; got $(percentile)"))
     n_expected >= 1 || throw(ArgumentError("no observations supplied"))
+    resume && isnothing(scratch_dir) && throw(ArgumentError(
+        "resume requires scratch_dir: an in-memory accumulator does not outlive its process"))
     kmax = max(1, ceil(Int, percentile * n_expected))
     npixel = prod(sz)
     vals, nfilled, counts = if isnothing(scratch_dir)
         Matrix{Float32}(undef, kmax, npixel), zeros(Int32, npixel), zeros(Int32, npixel)
     else
-        _topk_scratch_arrays(scratch_dir, kmax, npixel)
+        _topk_scratch_arrays(scratch_dir, kmax, npixel; resume=resume)
     end
+    # `n_seen` is restored on resume so the "more observations than declared" guard still
+    # counts the whole year, not just this process's share of it.
     return _LowPercentileTopK(Float64(percentile), Int(min_samples), kmax, Int(n_expected),
-                              0, sz, vals, nfilled, counts)
+                              Int(n_seen), sz, vals, nfilled, counts)
 end
 
 """
@@ -447,6 +473,188 @@ function _low_percentile_mean(obs::Vector{<:AbstractMatrix{Float32}},
     return _finalize(acc)
 end
 
+## ------------------------------------------------------- resume + progress
+
+# Sidecar file recording which timesteps a scratch-backed accumulator has already folded.
+const _ICE_ALBEDO_CHECKPOINT = "fold_state.txt"
+
+"""
+    _checkpoint_path(scratch_dir, year) -> String
+
+Where the fold state for one year lives, alongside that year's scratch arrays.
+"""
+_checkpoint_path(scratch_dir::AbstractString, year::Integer) =
+    joinpath(String(scratch_dir), "$(year)_$(_ICE_ALBEDO_CHECKPOINT)")
+
+"""
+    _checkpoint_read(path) -> (kmax, n_expected, dates)
+
+Read a fold checkpoint: the accumulator geometry it was written for, and the dates already
+folded into it. Returns `(0, 0, Date[])` when the file is absent or unreadable — a corrupt
+checkpoint must degrade to "start over", never to an error, since the alternative is a run
+that cannot start at all.
+"""
+function _checkpoint_read(path::AbstractString)
+    isfile(path) || return (0, 0, Date[])
+    try
+        kmax = 0
+        n_expected = 0
+        dates = Date[]
+        for line in eachline(path)
+            isempty(strip(line)) && continue
+            key, _, value = partition_kv(line)
+            if key == "kmax"
+                kmax = parse(Int, value)
+            elseif key == "n_expected"
+                n_expected = parse(Int, value)
+            elseif key == "folded"
+                push!(dates, Date(value))
+            end
+        end
+        return (kmax, n_expected, dates)
+    catch err
+        @warn "Ignoring unreadable albedo fold checkpoint" path exception = err
+        return (0, 0, Date[])
+    end
+end
+
+# `key = value` split, tolerating surrounding whitespace. Local helper rather than a regex
+# so the checkpoint parser stays allocation-cheap and obvious.
+function partition_kv(line::AbstractString)
+    i = findfirst('=', line)
+    isnothing(i) && return (strip(line), '=', "")
+    return (strip(line[1:prevind(line, i)]), '=', strip(line[nextind(line, i):end]))
+end
+
+"""
+    _checkpoint_write(path, kmax, n_expected, dates)
+
+Record the fold state atomically (write-then-rename), so a crash mid-write cannot leave a
+checkpoint that claims more progress than the scratch arrays hold.
+
+Written after **every** folded timestep, not once per batch: a global year is ~36 folds of
+~3 minutes each behind hours of CDS queueing, and the point of the checkpoint is that no
+single failure costs more than the fold in flight.
+"""
+function _checkpoint_write(path::AbstractString, kmax::Integer, n_expected::Integer,
+                           dates::AbstractVector{Date})
+    tmp = path * ".part"
+    open(tmp, "w") do io
+        println(io, "kmax = ", kmax)
+        println(io, "n_expected = ", n_expected)
+        for d in dates
+            println(io, "folded = ", d)
+        end
+    end
+    mv(tmp, path; force=true)
+    return path
+end
+
+"""
+    _grid_cache_path(scratch_dir) -> String
+
+Where the grid's X/Y coordinate vectors are cached, beside the scratch arrays.
+"""
+_grid_cache_path(scratch_dir::AbstractString) = joinpath(String(scratch_dir), "grid_xy.bin")
+
+"""
+    _grid_cache_write(path, xy)
+    _grid_cache_read(path) -> Union{Nothing,Tuple{X,Y}}
+
+Persist (and restore) the output grid's X/Y lookups across processes.
+
+Needed for one narrow but real case: resuming a year whose every timestep is already
+folded. Then no product file is opened — with `discard_after_fold` they no longer exist —
+so the dimensions cannot be recovered from the data, yet the result raster still needs
+them. The coordinate *values* are written as raw `Float64`, and the lookups rebuilt from
+them; `read` returns `nothing` if the file is absent or malformed, in which case the caller
+falls back to taking dimensions from the data as usual.
+
+Coordinate values round-trip exactly (no conversion), so the reconstructed grid is
+geometrically identical. Lookup *metadata* (e.g. an explicit CRS object) is not carried —
+these products are EPSG:4326 throughout, which `Raster` construction assumes anyway.
+"""
+function _grid_cache_write(path::AbstractString, xy)
+    xs = collect(Float64, parent(lookup(xy[1])))
+    ys = collect(Float64, parent(lookup(xy[2])))
+    tmp = path * ".part"
+    open(tmp, "w") do io
+        write(io, Int64(length(xs)))
+        write(io, Int64(length(ys)))
+        write(io, xs)
+        write(io, ys)
+    end
+    mv(tmp, path; force=true)
+    return path
+end
+
+function _grid_cache_read(path::AbstractString)
+    isfile(path) || return nothing
+    try
+        return open(path, "r") do io
+            nx = read(io, Int64)
+            ny = read(io, Int64)
+            xs = Vector{Float64}(undef, nx)
+            ys = Vector{Float64}(undef, ny)
+            read!(io, xs)
+            read!(io, ys)
+            (X(xs), Y(ys))
+        end
+    catch err
+        @warn "Ignoring unreadable albedo grid cache" path exception = err
+        return nothing
+    end
+end
+
+"""
+    _progress_bar(done, total; width=28) -> String
+
+A fixed-width `[####----] 12/36 33%` bar.
+
+Deliberately plain text on one line: this runs unattended for days with output redirected
+to a log file, where a terminal-control progress widget (ProgressMeter.jl and friends)
+degrades into thousands of unreadable escape-laden lines. Each update is instead a normal
+log record that `tail -f` renders correctly.
+"""
+function _progress_bar(done::Integer, total::Integer; width::Integer=28)
+    total <= 0 && return "[" * "?"^width * "]"
+    frac = clamp(done / total, 0, 1)
+    filled = round(Int, frac * width)
+    return string("[", "#"^filled, "-"^(width - filled), "] ",
+                  done, "/", total, " ", lpad(round(Int, 100 * frac), 3), "%")
+end
+
+"""
+    _format_duration(seconds) -> String
+
+`h:mm:ss` for a duration, or `"--:--:--"` when it is unknown (`NaN`/`Inf`), used for the
+elapsed/remaining figures beside the progress bar.
+"""
+function _format_duration(seconds::Real)
+    isfinite(seconds) || return "--:--:--"
+    s = max(0, round(Int, seconds))
+    h, rem = divrem(s, 3600)
+    m, sec = divrem(rem, 60)
+    return string(h, ":", lpad(m, 2, '0'), ":", lpad(sec, 2, '0'))
+end
+
+"""
+    _report_progress(label, done, total, t0)
+
+Emit one progress line: bar, elapsed, and an ETA extrapolated from the mean time per
+completed unit.
+
+The ETA is honest about being a straight-line estimate. For the global albedo run each
+unit's cost is dominated by CDS queue time, which varies by hours between jobs, so early
+estimates swing widely; it is still the only signal a user has for "hours or days".
+"""
+function _report_progress(label::AbstractString, done::Integer, total::Integer, t0::Float64)
+    elapsed = time() - t0
+    eta = done > 0 ? elapsed / done * (total - done) : NaN
+    @info "$(label) $(_progress_bar(done, total))  elapsed $(_format_duration(elapsed))  eta $(_format_duration(eta))"
+    return nothing
+end
+
 ## ------------------------------------------------------------------------ driver
 
 """
@@ -526,6 +734,25 @@ off by default, so a regional run behaves exactly as before:
   bound peak disk to one batch, which is the only way a global year (~36 × 67 GB, far
   past any normal free space) fits at all.
 
+## Resuming an interrupted run
+- `resume = false`: continue folding into the scratch state a previous run left behind,
+  instead of starting the year over. **Requires `scratch_dir`** — only mmap-backed state
+  outlives its process. A `<year>_fold_state.txt` checkpoint beside the scratch arrays
+  records which timesteps are already folded; it is rewritten after *every* fold, so a
+  failure costs at most the timestep in flight rather than the whole year. Batches whose
+  timesteps are all folded are skipped without ordering anything, which is what makes a
+  resume cheap: the expensive part is CDS queue time.
+
+  A checkpoint written for a different `percentile` or year length is ignored (with a
+  warning) and the year refolded, since reusing arrays of the wrong `kmax` would corrupt
+  every pixel. Pair `resume` with `discard_after_fold` freely — the product files are gone,
+  but the folded state is what matters, and a resumed run reorders only the batches it
+  never reached.
+- `progress = true`: log a one-line `[####----] 12/36 33%` bar with elapsed time and ETA
+  after each folded timestep, counted over *all* requested years. Plain text rather than a
+  terminal widget, so it stays readable in a redirected log; set `false` to silence it
+  (`verbose=false` silences it too).
+
 # Cost
 A cold year is ~3 CDS jobs, ordered and polled concurrently, so budget **30–90 minutes
 per year**; cached years are nearly free. The whole year is requested in one
@@ -584,6 +811,10 @@ function compute_glacier_ice_albedo(years=GLACIER_ICE_ALBEDO_YEARS;
                                     # the whole year, the concurrent fast path.
                                     batch_timesteps::Union{Nothing,Integer}=nothing,
                                     discard_after_fold::Bool=false,
+                                    # Resume a scratch-backed run that died partway. Needs
+                                    # `scratch_dir`, since only mmap state outlives a process.
+                                    resume::Bool=false,
+                                    progress::Bool=true,
                                     # `timeout`, `max_concurrent_jobs`, `poll_interval`,
                                     # `force_download`, … go straight to the loader rather
                                     # than being restated here with defaults that could drift.
@@ -596,6 +827,17 @@ function compute_glacier_ice_albedo(years=GLACIER_ICE_ALBEDO_YEARS;
         "min_samples must be at least 1; got $(min_samples)"))
     first(albedo_range) < last(albedo_range) || throw(ArgumentError(
         "albedo_range must be (low, high) with low < high; got $(albedo_range)"))
+    resume && isnothing(scratch_dir) && throw(ArgumentError(
+        "resume=true requires scratch_dir: the fold state lives in that directory, and an " *
+        "in-memory accumulator cannot survive the process that built it"))
+
+    # Progress is counted in timesteps over all requested years — the unit that actually
+    # costs time — so one bar covers a multi-year run rather than restarting per year.
+    total_steps = sum(length(_albedo_timesteps((DateTime(y, 1, 1),
+                                                DateTime(y, 12, 31, 23, 59, 59))))
+                      for y in year_list)
+    steps_done = 0
+    t_start = time()
 
     annual = Matrix{Float32}[]
     annual_counts = Matrix{Int32}[]
@@ -629,6 +871,33 @@ function compute_glacier_ice_albedo(years=GLACIER_ICE_ALBEDO_YEARS;
                   [year_dates[i:min(i + Int(batch_timesteps) - 1, end)]
                    for i in 1:Int(batch_timesteps):length(year_dates)]
 
+        # Which timesteps a previous, interrupted run already folded into the scratch
+        # arrays. Only trusted when the geometry matches, because reusing a `kmax` from a
+        # different percentile or year length would corrupt every pixel — a mismatch
+        # restarts the year rather than erroring, since the alternative is a run that
+        # cannot proceed at all.
+        ckpt_path = isnothing(scratch_dir) ? nothing : _checkpoint_path(scratch_dir, y)
+        folded_dates = Date[]
+        if resume && !isnothing(ckpt_path)
+            want_kmax = max(1, ceil(Int, percentile * length(year_dates)))
+            ck_kmax, ck_expected, ck_dates = _checkpoint_read(ckpt_path)
+            if ck_kmax == want_kmax && ck_expected == length(year_dates)
+                folded_dates = ck_dates
+                verbose && @info "Resuming $(y) from checkpoint" already_folded=length(folded_dates) of=length(year_dates)
+            elseif ck_kmax != 0
+                @warn """
+                Ignoring $(y) checkpoint written for a different accumulator geometry — \
+                refolding the year from scratch.
+                """ found=(kmax=ck_kmax, n_expected=ck_expected) wanted=(kmax=want_kmax, n_expected=length(year_dates))
+            end
+        end
+        # A batch whose every timestep is already folded needs no CDS order at all, which is
+        # what makes resuming cheap: the expensive part is queue time, and it is skipped.
+        pending = [b for b in batches if !all(in(folded_dates), b)]
+        steps_done += length(folded_dates)
+        progress && verbose && !isempty(folded_dates) &&
+            _report_progress("albedo", steps_done, total_steps, t_start)
+
         # Two independent scale problems, both only biting on very large grids, so both are
         # switched on by pixel count rather than changing behaviour for regional runs:
         #  * the accumulator itself is `kmax·npx·4 + 2·npx·4` bytes — 117 GB globally — so
@@ -637,11 +906,11 @@ function compute_glacier_ice_albedo(years=GLACIER_ICE_ALBEDO_YEARS;
         #    read and folded in Y-blocks (`_accumulate_blockwise!`).
         acc = nothing
         scratch = nothing
-        n_folded = 0
+        n_folded = length(folded_dates)
 
-        for (bi, batch) in enumerate(batches)
-            length(batches) > 1 && verbose &&
-                @info "  batch $(bi)/$(length(batches)): $(first(batch)) … $(last(batch))" n_timesteps=length(batch)
+        for (bi, batch) in enumerate(pending)
+            length(pending) > 1 && verbose &&
+                @info "  batch $(bi)/$(length(pending)): $(first(batch)) … $(last(batch))" n_timesteps=length(batch)
             time_range = (DateTime(first(batch)),
                           DateTime(last(batch)) + Hour(23) + Minute(59) + Second(59))
 
@@ -716,8 +985,18 @@ function compute_glacier_ice_albedo(years=GLACIER_ICE_ALBEDO_YEARS;
                         gib = npx * (kmax * 4 + 8) / 2^30
                         verbose && @info "Large grid: backing the accumulator with scratch files" pixels=npx scratch_gib=round(gib; digits=1) dir=scratch
                     end
+                    # Reopen rather than recreate when resuming into existing state, and
+                    # restore `n_seen` so the declared-count guard still spans the year.
                     acc = _LowPercentileTopK(sz, length(year_dates), percentile, min_samples;
-                                             scratch_dir=use_scratch ? scratch : nothing)
+                                             scratch_dir=use_scratch ? scratch : nothing,
+                                             resume=!isempty(folded_dates),
+                                             n_seen=length(folded_dates))
+                end
+                # Skip a timestep the checkpoint says is already in the accumulator. Folding
+                # it twice would double-count that pixel-observation, biasing the statistic.
+                if d in folded_dates
+                    verbose && @info "  $(d)  already folded, skipping"
+                    continue
                 end
                 # Lazy `Raster`s: index the block rather than `read`ing the whole layer, so
                 # a global timestep never materialises in full.
@@ -726,10 +1005,27 @@ function compute_glacier_ice_albedo(years=GLACIER_ICE_ALBEDO_YEARS;
                 nvalid = _accumulate_blockwise!(acc, alb, q, e; block_rows=block_rows,
                                                 bitmask, values, max_error, albedo_range)
                 n_folded += 1
+                steps_done += 1
                 if verbose
                     @info "  $(d)  valid $(round(100 * nvalid / prod(size(alb)); digits=1))%"
                 end
-                isnothing(xy) && (xy = dims(alb, (X, Y)))
+                if isnothing(xy)
+                    xy = dims(alb, (X, Y))
+                    # Cache the grid so a later resume can rebuild the result even if every
+                    # timestep is already folded and no product file is opened at all.
+                    isnothing(scratch_dir) || _grid_cache_write(_grid_cache_path(scratch_dir), xy)
+                end
+
+                # Checkpoint after every fold, not every batch: the fold is minutes but the
+                # batch is hours, so this is what bounds the loss from any single failure to
+                # the timestep in flight. Ordered after the fold so the file never claims
+                # progress the arrays do not hold.
+                if !isnothing(ckpt_path)
+                    push!(folded_dates, d)
+                    _checkpoint_write(ckpt_path, acc.kmax, length(year_dates), folded_dates)
+                end
+                progress && verbose &&
+                    _report_progress("albedo", steps_done, total_steps, t_start)
                 # The backing file is recorded per layer by the loader; collect it now,
                 # while the layer is still open, and delete only after the whole batch has
                 # been folded (all three layers share one file).
@@ -757,6 +1053,23 @@ function compute_glacier_ice_albedo(years=GLACIER_ICE_ALBEDO_YEARS;
         end
 
         n_folded == length(year_dates) || @warn "Fewer timesteps folded than $(y) should have" folded=n_folded expected=length(year_dates)
+
+        # A resumed year with nothing left to fold opened no product file, so the
+        # accumulator was never constructed here — reopen it (and the grid) from the scratch
+        # state that the earlier process left behind.
+        if isnothing(acc)
+            isempty(folded_dates) && error("No albedo observations folded for $(y)")
+            xy = something(xy, _grid_cache_read(_grid_cache_path(scratch_dir)))
+            isnothing(xy) && error("""
+            $(y) is fully folded per its checkpoint, but $(_grid_cache_path(scratch_dir)) is \
+            missing, so the output grid cannot be reconstructed. Delete the checkpoint to \
+            refold the year.
+            """)
+            acc = _LowPercentileTopK((length(xy[1]), length(xy[2])),
+                                     length(year_dates), percentile, min_samples;
+                                     scratch_dir=String(scratch_dir), resume=true,
+                                     n_seen=length(folded_dates))
+        end
 
         stat, counts = _finalize(acc)
         push!(annual, stat)

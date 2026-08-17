@@ -217,6 +217,15 @@ julia --project=. examples/glacier_ice_albedo_example.jl
      (30 s → 300 s) rather than failing. Note `"rejected"` is deliberately *not* in
      `_CDS_PENDING_STATUSES`: it must terminate the poll loop so the retry decision is made
      once. `timeout` bounds retries plus waiting, so a saturated queue cannot spin forever.
+   - **5xx is retried; 4xx is not.** A CDS 5xx (or a connection-level fault) throws
+     `CDSTransientError` and goes through `_cds_retry` — 5 s → 120 s backoff, 8 attempts,
+     bounded by the caller's deadline — wrapping *every* step: costing, submit, status polls,
+     results, download. Not defensive padding: one **HTTP 502 from `/costing`**, the cheap
+     unqueued pre-check, killed an 11 h global albedo run that had folded 8 timesteps and
+     downloaded 86 GB. Keep 4xx (bad request, licence, over-limit) and server-reported
+     `failed`/`dismissed` jobs **non**-retryable — retrying *those* is what produced the
+     endless resubmit loop described above. `_cds_is_transient` encodes the split and
+     `test_cds_retrieve.jl` asserts both directions.
 
 10. **`src/datasets/copernicus_albedo.jl`** - C3S satellite surface albedo (workflow 5)
    - `satellite_albedo(; time_range, extent, variable, ...)` → lazy `RasterSeries` over `Ti`.
@@ -317,6 +326,23 @@ julia --project=. examples/glacier_ice_albedo_example.jl
      - `n_expected` comes from `_albedo_timesteps` over the *whole year*, not from the batch,
        so `kmax` is identical however the year is split. Batched folding is verified
        bit-identical to the single call on real cached files (1, 2 and 4 batches).
+   - **`resume=true` continues a run that died mid-year**, and days-long runs *will* die. A
+     `<year>_fold_state.txt` checkpoint is written beside the scratch arrays after **every**
+     fold (not per batch: the fold is minutes, the batch is hours), and `_topk_scratch_arrays`
+     reopens the mmap files `r+` instead of truncating. Batches whose timesteps are all
+     folded are skipped **without ordering anything**, which is what makes resuming cheap —
+     the cost is queue time, and it is skipped. Requires `scratch_dir`: in-memory state cannot
+     outlive its process. Geometry is checked (file sizes vs `kmax·npx`), and a checkpoint
+     from a different `percentile`/year length is ignored with a warning rather than trusted,
+     since a wrong `kmax` would corrupt every pixel. Verified bit-identical to a single pass
+     at splits 1/5/18/35 of 36, in both the whole-grid and blockwise paths.
+     `_grid_cache_write` persists the X/Y lookups for the one case where no product file is
+     ever opened (a fully-folded year being finalized after `discard_after_fold` removed the
+     files).
+   - **Progress is a plain-text bar** (`_progress_bar`, `[####----] 12/36 33%` + elapsed +
+     ETA), logged per folded timestep and counted over all requested years. Deliberately not
+     ProgressMeter.jl: these runs are `nohup`-ed for days with output redirected, where a
+     terminal-control widget becomes thousands of unreadable escape-laden lines.
    - Three deliberate QC choices, each a trap to re-check before "fixing":
      - **`albedo_range`'s 0.3 floor is glaciological, not physical.** Exposed ice rarely goes
        below ~0.3 broadband, so darker pixels are usually rock/water/shadow/failed inversion.

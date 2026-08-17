@@ -18,7 +18,10 @@ using NCDatasets
 
 using GEMB_ClimateForcing: _low_percentile_mean, _LowPercentileTopK, _accumulate!,
     _finalize, _valid_albedo, _qflag_rejects, _qflag_table, _albedo_qflag_legend,
-    _albedo_isbad, _ICE_ALBEDO_RANGE, GLACIER_ICE_ALBEDO_QFLAG_REJECT
+    _albedo_isbad, _ICE_ALBEDO_RANGE, GLACIER_ICE_ALBEDO_QFLAG_REJECT,
+    _checkpoint_path, _checkpoint_read, _checkpoint_write, _progress_bar,
+    _format_duration, _grid_cache_path, _grid_cache_read, _grid_cache_write,
+    _accumulate_blockwise!
 
 @testset "Glacier bare-ice albedo" begin
 
@@ -228,6 +231,142 @@ using GEMB_ClimateForcing: _low_percentile_mean, _LowPercentileTopK, _accumulate
         finally
             rm(dir; recursive=true, force=true)
         end
+    end
+
+    @testset "Fold checkpoint" begin
+        dir = mktempdir()
+        try
+            path = _checkpoint_path(dir, 2019)
+            # Absent checkpoint reads as "nothing folded" rather than throwing: a missing
+            # file is the normal first-run state.
+            @test _checkpoint_read(path) == (0, 0, Date[])
+
+            dates = [Date(2019, 1, 10), Date(2019, 1, 20)]
+            _checkpoint_write(path, 2, 36, dates)
+            kmax, n_expected, got = _checkpoint_read(path)
+            @test kmax == 2
+            @test n_expected == 36
+            @test got == dates
+
+            # Rewriting is atomic and leaves no partial file behind.
+            _checkpoint_write(path, 2, 36, vcat(dates, Date(2019, 1, 31)))
+            @test length(last(_checkpoint_read(path))) == 3
+            @test !isfile(path * ".part")
+
+            # A corrupt checkpoint degrades to "start over" with a warning — never to an
+            # error, which would leave the run unable to start at all.
+            write(path, "kmax = not-a-number\n")
+            @test (@test_logs (:warn,) _checkpoint_read(path)) == (0, 0, Date[])
+        finally
+            rm(dir; recursive=true, force=true)
+        end
+    end
+
+    @testset "Resume folds each observation exactly once" begin
+        # The property that matters: folding 4 grids in one pass must equal folding 2, losing
+        # the process, reopening the scratch state, and folding the other 2. Anything else
+        # means a resumed run either double-counts or drops observations.
+        obs = [fill(Float32(0.30 + 0.05i), 4, 5) for i in 1:4]
+        want, want_counts = _low_percentile_mean(obs, 0.5, 1)
+
+        dir = mktempdir()
+        try
+            acc = _LowPercentileTopK((4, 5), 4, 0.5, 1; scratch_dir=dir)
+            for m in obs[1:2]
+                _accumulate!(acc, m)
+            end
+            acc = nothing
+            GC.gc()   # release the mmap handles, as a dying process would
+
+            # Reopen without truncating and finish the year.
+            acc2 = _LowPercentileTopK((4, 5), 4, 0.5, 1; scratch_dir=dir, resume=true,
+                                      n_seen=2)
+            for m in obs[3:4]
+                _accumulate!(acc2, m)
+            end
+            got, got_counts = _finalize(acc2)
+            @test got == want                     # bit-identical, not merely close
+            @test got_counts == want_counts
+
+            # `n_seen` is restored, so the declared-count guard still spans the whole year:
+            # a fifth observation is rejected rather than silently accepted.
+            @test_throws ArgumentError _accumulate!(acc2, obs[1])
+        finally
+            rm(dir; recursive=true, force=true)
+        end
+    end
+
+    @testset "Resume rejects mismatched scratch geometry" begin
+        dir = mktempdir()
+        try
+            acc = _LowPercentileTopK((4, 5), 4, 0.5, 1; scratch_dir=dir)
+            acc = nothing
+            GC.gc()
+            # Same directory, different kmax (percentile) — reusing those arrays would
+            # corrupt every pixel, so this must fail loudly rather than proceed.
+            @test_throws ArgumentError _LowPercentileTopK((4, 5), 4, 0.25, 1;
+                                                          scratch_dir=dir, resume=true)
+            # Different grid size, likewise.
+            @test_throws ArgumentError _LowPercentileTopK((8, 5), 4, 0.5, 1;
+                                                          scratch_dir=dir, resume=true)
+            # Resuming with no scratch at all is a contradiction: in-memory state cannot
+            # outlive its process.
+            @test_throws ArgumentError _LowPercentileTopK((4, 5), 4, 0.5, 1; resume=true)
+            @test_throws ArgumentError compute_glacier_ice_albedo(2019; resume=true)
+        finally
+            rm(dir; recursive=true, force=true)
+        end
+    end
+
+    @testset "Resume with a missing scratch file" begin
+        dir = mktempdir()
+        try
+            # Nothing there at all: resuming must say so rather than create zeroed arrays
+            # and silently report a year of no observations.
+            @test_throws ArgumentError _LowPercentileTopK((4, 5), 4, 0.5, 1;
+                                                          scratch_dir=dir, resume=true)
+        finally
+            rm(dir; recursive=true, force=true)
+        end
+    end
+
+    @testset "Grid cache round-trip" begin
+        dir = mktempdir()
+        try
+            path = _grid_cache_path(dir)
+            @test isnothing(_grid_cache_read(path))     # absent → nothing, not an error
+
+            xy = (X(collect(-50.0:0.1:-49.5)), Y(collect(67.0:0.1:67.4)))
+            _grid_cache_write(path, xy)
+            got = _grid_cache_read(path)
+            @test !isnothing(got)
+            # Coordinates must round-trip exactly, or a resumed year's raster would be
+            # georeferenced slightly differently from the run that folded it.
+            @test collect(lookup(got[1])) == collect(lookup(xy[1]))
+            @test collect(lookup(got[2])) == collect(lookup(xy[2]))
+
+            write(path, "garbage")
+            @test (@test_logs (:warn,) _grid_cache_read(path)) === nothing
+        finally
+            rm(dir; recursive=true, force=true)
+        end
+    end
+
+    @testset "Progress bar" begin
+        @test occursin("0/36", _progress_bar(0, 36))
+        @test occursin("36/36", _progress_bar(36, 36))
+        @test occursin("100%", _progress_bar(36, 36))
+        @test occursin("50%", _progress_bar(18, 36))
+        # Fixed width regardless of progress, so successive log lines stay aligned.
+        w(s) = length(s[findfirst('[', s):findfirst(']', s)])
+        @test w(_progress_bar(0, 36)) == w(_progress_bar(18, 36)) == w(_progress_bar(36, 36))
+        # Degenerate totals must not divide by zero.
+        @test occursin("?", _progress_bar(0, 0))
+
+        @test _format_duration(0) == "0:00:00"
+        @test _format_duration(3661) == "1:01:01"
+        @test _format_duration(NaN) == "--:--:--"
+        @test _format_duration(Inf) == "--:--:--"
     end
 
     @testset "Input validation" begin
