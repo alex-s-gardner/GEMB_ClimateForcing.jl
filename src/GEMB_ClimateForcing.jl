@@ -69,6 +69,10 @@ export compute_glacier_ice_albedo_modis, MCD43A3_ALBEDO_LAYERS, MCD43A3_LAYERS,
 export glacier_decoupling, glacier_decoupling_table, GlacierDecoupling,
     climate_adjust_for_glacier
 
+# Export the per-region downscaling-parameter fits — the inverse of the two adjustments above,
+# read back out of a region's own forcing rather than looked up
+export derive_decoupling_factor, derive_lapse_rate, decoupling_factor_at_elevation
+
 # Include submodules
 include("utils.jl")
 include("authenticated_http_store.jl")
@@ -103,6 +107,11 @@ include("glacier_decoupling.jl")
 # Ambient → on-glacier correction, applying the decoupling factor to a forcing stack.
 # Shares _rebuild_forcing / _adjust_longwave (utils.jl) with the two siblings above.
 include("glacier_adjustment.jl")
+# The inverse of the two adjustments above: per-region regressions that read a decoupling factor
+# and a lapse rate back out of a region's forcing. Must follow elevation_adjustment.jl, whose
+# _LAPSE_RATE_MIN/_MAX it names as the domain a fitted slope has to be clamped into, and shares
+# _rebuild_forcing / _adjust_longwave (utils.jl) with glacier_adjustment.jl.
+include("downscaling_parameters.jl")
 
 # Synthetic forcing generation
 include("simulate/simulate_climate_forcing.jl")
