@@ -58,6 +58,10 @@ println("="^70)
     # Include ambient → on-glacier correction tests (offline, analytic)
     include("test_glacier_adjustment.jl")
 
+    # Include the per-region downscaling-parameter fits — the inverse of the two adjustments above
+    # (offline: hand-built cross-cell sums, analytic recovery of a known k and lapse rate)
+    include("test_downscaling_parameters.jl")
+
     # Include analytical physics cross-checks (offline)
     include("test_elevation_physics.jl")
 
