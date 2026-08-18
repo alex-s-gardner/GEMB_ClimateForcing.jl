@@ -23,18 +23,34 @@ using GEMB_ClimateForcing: _low_percentile_mean, _LowPercentileTopK, _accumulate
     _format_duration, _grid_cache_path, _grid_cache_read, _grid_cache_write,
     _accumulate_blockwise!
 
-# Unmap an accumulator's scratch arrays deterministically.
+# Unmap an accumulator's scratch arrays as promptly as the platform allows, then remove
+# their directory — tolerating the one failure Windows can still produce.
 #
-# Dropping the reference and calling `GC.gc()` is *not* enough on Windows: the collector is
-# not obliged to run the mmap finalizers on any given pass, and while a file is mapped
-# Windows refuses to delete it (`rm` fails with ENOTEMPTY on the containing directory).
-# `finalize` on the array is Julia's documented way to release the mapping now. It is a
-# no-op for the in-memory accumulator, whose fields are plain `Array`s.
+# On Windows, deleting a file that is still memory-mapped does not fail; it is *deferred*
+# (delete-on-close), so the file lingers until the last mapping is torn down and `rm` then
+# reports ENOTEMPTY on the parent directory even though every file "succeeded". Neither
+# dropping the reference plus `GC.gc()` nor `finalize` on the arrays wins that race
+# reliably — both were tried on CI, and which of these testsets failed varied between runs.
+#
+# So: release what we can, then treat cleanup failure as ignorable. This is scratch space
+# under `mktempdir()`, which the OS reclaims anyway, and nothing under test depends on the
+# deletion — the assertions are about the folded values. `finalize` is a no-op for the
+# in-memory accumulator, whose fields are plain `Array`s.
 function release_scratch!(acc)
     for a in (acc.vals, acc.nfilled, acc.counts)
         finalize(a)
     end
     GC.gc()
+    return nothing
+end
+
+function remove_scratch_dir(dir)
+    try
+        rm(dir; recursive=true, force=true)
+    catch err
+        err isa Base.IOError || rethrow()
+        @debug "Left scratch directory behind (mapped files); the OS will reclaim it" dir
+    end
     return nothing
 end
 
@@ -364,10 +380,8 @@ end
             # a fifth observation is rejected rather than silently accepted.
             @test_throws ArgumentError _accumulate!(acc2, obs[1])
         finally
-            # Windows will not delete a mapped file, and `GC.gc()` alone does not reliably
-            # run the finalizers that unmap it — hence the explicit release.
             isnothing(acc2) || release_scratch!(acc2)
-            rm(dir; recursive=true, force=true)
+            remove_scratch_dir(dir)
         end
     end
 
@@ -389,7 +403,7 @@ end
             @test_throws ArgumentError _LowPercentileTopK((4, 5), 4, 0.5, 1; resume=true)
             @test_throws ArgumentError compute_glacier_ice_albedo(2019; resume=true)
         finally
-            rm(dir; recursive=true, force=true)
+            remove_scratch_dir(dir)
         end
     end
 
@@ -401,7 +415,7 @@ end
             @test_throws ArgumentError _LowPercentileTopK((4, 5), 4, 0.5, 1;
                                                           scratch_dir=dir, resume=true)
         finally
-            rm(dir; recursive=true, force=true)
+            remove_scratch_dir(dir)
         end
     end
 
