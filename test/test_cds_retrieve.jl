@@ -10,10 +10,14 @@ the network — the live-endpoint paths are exercised by the opt-in integration 
 using Test
 using GEMB_ClimateForcing
 import JSON3
+import HTTP
 
 using GEMB_ClimateForcing: _cds_headers, _cds_error_detail, CDSQueueLimitError,
     _CDS_QUEUE_LIMIT_HINT, _CDS_PENDING_STATUSES, _CDS_QUEUE_RETRY_BASE,
-    _CDS_QUEUE_RETRY_MAX, _run_concurrent_jobs
+    _CDS_QUEUE_RETRY_MAX, _run_concurrent_jobs, CDSTransientError, _cds_is_transient,
+    _cds_retry, _cds_check_response, _CDS_TRANSIENT_RETRY_BASE, _CDS_TRANSIENT_RETRY_MAX,
+    _CDS_TRANSIENT_ATTEMPTS, _cds_retry_after, _CDS_RETRY_AFTER_MAX,
+    _CDS_TRANSIENT_STATUSES, _cds_advisory_cost
 
 @testset "CDS Retrieve client" begin
     @testset "Headers use PRIVATE-TOKEN, not Bearer" begin
@@ -136,6 +140,166 @@ using GEMB_ClimateForcing: _cds_headers, _cds_error_detail, CDSQueueLimitError,
         # Degenerate counts are no-ops rather than errors.
         @test _run_concurrent_jobs((i, g) -> error("should not run"), 0, 4, 0.0;
                                    verbose=false) === nothing
+    end
+
+    @testset "Transient (5xx) classification" begin
+        # A 502 from the fronting proxy says nothing about the request. This exact case
+        # killed an 11 h global run: the bare `error()` it used to raise was
+        # indistinguishable from a real failure, so two batches of folded work were lost.
+        resp502 = HTTP.Response(502, "<html><head><title>502 Bad Gateway</title></head></html>")
+        err = try
+            _cds_check_response(resp502, "satellite-albedo", "costing")
+            nothing
+        catch e
+            e
+        end
+        @test err isa CDSTransientError
+        @test err.status == 502
+        @test _cds_is_transient(err)
+        msg = sprint(showerror, err)
+        @test occursin("502", msg)
+        @test occursin("transient", msg)
+
+        for status in (500, 503, 504)
+            e = try
+                _cds_check_response(HTTP.Response(status, "upstream down"), "d", "submit")
+            catch e
+                e
+            end
+            @test e isa CDSTransientError && _cds_is_transient(e)
+        end
+
+        # 408 and 429 are 4xx by number but transient by nature — the request is legal and
+        # the service is asking us to come back. ECMWF's own `cdsapi` retries these
+        # alongside the 5xx set, and surfacing a 429 as "CDS rejected the request" would
+        # send the user looking for a fault in a request that has none.
+        for status in (408, 429)
+            e = try
+                _cds_check_response(HTTP.Response(status, "slow down"), "d", "submit")
+            catch e
+                e
+            end
+            @test e isa CDSTransientError && _cds_is_transient(e)
+            @test e.status == status
+        end
+
+        # `Retry-After` is honoured when present, ignored when absent or unparseable, and
+        # clamped so a pathological header cannot park a run.
+        retry429 = HTTP.Response(429, ["Retry-After" => "45"], "slow down")
+        e = try; _cds_check_response(retry429, "d", "submit"); catch e; e; end
+        @test e.retry_after == 45.0
+        @test _cds_retry_after(HTTP.Response(429, "no header")) == 0.0
+        @test _cds_retry_after(HTTP.Response(429, ["Retry-After" => "Wed, 21 Oct 2015 07:28:00 GMT"], "")) == 0.0
+        @test _cds_retry_after(HTTP.Response(429, ["Retry-After" => "99999"], "")) == _CDS_RETRY_AFTER_MAX
+        # A 5xx with no header keeps the default, so the backoff curve applies unchanged.
+        e5 = try; _cds_check_response(HTTP.Response(502, "bad gateway"), "d", "submit"); catch e; e; end
+        @test e5.retry_after == 0.0
+
+        # 4xx must stay non-retryable: a bad request, a missing licence, or an over-limit
+        # order fails the same way however many times it is sent. Retrying these is what
+        # produced the endless resubmit loop documented at `satellite_albedo`.
+        for status in (400, 401, 403, 404)
+            e = try
+                _cds_check_response(HTTP.Response(status, "nope"), "d", "submit")
+            catch e
+                e
+            end
+            @test !_cds_is_transient(e)
+        end
+        # Nor is a job the server reports as genuinely `failed` (an `ErrorException`).
+        @test !_cds_is_transient(ErrorException("CDS job x failed"))
+        @test !_cds_is_transient(ArgumentError("bad request"))
+
+        # Connection-level faults are retryable — a dropped socket mid-run is not a verdict
+        # on the request.
+        @test _cds_is_transient(HTTP.Exceptions.ConnectError("https://x", ErrorException("refused")))
+        @test _cds_is_transient(EOFError())
+    end
+
+    @testset "_cds_retry" begin
+        # Succeeds after transient failures, without propagating them.
+        n = 0
+        got = _cds_retry(; dataset="d", context="test", verbose=false) do
+            n += 1
+            n < 3 && throw(CDSTransientError("d", "test", 502, "bad gateway"))
+            :ok
+        end
+        @test got == :ok
+        @test n == 3
+
+        # A non-transient error escapes on the first attempt, unwrapped.
+        m = 0
+        @test_throws ArgumentError _cds_retry(; dataset="d", context="test", verbose=false) do
+            m += 1
+            throw(ArgumentError("bad request"))
+        end
+        @test m == 1
+
+        # The attempt cap is honoured and the final failure is rethrown as itself, so the
+        # user sees the service's own message rather than a wrapper.
+        k = 0
+        @test_throws CDSTransientError _cds_retry(; dataset="d", context="test",
+                                                  attempts=3, verbose=false) do
+            k += 1
+            throw(CDSTransientError("d", "test", 500, "boom"))
+        end
+        @test k == 3
+
+        # A deadline already in the past stops the retrying immediately, so a caller's own
+        # timeout still bounds total time rather than being extended by retries.
+        j = 0
+        @test_throws CDSTransientError _cds_retry(; dataset="d", context="test",
+                                                  verbose=false, deadline=time() - 1) do
+            j += 1
+            throw(CDSTransientError("d", "test", 503, "boom"))
+        end
+        @test j == 1
+    end
+
+    @testset "Cost pre-check is advisory" begin
+        # A transient failure of the cheap `/costing` call must NOT abort the retrieve —
+        # this exact case (one nginx 502) killed an 11 h global run. The helper degrades to
+        # (NaN, Inf) so `cds_retrieve` submits and lets the server judge the request.
+        inputs = Dict("year" => ["2019"])
+        advisory(err) = _cds_advisory_cost("satellite-albedo", inputs; token="tok",
+                                           verbose=false,
+                                           estimate=(args...; kwargs...) -> throw(err))
+
+        for err in (CDSTransientError("d", "costing", 502, "bad gateway"),
+                    HTTP.Exceptions.ConnectError("https://x", ErrorException("refused")),
+                    EOFError())
+            cost, limit = advisory(err)
+            @test isnan(cost)
+            @test limit == Inf
+        end
+        # The degradation is warned about, not silent.
+        @test_logs (:warn,) match_mode = :any _cds_advisory_cost(
+            "satellite-albedo", inputs; token="tok", verbose=true,
+            estimate=(args...; kwargs...) -> throw(CDSTransientError("d", "costing", 502, "x")))
+
+        # But a non-transient error still propagates: a 4xx means the request or the
+        # licence is wrong, and submitting it anyway would only produce a worse message.
+        @test_throws ArgumentError advisory(ArgumentError("bad request"))
+        @test_throws ErrorException advisory(ErrorException("licence not accepted"))
+
+        # The happy path is passed through untouched.
+        @test _cds_advisory_cost("satellite-albedo", inputs; token="tok", verbose=false,
+                                 estimate=(args...; kwargs...) -> (4.0, 20.0)) == (4.0, 20.0)
+    end
+
+    @testset "Transient backoff bounds" begin
+        @test 0 < _CDS_TRANSIENT_RETRY_BASE <= _CDS_TRANSIENT_RETRY_MAX
+        # The attempt cap must not be the binding limit on a long run — `deadline` is.
+        # Eight attempts was only ~6.6 min of backoff, less than a maintenance window.
+        @test _CDS_TRANSIENT_ATTEMPTS * _CDS_TRANSIENT_RETRY_MAX >= 3600
+        @test 408 in _CDS_TRANSIENT_STATUSES && 429 in _CDS_TRANSIENT_STATUSES
+        # Faster than the queue-limit backoff: a proxy hiccup clears in seconds, whereas a
+        # queue slot needs another of our jobs to finish.
+        @test _CDS_TRANSIENT_RETRY_BASE < _CDS_QUEUE_RETRY_BASE
+        backoffs = [min(_CDS_TRANSIENT_RETRY_BASE * 2.0^(i - 1), _CDS_TRANSIENT_RETRY_MAX)
+                    for i in 1:8]
+        @test issorted(backoffs)
+        @test all(<=(_CDS_TRANSIENT_RETRY_MAX), backoffs)
     end
 
     @testset "Retry backoff bounds" begin

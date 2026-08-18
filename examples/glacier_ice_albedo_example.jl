@@ -32,8 +32,12 @@ using Printf
 ## ------------------------------------------------------------------ configuration
 
 # Russell Glacier area, west Greenland — a small extent with a real ablation zone, so
-# the run finishes in one CDS job round. ALWAYS pass an extent: the global grid is
-# ~120960 × 47040 pixels *per timestep*.
+# the run finishes in one CDS job round. The global grid is 120960 × 47040 pixels and
+# ~10.9 GB *per timestep*, so a small extent is much cheaper.
+#
+# For global coverage use `extent = nothing`, NOT a −180…180 / −90…90 `Extent`: the
+# latter becomes a CDS `area` subset, and large `area` subsets fail server-side. See the
+# large-grid keywords in `compute_glacier_ice_albedo`.
 const EXTENT = Extent(X = (-50.3, -49.5), Y = (66.9, 67.3))
 
 # Sentinel-3 300 m era only (2018–2024 — `GLACIER_ICE_ALBEDO_YEARS`). Two years is

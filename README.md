@@ -13,14 +13,26 @@ Pure Julia — no Python. Reanalysis data is read from Analysis-Ready, Cloud-Opt
 - **Invariant fields** — lazy `Raster`s for land–sea mask, geopotential/orography, vegetation/soil/lake, and a 30 m global DEM (`climate_model_invariant`).
 - **Chunk mapping** — visualize Zarr download locality before batch queries (`climate_chunk_map`).
 - **Satellite albedo** — 10-daily C3S surface albedo (Sentinel-3, 300 m) as a lazy `RasterSeries`, ordered from the CDS Retrieve API (`satellite_albedo`).
-- **Glacier bare-ice albedo** — observed bare-ice albedo per pixel-year, as the mean of each year's darkest few percent of albedo retrievals (`compute_glacier_ice_albedo`).
+- **Glacier bare-ice albedo** — observed bare-ice albedo per pixel-year, as the mean of each year's darkest few percent of albedo retrievals (`compute_glacier_ice_albedo`), or the same statistic at a point list from MODIS MCD43A3 500 m, in black-sky and white-sky forms (`compute_glacier_ice_albedo_modis`).
 
 ## Installation
+
+Requires **Julia 1.11 or newer**.
 
 ```julia
 using Pkg
 Pkg.develop(path="/path/to/GEMB_ClimateForcing.jl")
+Pkg.instantiate()   # resolves EarthData.jl from git — see the note below
 ```
+
+> **Note — `EarthData.jl` is pinned to `main`.** NASA CMR granule discovery is delegated to
+> [`EarthData.jl`](https://github.com/evetion/EarthData.jl) (JuliaGeo) rather than
+> reimplemented here, but the registered v0.1.0 predates the current CMR response schema and
+> cannot parse a live query. `Project.toml` therefore pins the development branch through a
+> `[sources]` block, which is what requires Julia 1.11 rather than the 1.10 LTS. The pin also
+> means this package cannot be registered in General until upstream tags a release; missing
+> functionality is being contributed upstream rather than kept local. `Pkg.instantiate()`
+> fetches the pinned revision automatically — nothing extra to install.
 
 ## Quick Start
 
@@ -238,7 +250,7 @@ Timesteps follow the 10-daily ("decadal") convention: **day 10, day 20, and the 
 
 > **Accept the licence first.** Visit [the dataset's download tab](https://cds.climate.copernicus.eu/datasets/satellite-albedo?tab=download#manage-licences) once and accept the product terms, or every request fails with HTTP 403. This is the most common first-run failure.
 
-> **Longitude is −180…180°E** here (as for the Copernicus DEM), *not* the 0–360°E convention of the ERA5-Land invariants. Omitting `extent` requests global 300 m data — ~120960 × 47040 pixels per variable per timestep — so an extent is strongly recommended.
+> **Longitude is −180…180°E** here (as for the Copernicus DEM), *not* the 0–360°E convention of the ERA5-Land invariants. Omitting `extent` requests global 300 m data — 120960 × 47040 pixels (lat 80°N…−60°S), ~10.9 GB per variable per timestep — so a *small* extent saves a great deal. A *large* extent, however, is worse than none: CDS fails `area` subsets above roughly a Greenland-sized box, while the same request with no `area` succeeds, so continental-scale work should order globally and subset locally.
 
 ### `compute_glacier_ice_albedo(years; extent, ...)`
 
@@ -273,6 +285,71 @@ Quality control runs per observation before any statistic is formed — missing/
 See `examples/glacier_ice_albedo_example.jl` for a runnable workflow — per-year summary, the multi-year mean GEMB consumes, and a NetCDF write. It runs on `include` and leaves `run_example(years; kwargs...)` callable for other settings.
 
 The albedo, `QFLAG` and `_ERR` layers all live in the same product file, so all three are read in a single `satellite_albedo` call per year at no extra CDS cost. The annual reduction streams the timesteps, keeping only the darkest few values per pixel, so peak memory is set by the percentile rather than by the number of observations in the year. Loader keywords (`timeout`, `max_concurrent_jobs`, `force_download`, …) are forwarded to `satellite_albedo`.
+
+### `compute_glacier_ice_albedo_modis(lat, lon, years; ...)`
+
+The **same statistic from MODIS MCD43A3** (500 m, daily, 2000-02-16 → present), evaluated at a **list of points** rather than over a gridded extent, and returning **black-sky** and **white-sky** albedo as separate layers.
+
+Requires a free [NASA Earthdata Login](https://urs.earthdata.nasa.gov/users/new) and a bearer token:
+
+```bash
+export EARTHDATA_TOKEN="your-token-here"     # or a single line in ~/.edl_token
+```
+
+Tokens last 60 days and **you may hold at most two** — a third request returns HTTP 403. `earthdata_token_from_netrc()` will mint one from `~/.netrc` credentials; call it yourself once rather than from a loop.
+
+```julia
+using GEMB_ClimateForcing, DimensionalData, Statistics
+
+# Points on the Russell Glacier ablation zone. The first two are ~20 m apart, i.e. inside
+# one 500 m MODIS cell.
+lat = [67.0900, 67.0902, 67.0950]
+lon = [-50.0500, -50.0500, -49.9000]
+
+ice = compute_glacier_ice_albedo_modis(lat, lon, 2019:2020; doy_range = :melt_season)
+
+ice[:albedo_bsa]                  # (point, Ti) Float32 — black-sky, NaN where unresolved
+ice[:albedo_wsa]                  # white-sky
+ice[:n_valid_observations_bsa]    # retrievals each point-year drew on
+ice[:cell_id]                     # "h16v02_r0699_c0124" — equal ⇒ identical albedo
+ice[:latitude], ice[:longitude]   # centre of the cell actually sampled
+
+# One value per point, for GEMB:
+albedo_ice = [mean(filter(!isnan, collect(ice[:albedo_bsa][p, :]))) for p in 1:length(lat)]
+```
+
+**Points are deduplicated to unique MODIS cells**, so several points inside one 500 m cell cost one sample and are populated from a single derivation — `cell_id` makes that auditable, and points sharing it necessarily share their albedo bit-for-bit. A vector of `(lat, lon)` tuples is accepted as an alternative first argument.
+
+> **Download volume is the cost and it is not reducible.** MODIS offers no server-side subsetting: the unit of transfer is a whole ~70 MB granule, of which ~85 % is layers never read. Budget `n_tiles × n_dates × 70 MB` — a Greenland point list spanning 8 tiles over a full year is ~200 GB. **`doy_range` is the fix**: at high latitude polar night yields no usable retrieval, so a melt-season window removes ~2.5× of the download at approximately zero cost in surviving samples. `stride` is the blunt fallback.
+>
+> **Pass `doy_range = :melt_season` rather than a hardcoded window.** The melt season is a different half of the year in each hemisphere, so a northern window like `(180, 220)` samples austral *midwinter* in Patagonia or Antarctica and resolves nothing. `:melt_season` reads the sign of the points' latitudes and picks `(120, 290)` or `(300, 110)`; a list straddling the equator falls back to the whole year, so split it by hemisphere and call twice. An explicit tuple with `first > last` wraps New Year, which is how the southern window is expressed — that pools the tail of one melt season with the start of the next inside a calendar year, which is acceptable for a darkest-percentile statistic. Granules are deleted after each date is folded (`keep_granules = false`, the default — *inverted* from the CDS path, where a re-order costs hours of queue latency rather than bandwidth-bound minutes), so peak disk stays at one date's tiles. Per-date sampled cell values are cached, so a re-run with the same points never re-downloads.
+
+Quality control mirrors the C3S path except in one respect: MCD43A3's quality band is a small-integer **class**, not a bitmask, so `qa_keep` is a **whitelist** (default `[0]`, full BRDF inversion; add `1` to admit magnitude inversions, which roughly doubles the sample count at high latitude). There is no per-pixel uncertainty layer and hence no `max_error`. The glaciological 0.3 `albedo_range` floor and the decision to keep bright snowy observations both transfer unchanged.
+
+Requesting more layers costs **no extra download** — the spectral bands live in the same granules:
+
+```julia
+ice = compute_glacier_ice_albedo_modis(lat, lon, 2019;
+    layers = (:Albedo_BSA_shortwave, :Albedo_WSA_shortwave, :Albedo_BSA_vis))
+ice[:albedo_bsa_vis]
+```
+
+See `examples/glacier_ice_albedo_modis_example.jl` for a runnable workflow.
+
+#### Choosing a source
+
+| | `compute_glacier_ice_albedo` (C3S) | `compute_glacier_ice_albedo_modis` (MCD43A3) |
+|---|---|---|
+| Resolution | 300 m | 500 m |
+| Cadence | 10-daily (~36/yr) | daily (~365/yr) |
+| Record | 2018–2024 (Sentinel-3 era) | 2000-02-16 → present |
+| Interface | gridded `extent` | point list |
+| Output | one broadband albedo | **black-sky + white-sky** |
+| Quality band | `QFLAG` bitmask + `_ERR` uncertainty | quality *class* whitelist, no uncertainty |
+| Access | CDS async jobs — hours of queue latency | HTTPS granule download — bandwidth-bound |
+| Credentials | CDS API key + licence acceptance | Earthdata Login token |
+
+Prefer MODIS for long records, per-point work, or when black-sky/white-sky are needed separately; prefer C3S for finer spatial detail over a contiguous area. The reduction statistic is identical, so the two are directly comparable.
 
 ## ERA5-Land Details
 

@@ -1,0 +1,306 @@
+{
+ "hits": 32,
+ "took": 371,
+ "items": [
+  {
+   "meta": {
+    "concept-type": "granule",
+    "concept-id": "G2371506667-LPCLOUD",
+    "revision-id": 1,
+    "native-id": "MCD43A3.A2019175.h16v02.061.2020308035737",
+    "collection-concept-id": "C2278860820-LPCLOUD",
+    "provider-id": "LPCLOUD",
+    "format": "application/echo10+xml",
+    "revision-date": "2022-07-28T18:37:47.686Z"
+   },
+   "umm": {
+    "GranuleUR": "MCD43A3.A2019175.h16v02.061.2020308035737",
+    "RelatedUrls": [
+     {
+      "URL": "https://data.lpdaac.earthdatacloud.nasa.gov/lp-prod-protected/MCD43A3.061/MCD43A3.A2019175.h16v02.061.2020308035737/MCD43A3.A2019175.h16v02.061.2020308035737.hdf",
+      "Type": "GET DATA",
+      "Description": "Download MCD43A3.A2019175.h16v02.061.2020308035737.hdf"
+     },
+     {
+      "URL": "s3://lp-prod-protected/MCD43A3.061/MCD43A3.A2019175.h16v02.061.2020308035737/MCD43A3.A2019175.h16v02.061.2020308035737.hdf",
+      "Type": "GET DATA VIA DIRECT ACCESS",
+      "Description": "This link provides direct download access via S3 to the granule"
+     },
+     {
+      "URL": "https://doi.org/10.5067/MODIS/MCD43A3.061",
+      "Type": "VIEW RELATED INFORMATION",
+      "Description": "The Landing Page for this file may be accessed directly from this link",
+      "MimeType": "text/html"
+     },
+     {
+      "URL": "https://data.lpdaac.earthdatacloud.nasa.gov/lp-prod-protected/MCD43A3.061/MCD43A3.A2019175.h16v02.061.2020308035737/MCD43A3.A2019175.h16v02.061.2020308035737.cmr.xml",
+      "Type": "VIEW RELATED INFORMATION",
+      "Description": "Download MCD43A3.A2019175.h16v02.061.2020308035737.cmr.xml"
+     },
+     {
+      "URL": "s3://lp-prod-protected/MCD43A3.061/MCD43A3.A2019175.h16v02.061.2020308035737/MCD43A3.A2019175.h16v02.061.2020308035737.cmr.xml",
+      "Type": "VIEW RELATED INFORMATION",
+      "Description": "This link provides direct download access via S3 to the granule"
+     },
+     {
+      "URL": "https://data.lpdaac.earthdatacloud.nasa.gov/s3credentials",
+      "Type": "VIEW RELATED INFORMATION",
+      "Description": "api endpoint to retrieve temporary credentials valid for same-region direct s3 access"
+     },
+     {
+      "URL": "https://data.lpdaac.earthdatacloud.nasa.gov/lp-prod-public/MCD43A3.061/MCD43A3.A2019175.h16v02.061.2020308035737/BROWSE.MCD43A3.A2019175.h16v02.061.2020307230732.1.jpg",
+      "Type": "GET RELATED VISUALIZATION",
+      "Description": "Download BROWSE.MCD43A3.A2019175.h16v02.061.2020307230732.1.jpg"
+     },
+     {
+      "URL": "s3://lp-prod-public/MCD43A3.061/MCD43A3.A2019175.h16v02.061.2020308035737/BROWSE.MCD43A3.A2019175.h16v02.061.2020307230732.1.jpg",
+      "Type": "GET RELATED VISUALIZATION",
+      "Description": "This link provides direct download access via S3 to the granule"
+     }
+    ],
+    "DataGranule": {
+     "DayNightFlag": "Day",
+     "Identifiers": [
+      {
+       "Identifier": "MCD43A3.A2019175.h16v02.061.2020308035737",
+       "IdentifierType": "ProducerGranuleId"
+      }
+     ],
+     "ProductionDateTime": "2020-11-03T04:06:06.000Z",
+     "ArchiveAndDistributionInformation": [
+      {
+       "Name": "Not provided",
+       "Size": 53.9037,
+       "SizeUnit": "MB"
+      }
+     ]
+    },
+    "TemporalExtent": {
+     "RangeDateTime": {
+      "BeginningDateTime": "2019-06-16T00:00:00.000Z",
+      "EndingDateTime": "2019-07-01T23:59:59.999Z"
+     }
+    },
+    "CollectionReference": {
+     "ShortName": "MCD43A3",
+     "Version": "061"
+    },
+    "MetadataSpecification": {
+     "URL": "https://cdn.earthdata.nasa.gov/umm/granule/v1.6.6",
+     "Name": "UMM-G",
+     "Version": "1.6.6"
+    },
+    "ProviderDates": [
+     {
+      "Date": "2022-03-31T16:50:50.820Z",
+      "Type": "Insert"
+     },
+     {
+      "Date": "2022-03-31T16:51:21.374Z",
+      "Type": "Update"
+     }
+    ]
+   }
+  },
+  {
+   "meta": {
+    "concept-type": "granule",
+    "concept-id": "G2371508754-LPCLOUD",
+    "revision-id": 1,
+    "native-id": "MCD43A3.A2019175.h15v02.061.2020308031227",
+    "collection-concept-id": "C2278860820-LPCLOUD",
+    "provider-id": "LPCLOUD",
+    "format": "application/echo10+xml",
+    "revision-date": "2022-07-28T18:38:48.747Z"
+   },
+   "umm": {
+    "GranuleUR": "MCD43A3.A2019175.h15v02.061.2020308031227",
+    "RelatedUrls": [
+     {
+      "URL": "https://data.lpdaac.earthdatacloud.nasa.gov/lp-prod-protected/MCD43A3.061/MCD43A3.A2019175.h15v02.061.2020308031227/MCD43A3.A2019175.h15v02.061.2020308031227.hdf",
+      "Type": "GET DATA",
+      "Description": "Download MCD43A3.A2019175.h15v02.061.2020308031227.hdf"
+     },
+     {
+      "URL": "s3://lp-prod-protected/MCD43A3.061/MCD43A3.A2019175.h15v02.061.2020308031227/MCD43A3.A2019175.h15v02.061.2020308031227.hdf",
+      "Type": "GET DATA VIA DIRECT ACCESS",
+      "Description": "This link provides direct download access via S3 to the granule"
+     },
+     {
+      "URL": "https://doi.org/10.5067/MODIS/MCD43A3.061",
+      "Type": "VIEW RELATED INFORMATION",
+      "Description": "The Landing Page for this file may be accessed directly from this link",
+      "MimeType": "text/html"
+     },
+     {
+      "URL": "https://data.lpdaac.earthdatacloud.nasa.gov/lp-prod-protected/MCD43A3.061/MCD43A3.A2019175.h15v02.061.2020308031227/MCD43A3.A2019175.h15v02.061.2020308031227.cmr.xml",
+      "Type": "VIEW RELATED INFORMATION",
+      "Description": "Download MCD43A3.A2019175.h15v02.061.2020308031227.cmr.xml"
+     },
+     {
+      "URL": "s3://lp-prod-protected/MCD43A3.061/MCD43A3.A2019175.h15v02.061.2020308031227/MCD43A3.A2019175.h15v02.061.2020308031227.cmr.xml",
+      "Type": "VIEW RELATED INFORMATION",
+      "Description": "This link provides direct download access via S3 to the granule"
+     },
+     {
+      "URL": "https://data.lpdaac.earthdatacloud.nasa.gov/s3credentials",
+      "Type": "VIEW RELATED INFORMATION",
+      "Description": "api endpoint to retrieve temporary credentials valid for same-region direct s3 access"
+     },
+     {
+      "URL": "https://data.lpdaac.earthdatacloud.nasa.gov/lp-prod-public/MCD43A3.061/MCD43A3.A2019175.h15v02.061.2020308031227/BROWSE.MCD43A3.A2019175.h15v02.061.2020307222103.1.jpg",
+      "Type": "GET RELATED VISUALIZATION",
+      "Description": "Download BROWSE.MCD43A3.A2019175.h15v02.061.2020307222103.1.jpg"
+     },
+     {
+      "URL": "s3://lp-prod-public/MCD43A3.061/MCD43A3.A2019175.h15v02.061.2020308031227/BROWSE.MCD43A3.A2019175.h15v02.061.2020307222103.1.jpg",
+      "Type": "GET RELATED VISUALIZATION",
+      "Description": "This link provides direct download access via S3 to the granule"
+     }
+    ],
+    "DataGranule": {
+     "DayNightFlag": "Day",
+     "Identifiers": [
+      {
+       "Identifier": "MCD43A3.A2019175.h15v02.061.2020308031227",
+       "IdentifierType": "ProducerGranuleId"
+      }
+     ],
+     "ProductionDateTime": "2020-11-03T03:19:08.000Z",
+     "ArchiveAndDistributionInformation": [
+      {
+       "Name": "Not provided",
+       "Size": 72.2186,
+       "SizeUnit": "MB"
+      }
+     ]
+    },
+    "TemporalExtent": {
+     "RangeDateTime": {
+      "BeginningDateTime": "2019-06-16T00:00:00.000Z",
+      "EndingDateTime": "2019-07-01T23:59:59.999Z"
+     }
+    },
+    "CollectionReference": {
+     "ShortName": "MCD43A3",
+     "Version": "061"
+    },
+    "MetadataSpecification": {
+     "URL": "https://cdn.earthdata.nasa.gov/umm/granule/v1.6.6",
+     "Name": "UMM-G",
+     "Version": "1.6.6"
+    },
+    "ProviderDates": [
+     {
+      "Date": "2022-03-31T16:51:48.250Z",
+      "Type": "Insert"
+     },
+     {
+      "Date": "2022-03-31T16:52:19.586Z",
+      "Type": "Update"
+     }
+    ]
+   }
+  },
+  {
+   "meta": {
+    "concept-type": "granule",
+    "concept-id": "G2371509062-LPCLOUD",
+    "revision-id": 1,
+    "native-id": "MCD43A3.A2019176.h16v02.061.2020308052606",
+    "collection-concept-id": "C2278860820-LPCLOUD",
+    "provider-id": "LPCLOUD",
+    "format": "application/echo10+xml",
+    "revision-date": "2022-07-28T18:38:56.182Z"
+   },
+   "umm": {
+    "GranuleUR": "MCD43A3.A2019176.h16v02.061.2020308052606",
+    "RelatedUrls": [
+     {
+      "URL": "https://data.lpdaac.earthdatacloud.nasa.gov/lp-prod-protected/MCD43A3.061/MCD43A3.A2019176.h16v02.061.2020308052606/MCD43A3.A2019176.h16v02.061.2020308052606.hdf",
+      "Type": "GET DATA",
+      "Description": "Download MCD43A3.A2019176.h16v02.061.2020308052606.hdf"
+     },
+     {
+      "URL": "s3://lp-prod-protected/MCD43A3.061/MCD43A3.A2019176.h16v02.061.2020308052606/MCD43A3.A2019176.h16v02.061.2020308052606.hdf",
+      "Type": "GET DATA VIA DIRECT ACCESS",
+      "Description": "This link provides direct download access via S3 to the granule"
+     },
+     {
+      "URL": "https://doi.org/10.5067/MODIS/MCD43A3.061",
+      "Type": "VIEW RELATED INFORMATION",
+      "Description": "The Landing Page for this file may be accessed directly from this link",
+      "MimeType": "text/html"
+     },
+     {
+      "URL": "https://data.lpdaac.earthdatacloud.nasa.gov/lp-prod-protected/MCD43A3.061/MCD43A3.A2019176.h16v02.061.2020308052606/MCD43A3.A2019176.h16v02.061.2020308052606.cmr.xml",
+      "Type": "VIEW RELATED INFORMATION",
+      "Description": "Download MCD43A3.A2019176.h16v02.061.2020308052606.cmr.xml"
+     },
+     {
+      "URL": "s3://lp-prod-protected/MCD43A3.061/MCD43A3.A2019176.h16v02.061.2020308052606/MCD43A3.A2019176.h16v02.061.2020308052606.cmr.xml",
+      "Type": "VIEW RELATED INFORMATION",
+      "Description": "This link provides direct download access via S3 to the granule"
+     },
+     {
+      "URL": "https://data.lpdaac.earthdatacloud.nasa.gov/s3credentials",
+      "Type": "VIEW RELATED INFORMATION",
+      "Description": "api endpoint to retrieve temporary credentials valid for same-region direct s3 access"
+     },
+     {
+      "URL": "https://data.lpdaac.earthdatacloud.nasa.gov/lp-prod-public/MCD43A3.061/MCD43A3.A2019176.h16v02.061.2020308052606/BROWSE.MCD43A3.A2019176.h16v02.061.2020308003733.1.jpg",
+      "Type": "GET RELATED VISUALIZATION",
+      "Description": "Download BROWSE.MCD43A3.A2019176.h16v02.061.2020308003733.1.jpg"
+     },
+     {
+      "URL": "s3://lp-prod-public/MCD43A3.061/MCD43A3.A2019176.h16v02.061.2020308052606/BROWSE.MCD43A3.A2019176.h16v02.061.2020308003733.1.jpg",
+      "Type": "GET RELATED VISUALIZATION",
+      "Description": "This link provides direct download access via S3 to the granule"
+     }
+    ],
+    "DataGranule": {
+     "DayNightFlag": "Day",
+     "Identifiers": [
+      {
+       "Identifier": "MCD43A3.A2019176.h16v02.061.2020308052606",
+       "IdentifierType": "ProducerGranuleId"
+      }
+     ],
+     "ProductionDateTime": "2020-11-03T05:36:11.000Z",
+     "ArchiveAndDistributionInformation": [
+      {
+       "Name": "Not provided",
+       "Size": 54.4586,
+       "SizeUnit": "MB"
+      }
+     ]
+    },
+    "TemporalExtent": {
+     "RangeDateTime": {
+      "BeginningDateTime": "2019-06-17T00:00:00.000Z",
+      "EndingDateTime": "2019-07-02T23:59:59.999Z"
+     }
+    },
+    "CollectionReference": {
+     "ShortName": "MCD43A3",
+     "Version": "061"
+    },
+    "MetadataSpecification": {
+     "URL": "https://cdn.earthdata.nasa.gov/umm/granule/v1.6.6",
+     "Name": "UMM-G",
+     "Version": "1.6.6"
+    },
+    "ProviderDates": [
+     {
+      "Date": "2022-03-31T16:51:59.402Z",
+      "Type": "Insert"
+     },
+     {
+      "Date": "2022-03-31T16:52:31.615Z",
+      "Type": "Update"
+     }
+    ]
+   }
+  }
+ ]
+}

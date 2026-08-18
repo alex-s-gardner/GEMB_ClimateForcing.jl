@@ -17,7 +17,11 @@ jobs:
       fail-fast: false
       matrix:
         version:
-          - '1.10'  # LTS
+          # NOT the 1.10 LTS: Project.toml's `[sources]` block (pinning EarthData.jl to
+          # main, since its registered v0.1.0 cannot parse a present-day CMR response)
+          # requires julia 1.11, so a 1.10 job fails at resolution, not at a real
+          # regression. Restore 1.10 here only if that pin goes away.
+          - '1.11'  # minimum supported
           - '1'     # Latest stable
         os:
           - ubuntu-latest

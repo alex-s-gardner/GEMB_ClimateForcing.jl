@@ -18,7 +18,41 @@ using NCDatasets
 
 using GEMB_ClimateForcing: _low_percentile_mean, _LowPercentileTopK, _accumulate!,
     _finalize, _valid_albedo, _qflag_rejects, _qflag_table, _albedo_qflag_legend,
-    _albedo_isbad, _ICE_ALBEDO_RANGE, GLACIER_ICE_ALBEDO_QFLAG_REJECT
+    _albedo_isbad, _ICE_ALBEDO_RANGE, GLACIER_ICE_ALBEDO_QFLAG_REJECT,
+    _checkpoint_path, _checkpoint_read, _checkpoint_write, _progress_bar,
+    _format_duration, _grid_cache_path, _grid_cache_read, _grid_cache_write,
+    _accumulate_blockwise!
+
+# Unmap an accumulator's scratch arrays as promptly as the platform allows, then remove
+# their directory — tolerating the one failure Windows can still produce.
+#
+# On Windows, deleting a file that is still memory-mapped does not fail; it is *deferred*
+# (delete-on-close), so the file lingers until the last mapping is torn down and `rm` then
+# reports ENOTEMPTY on the parent directory even though every file "succeeded". Neither
+# dropping the reference plus `GC.gc()` nor `finalize` on the arrays wins that race
+# reliably — both were tried on CI, and which of these testsets failed varied between runs.
+#
+# So: release what we can, then treat cleanup failure as ignorable. This is scratch space
+# under `mktempdir()`, which the OS reclaims anyway, and nothing under test depends on the
+# deletion — the assertions are about the folded values. `finalize` is a no-op for the
+# in-memory accumulator, whose fields are plain `Array`s.
+function release_scratch!(acc)
+    for a in (acc.vals, acc.nfilled, acc.counts)
+        finalize(a)
+    end
+    GC.gc()
+    return nothing
+end
+
+function remove_scratch_dir(dir)
+    try
+        rm(dir; recursive=true, force=true)
+    catch err
+        err isa Base.IOError || rethrow()
+        @debug "Left scratch directory behind (mapped files); the OS will reclaim it" dir
+    end
+    return nothing
+end
 
 @testset "Glacier bare-ice albedo" begin
 
@@ -141,6 +175,51 @@ using GEMB_ClimateForcing: _low_percentile_mean, _LowPercentileTopK, _accumulate
         @test all(≈(0.5f0), m)
     end
 
+    @testset "Per-observation QC — scaled integers + QA whitelist" begin
+        # MCD43A3 shape: Int16 albedo × 0.001, quality as a small-integer class.
+        # Columns: (500→0.5, QA 0), (620→0.62, QA 1), (450→0.45, QA 255 fill),
+        #          (32767 fill → 32.767, QA 0), (200→0.2 below floor, QA 0).
+        alb = [500 620 450 32767 200]
+        qa = UInt8[0 1 255 0 0]
+
+        m = _valid_albedo(alb, qa, nothing; scale=0.001, keep_values=[0])
+        @test m[1] ≈ 0.5f0
+        @test isnan(m[2])            # QA 1 not in the whitelist
+        @test isnan(m[3])            # QA 255 (fill) not in the whitelist
+        # Albedo fill needs no special case: 32767 × 0.001 = 32.767 fails the range check.
+        @test isnan(m[4])
+        @test isnan(m[5])            # below the 0.3 glaciological floor
+
+        # Admitting magnitude inversions (QA 1) is a one-keyword change.
+        m2 = _valid_albedo(alb, qa, nothing; scale=0.001, keep_values=[0, 1])
+        @test m2[1] ≈ 0.5f0
+        @test m2[2] ≈ 0.62f0
+        @test isnan(m2[3]) && isnan(m2[4]) && isnan(m2[5])
+
+        # The whitelist alone rejects every class it does not name, including ones a later
+        # product version might add — this is why it is a whitelist and not a reject-list.
+        @test all(isnan, _valid_albedo(alb, qa, nothing; scale=0.001, keep_values=Int[]))
+
+        # `scale` is applied before the range check, so the floor is in albedo units.
+        m3 = _valid_albedo([200 500], nothing, nothing;
+                           scale=0.001, albedo_range=(0.15, 1.0))
+        @test m3[1] ≈ 0.2f0 && m3[2] ≈ 0.5f0
+
+        # The C3S path must be untouched by the generalization: `scale=1` is exact in IEEE
+        # and `keep_values=nothing` disables the whitelist, so results match bit-for-bit.
+        for (a, q, e, kw) in ((Any[0.5 missing; NaN 0.7], nothing, nothing, (;)),
+                              ([0.5 0.5 0.5], [0 2 5], nothing, (; bitmask=2)),
+                              ([0.5 0.5 0.5], [1 7 missing], nothing, (; values=[7])),
+                              ([0.5 0.5 0.5], nothing, [0.1 0.9 missing],
+                               (; max_error=0.2)),
+                              ([0.2 0.5 0.95], [0 1 0], [0.05 0.05 0.05],
+                               (; bitmask=1, max_error=0.2, albedo_range=(0.15, 1.0))))
+            base = _valid_albedo(a, q, e; kw...)
+            # `isequal`, not `≈`: NaN-to-NaN must match too, and the values must be exact.
+            @test isequal(base, _valid_albedo(a, q, e; kw..., scale=1, keep_values=nothing))
+        end
+    end
+
     @testset "QFLAG legend → reject mask" begin
         # The real v3.1 legend shape: snow_presence, then per-band no-obs and BRDF bits.
         table = [(meaning="snow_presence", mask=1, is_value=false),
@@ -228,6 +307,155 @@ using GEMB_ClimateForcing: _low_percentile_mean, _LowPercentileTopK, _accumulate
         finally
             rm(dir; recursive=true, force=true)
         end
+    end
+
+    @testset "Fold checkpoint" begin
+        dir = mktempdir()
+        try
+            path = _checkpoint_path(dir, 2019)
+            # Absent checkpoint reads as "nothing folded" rather than throwing: a missing
+            # file is the normal first-run state.
+            @test _checkpoint_read(path) == (0, 0, Date[])
+
+            dates = [Date(2019, 1, 10), Date(2019, 1, 20)]
+            _checkpoint_write(path, 2, 36, dates)
+            kmax, n_expected, got = _checkpoint_read(path)
+            @test kmax == 2
+            @test n_expected == 36
+            @test got == dates
+
+            # Rewriting is atomic and leaves no partial file behind.
+            _checkpoint_write(path, 2, 36, vcat(dates, Date(2019, 1, 31)))
+            @test length(last(_checkpoint_read(path))) == 3
+            @test !isfile(path * ".part")
+
+            # A corrupt checkpoint degrades to "start over" with a warning — never to an
+            # error, which would leave the run unable to start at all.
+            write(path, "kmax = not-a-number\n")
+            @test (@test_logs (:warn,) _checkpoint_read(path)) == (0, 0, Date[])
+
+            # ...and it must leave no file handle behind when it degrades. A reader that
+            # threw out of `eachline(path)` keeps the file open, which on Windows locks it
+            # and makes the very next checkpoint write fail with EBUSY — turning a corrupt
+            # checkpoint into a dead run.
+            _checkpoint_write(path, 2, 36, dates)
+            @test _checkpoint_read(path) == (2, 36, dates)
+        finally
+            rm(dir; recursive=true, force=true)
+        end
+    end
+
+    @testset "Resume folds each observation exactly once" begin
+        # The property that matters: folding 4 grids in one pass must equal folding 2, losing
+        # the process, reopening the scratch state, and folding the other 2. Anything else
+        # means a resumed run either double-counts or drops observations.
+        obs = [fill(Float32(0.30 + 0.05i), 4, 5) for i in 1:4]
+        want, want_counts = _low_percentile_mean(obs, 0.5, 1)
+
+        dir = mktempdir()
+        acc2 = nothing
+        try
+            acc = _LowPercentileTopK((4, 5), 4, 0.5, 1; scratch_dir=dir)
+            for m in obs[1:2]
+                _accumulate!(acc, m)
+            end
+            release_scratch!(acc)   # unmap, as a dying process would
+            acc = nothing
+
+            # Reopen without truncating and finish the year.
+            acc2 = _LowPercentileTopK((4, 5), 4, 0.5, 1; scratch_dir=dir, resume=true,
+                                      n_seen=2)
+            for m in obs[3:4]
+                _accumulate!(acc2, m)
+            end
+            got, got_counts = _finalize(acc2)
+            @test got == want                     # bit-identical, not merely close
+            # `copy`, because `_finalize` returns the count layer as a reshaped *view* of
+            # the mmap — deliberately, so a global grid is not pulled into RAM. Holding the
+            # view here would keep the scratch file mapped past the `rm` below.
+            got_counts = copy(got_counts)
+            @test got_counts == want_counts
+
+            # `n_seen` is restored, so the declared-count guard still spans the whole year:
+            # a fifth observation is rejected rather than silently accepted.
+            @test_throws ArgumentError _accumulate!(acc2, obs[1])
+        finally
+            isnothing(acc2) || release_scratch!(acc2)
+            remove_scratch_dir(dir)
+        end
+    end
+
+    @testset "Resume rejects mismatched scratch geometry" begin
+        dir = mktempdir()
+        try
+            acc = _LowPercentileTopK((4, 5), 4, 0.5, 1; scratch_dir=dir)
+            release_scratch!(acc)
+            acc = nothing
+            # Same directory, different kmax (percentile) — reusing those arrays would
+            # corrupt every pixel, so this must fail loudly rather than proceed.
+            @test_throws ArgumentError _LowPercentileTopK((4, 5), 4, 0.25, 1;
+                                                          scratch_dir=dir, resume=true)
+            # Different grid size, likewise.
+            @test_throws ArgumentError _LowPercentileTopK((8, 5), 4, 0.5, 1;
+                                                          scratch_dir=dir, resume=true)
+            # Resuming with no scratch at all is a contradiction: in-memory state cannot
+            # outlive its process.
+            @test_throws ArgumentError _LowPercentileTopK((4, 5), 4, 0.5, 1; resume=true)
+            @test_throws ArgumentError compute_glacier_ice_albedo(2019; resume=true)
+        finally
+            remove_scratch_dir(dir)
+        end
+    end
+
+    @testset "Resume with a missing scratch file" begin
+        dir = mktempdir()
+        try
+            # Nothing there at all: resuming must say so rather than create zeroed arrays
+            # and silently report a year of no observations.
+            @test_throws ArgumentError _LowPercentileTopK((4, 5), 4, 0.5, 1;
+                                                          scratch_dir=dir, resume=true)
+        finally
+            remove_scratch_dir(dir)
+        end
+    end
+
+    @testset "Grid cache round-trip" begin
+        dir = mktempdir()
+        try
+            path = _grid_cache_path(dir)
+            @test isnothing(_grid_cache_read(path))     # absent → nothing, not an error
+
+            xy = (X(collect(-50.0:0.1:-49.5)), Y(collect(67.0:0.1:67.4)))
+            _grid_cache_write(path, xy)
+            got = _grid_cache_read(path)
+            @test !isnothing(got)
+            # Coordinates must round-trip exactly, or a resumed year's raster would be
+            # georeferenced slightly differently from the run that folded it.
+            @test collect(lookup(got[1])) == collect(lookup(xy[1]))
+            @test collect(lookup(got[2])) == collect(lookup(xy[2]))
+
+            write(path, "garbage")
+            @test (@test_logs (:warn,) _grid_cache_read(path)) === nothing
+        finally
+            rm(dir; recursive=true, force=true)
+        end
+    end
+
+    @testset "Progress bar" begin
+        @test occursin("0/36", _progress_bar(0, 36))
+        @test occursin("36/36", _progress_bar(36, 36))
+        @test occursin("100%", _progress_bar(36, 36))
+        @test occursin("50%", _progress_bar(18, 36))
+        # Fixed width regardless of progress, so successive log lines stay aligned.
+        w(s) = length(s[findfirst('[', s):findfirst(']', s)])
+        @test w(_progress_bar(0, 36)) == w(_progress_bar(18, 36)) == w(_progress_bar(36, 36))
+        # Degenerate totals must not divide by zero.
+        @test occursin("?", _progress_bar(0, 0))
+
+        @test _format_duration(0) == "0:00:00"
+        @test _format_duration(3661) == "1:01:01"
+        @test _format_duration(NaN) == "--:--:--"
+        @test _format_duration(Inf) == "--:--:--"
     end
 
     @testset "Input validation" begin

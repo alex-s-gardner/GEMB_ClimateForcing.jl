@@ -96,7 +96,14 @@ const _ALBEDO_COST_LIMIT = 20
 # after 1840 s, so a 1800 s timeout aborts jobs that would have succeeded. A timeout is
 # especially expensive here — it kills the wait *before* the finished result is cached, so
 # the work is lost and the order must be resubmitted for another 30–90 min of queue time.
-const _ALBEDO_JOB_TIMEOUT = 10800
+#
+# 24 h, raised from 3 h. Large orders (wide `area`, many timesteps) routinely run far past
+# 3 h server-side: measured jobs have taken 1 h 49 m for a *subset*, and globe-wide orders
+# were still `running` after 7 h. The old 3 h value gave up on jobs that would have
+# succeeded, and because giving up happens before anything is cached, the abandoned queue
+# time is pure loss. Prefer waiting: a job left alone finishes, whereas a resubmission
+# starts the queue wait over *and* consumes one of the account's ~3 concurrent slots.
+const _ALBEDO_JOB_TIMEOUT = 86400
 
 # Filename token per variable, as used in the C3S product filenames. Verified against a
 # delivered file: `c3s_ALBB-DH_20190610000000_GLOBE_SENTINEL3_V3.1.0.area-subset.….nc`
@@ -658,8 +665,12 @@ below before requesting long series.
 - `time_range::Tuple{DateTime,DateTime}`: inclusive start/stop. Timesteps fall on day 10,
   day 20 and the last day of each month; only those inside the range are returned.
 - `extent`: an `Extents.Extent` or `(; X, Y)` NamedTuple in −180…180 longitude, or
-  `nothing` (default) for global. Global 300 m data is ~120960 × 47040 pixels *per
-  variable per timestep*, so an extent is strongly recommended.
+  `nothing` (default) for global. The global grid is 120960 × 47040 (lat 80°N…−60°S) —
+  10.9 GB per variable per timestep — so a *small* extent saves a great deal.
+  **But a large `extent` is worse than none**: CDS fails `area` subsets above roughly a
+  Greenland-sized box (`status:"failed"`, empty traceback), while the same request with no
+  `area` at all succeeds. For continental-or-larger coverage pass `extent=nothing` and
+  subset the returned rasters locally.
 - `variable`: one `Symbol` (default `:albb_dh`, broadband black-sky) or a vector of them.
   See [`SATELLITE_ALBEDO_VARIABLES`](@ref). One variable and one layer returns a series of
   `Raster`s; several of either return a series of `RasterStack`s.
@@ -745,8 +756,10 @@ function satellite_albedo(;
 
     area = _albedo_area(extent)
     isnothing(area) && verbose && @warn """
-    Ordering global 300 m albedo (~120960 × 47040 pixels per variable per timestep). \
-    Pass `extent` to subset server-side and download far less.
+    Ordering global 300 m albedo: 120960 × 47040 px, ~10.9 GB per variable per timestep. \
+    A *small* `extent` downloads far less — but note that `area` subsets larger than about \
+    a Greenland-sized box fail server-side, so global-and-subset-locally is the correct \
+    approach for continental coverage.
     """
 
     cache = isnothing(cache_path) ? _default_albedo_cache() : cache_path

@@ -5,12 +5,15 @@ authors = ["Alex Gardner <alex.s.gardner@jpl.nasa.gov> and contributors"]
 
 [deps]
 ArchGDAL = "c9ce4bd3-c3d5-55b8-8973-c0e20141b8c3"
+Base64 = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"
 CodecZlib = "944b1d66-785c-5afd-91f1-9de20f533193"
 Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
 DimensionalData = "0703355e-b756-11e9-17c0-8b28908087d0"
 Downloads = "f43a241f-c20a-4ad4-852c-f6b1247861c6"
+EarthData = "0ce7a1f8-0645-46c2-a0bb-6c09c29d93e9"
 HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
 JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
+Mmap = "a63ad114-7e13-5084-954f-fe012c677804"
 NCDatasets = "85f8d34a-cbdd-5861-8df4-14fed0d494ab"
 NetworkOptions = "ca575930-c2e3-43a9-ace4-1e988b2c1908"
 OpenSSL = "4d8831e6-92b7-49fb-bdf8-b643e874388c"
@@ -24,12 +27,15 @@ p7zip_jll = "3f19e933-33d8-53b3-aaab-bd5110c3b7a0"
 
 [compat]
 ArchGDAL = "0.10"
+Base64 = "1.11.0"
 CodecZlib = "0.7.8"
 Dates = "1"
 DimensionalData = "0.30"
 Downloads = "1.6"
+EarthData = "0.1"
 HTTP = "1"
 JSON3 = "1"
+Mmap = "1"
 NCDatasets = "0.14.15"
 NetworkOptions = "1"
 OpenSSL = "1"
@@ -39,8 +45,28 @@ Rasters = "0.15.0"
 SHA = "0.7, 1"
 Statistics = "1"
 Zarr = "0.9, 0.10"
-julia = "1.10"
+# 1.11 rather than the 1.10 LTS solely because [sources] below needs it, and that pin is
+# not optional — see the comment there.
+julia = "1.11"
 p7zip_jll = "17"
+
+# EarthData.jl is pinned to `main`, NOT taken from the General registry, and this is
+# load-bearing rather than a preference for newer code. The registered v0.1.0 is the 2023
+# tree: it cannot parse a present-day CMR response at all (`MethodError: Cannot convert an
+# object of type Int64 to an object of type String` out of the UMM-G schema on any real
+# query) and predates `urls`/`collections`. The July 2026 work on `main` fixes both but is
+# untagged, so there is no released version that works.
+#
+# Consequences, deliberately accepted:
+#   - This package cannot be registered in General until upstream tags a release. Ask on
+#     https://github.com/evetion/EarthData.jl/issues/18, then drop this block and let the
+#     [compat] entry above resolve normally.
+#   - An upstream force-push to `main` breaks re-resolution (existing checkouts are fine).
+#
+# Do NOT "simplify" by deleting this block: Pkg would silently resolve the broken v0.1.0 and
+# every MODIS granule query would fail in the schema parser, far from the cause.
+[sources]
+EarthData = {url = "https://github.com/evetion/EarthData.jl", rev = "main"}
 
 [extras]
 BenchmarkTools = "6e4b80f9-dd63-53aa-95a3-0cdb28fa8baf"

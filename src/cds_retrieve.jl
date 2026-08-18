@@ -82,6 +82,135 @@ end
 # opposed to any other cause of a "rejected" status.
 const _CDS_QUEUE_LIMIT_HINT = "queued requests for this dataset is temporarily limited"
 
+"""
+    CDSTransientError(dataset, context, status, detail)
+
+A CDS response that says nothing about the request: a 5xx from the service or its
+fronting proxy.
+
+Distinct from the 4xx errors, which are the caller's fault and must not be retried. A
+502/503/504 typically means nginx could not reach the application for a moment; the
+identical call succeeds seconds later. [`_cds_retry`](@ref) catches this and retries.
+
+This exists because the failure it names is unavoidable over long runs and was fatal
+before: a multi-hour global albedo order died on a single HTTP 502 from `/costing` — the
+*cheap, unqueued* cost pre-check — discarding two batches of folded work and ~11 h of
+downloads.
+"""
+struct CDSTransientError <: Exception
+    dataset::String
+    context::String
+    status::Int
+    detail::String
+    retry_after::Float64   # server-requested wait, seconds; 0.0 when unspecified
+end
+
+CDSTransientError(dataset, context, status, detail) =
+    CDSTransientError(dataset, context, status, detail, 0.0)
+
+function Base.showerror(io::IO, e::CDSTransientError)
+    print(io, """
+    CDS server error for "$(e.dataset)" (HTTP $(e.status), $(e.context)).
+
+    $(e.detail)
+
+    This is a service-side fault, not a problem with the request; it is normally
+    transient and worth retrying.
+    """)
+end
+
+# Backoff bounds and attempt cap for retrying a transient (5xx / network) failure. Short
+# compared with the queue-limit backoff because the blocker is a service hiccup, not other
+# jobs of ours draining.
+const _CDS_TRANSIENT_RETRY_BASE = 5.0
+const _CDS_TRANSIENT_RETRY_MAX = 120.0
+# Generous on purpose. Eight attempts is only ~6.6 min of backoff, which a CDS maintenance
+# window outlasts easily — and the cost of giving up is hours of queue time plus, for the
+# albedo folder, the batch of downloads behind it. ECMWF's `cdsapi` sets `retry_max=500` at
+# `sleep_max=120` (~16 h), i.e. effectively "never give up"; `deadline` is what actually
+# bounds us, so a high count here just stops the *attempt cap* from being the binding limit.
+const _CDS_TRANSIENT_ATTEMPTS = 60
+
+# Non-5xx statuses that are nonetheless worth retrying. 408 and 429 are 4xx by number but
+# say nothing bad about the request: the service is asking us to come back. Matches the set
+# ECMWF's own `cdsapi` retries (`Client.robust`: 500, 502, 503, 504, 408, 429).
+const _CDS_TRANSIENT_STATUSES = (408, 429)
+
+# Cap on an honoured `Retry-After`, so a pathological header cannot park a run for hours.
+const _CDS_RETRY_AFTER_MAX = 300.0
+
+"""
+    _cds_retry_after(response) -> Float64
+
+Seconds the server asked us to wait, from the `Retry-After` header, or `0.0` when absent
+or unparseable. Only the delta-seconds form is honoured (the HTTP-date form is legal but
+CDS does not use it); the value is clamped to `_CDS_RETRY_AFTER_MAX`.
+"""
+function _cds_retry_after(response)
+    raw = HTTP.header(response, "Retry-After", "")
+    isempty(strip(raw)) && return 0.0
+    seconds = tryparse(Float64, strip(raw))
+    isnothing(seconds) && return 0.0
+    return clamp(seconds, 0.0, _CDS_RETRY_AFTER_MAX)
+end
+
+"""
+    _cds_is_transient(err) -> Bool
+
+Whether `err` is worth retrying: a [`CDSTransientError`](@ref) (a 5xx, or a 408/429 —
+see `_CDS_TRANSIENT_STATUSES`) or a connection-level failure (DNS, connect, timeout,
+reset, truncated body).
+
+Deliberately narrow. `ArgumentError` (4xx: bad request, unknown dataset) and plain
+`ErrorException` (a job CDS reports as `failed`/`dismissed`, or a request that timed out)
+are *not* transient — retrying those is what produced the endless resubmit loop this
+package documents at `satellite_albedo`.
+"""
+_cds_is_transient(err) =
+    err isa CDSTransientError ||
+    err isa HTTP.Exceptions.ConnectError ||
+    err isa HTTP.Exceptions.TimeoutError ||
+    err isa HTTP.Exceptions.RequestError ||
+    err isa Downloads.RequestError ||
+    err isa Base.IOError ||
+    err isa EOFError
+
+"""
+    _cds_retry(f; dataset, context, attempts, verbose, deadline) -> f()
+
+Call `f`, retrying while it fails transiently (see [`_cds_is_transient`](@ref)) with
+exponential backoff from `_CDS_TRANSIENT_RETRY_BASE` to `_CDS_TRANSIENT_RETRY_MAX`.
+
+Every CDS interaction goes through this — costing, submission, status polls, results and
+the asset download — because any of them can catch a proxy hiccup, and a single one
+killing a multi-hour run is not acceptable. Non-transient errors propagate on the first
+attempt, unchanged.
+
+`deadline` (an absolute `time()` value) bounds the retrying so a caller's own timeout is
+still respected; the final failure is rethrown rather than wrapped, so the message the
+user sees is the service's own.
+
+The mechanism itself lives in [`_retry_transient`](@ref) (`utils.jl`) and is shared with
+the NASA Earthdata client; this wrapper supplies only what is CDS-specific — the error
+taxonomy, the `_CDS_*` constants, the `Retry-After` accessor, and the log record.
+
+!!! note "Resubmission may duplicate a job"
+    A 5xx on *submission* can in principle mean the job was created and only the
+    response was lost, in which case the retry queues a second identical job. That is
+    tolerable — a duplicate is dismissible and costs one queue slot — and far cheaper
+    than failing a run that has hours of folded state behind it.
+"""
+_cds_retry(f; dataset::AbstractString, context::AbstractString,
+           attempts::Integer=_CDS_TRANSIENT_ATTEMPTS, verbose::Bool=true,
+           deadline::Float64=Inf) =
+    _retry_transient(f; is_transient=_cds_is_transient, context=context,
+        attempts=attempts, base=_CDS_TRANSIENT_RETRY_BASE,
+        max_backoff=_CDS_TRANSIENT_RETRY_MAX, deadline=deadline, verbose=verbose,
+        # A server-supplied `Retry-After` (429) knows better than our curve does.
+        retry_after = err -> err isa CDSTransientError ? err.retry_after : 0.0,
+        on_retry = (attempt, backoff, err) ->
+            @warn "Transient CDS failure; retrying" dataset context attempt backoff_s = round(backoff; digits=1) error = sprint(showerror, err))
+
 # Backoff bounds, in seconds, for resubmitting a queue-limited job. Generous because the
 # blocker is other jobs of ours finishing, which takes minutes, not milliseconds.
 const _CDS_QUEUE_RETRY_BASE = 30.0
@@ -176,6 +305,14 @@ function _cds_check_response(response, dataset::AbstractString, context::Abstrac
 
         $(detail)
         """))
+    elseif response.status in _CDS_TRANSIENT_STATUSES
+        # 408 Request Timeout and 429 Too Many Requests are 4xx by number but transient by
+        # nature: the request is legal and the service is asking us to come back. ECMWF's
+        # own `cdsapi` retries exactly these alongside the 5xx set (`Client.robust`), and a
+        # 429 reaching the user as "CDS rejected the request" would be actively misleading.
+        # 429 usually carries `Retry-After`; honour it instead of our own backoff.
+        throw(CDSTransientError(String(dataset), String(context), Int(response.status),
+                                detail * request_note, _cds_retry_after(response)))
     elseif 400 <= response.status < 500
         throw(ArgumentError("""
         CDS rejected the request for "$(dataset)" (HTTP $(response.status), $(context)).
@@ -183,11 +320,11 @@ function _cds_check_response(response, dataset::AbstractString, context::Abstrac
         $(detail)$(request_note)
         """))
     else
-        error("""
-        CDS server error for "$(dataset)" (HTTP $(response.status), $(context)).
-
-        $(detail)$(request_note)
-        """)
+        # 5xx says nothing about the request — it is the service or its proxy faltering, and
+        # the identical call usually succeeds moments later. Typed so `_cds_retry` can pick
+        # it out; a bare `error()` here once killed an 11 h run on one nginx 502.
+        throw(CDSTransientError(String(dataset), String(context), Int(response.status),
+                                detail * request_note, _cds_retry_after(response)))
     end
 end
 
@@ -211,14 +348,53 @@ cost > limit && error("split this request")
 ```
 """
 function cds_estimate_cost(dataset::AbstractString, inputs::AbstractDict;
-                           token::AbstractString)
+                           token::AbstractString, verbose::Bool=true,
+                           deadline::Float64=Inf)
     url = "$(_CDS_RETRIEVE_BASE)/processes/$(dataset)/costing?request_origin=api"
-    response = _cds_post(url, inputs; token=token)
-    _cds_check_response(response, dataset, "costing"; inputs=inputs)
+    response = _cds_retry(; dataset=dataset, context="costing", verbose=verbose,
+                          deadline=deadline) do
+        r = _cds_post(url, inputs; token=token)
+        _cds_check_response(r, dataset, "costing"; inputs=inputs)
+        r
+    end
     body = JSON3.read(String(response.body))
     cost = haskey(body, :cost) ? Float64(body[:cost]) : NaN
     limit = haskey(body, :limit) ? Float64(body[:limit]) : Inf
     return (cost, limit)
+end
+
+"""
+    _cds_advisory_cost(dataset, inputs; token, verbose, deadline) -> (cost, limit)
+
+[`cds_estimate_cost`](@ref), downgraded from a gate to a courtesy: returns `(NaN, Inf)`
+instead of throwing when the costing endpoint cannot be reached, so the caller submits the
+request and lets the *server* judge it.
+
+This distinction is load-bearing. The pre-check exists only to turn an eventual server
+rejection into a clearer local error, and ECMWF's own `cdsapi` does not call the endpoint
+at all — so a `/costing` outage must never be fatal. It was: one nginx **HTTP 502 from
+this cheap, unqueued call** killed an 11 h global albedo run that had folded 8 timesteps
+and downloaded 86 GB. Making the call retry ([`_cds_retry`](@ref)) narrows the window but
+does not close it — exhausting the attempts would still abort a run over a check whose
+answer is not needed.
+
+A **non**-transient error still propagates: a 4xx means the request is malformed or the
+licence unaccepted, and submitting it would fail the same way with a worse message.
+
+`estimate` exists so the tests can exercise both branches of that policy without a network
+round trip; callers should leave it at its default.
+"""
+function _cds_advisory_cost(dataset::AbstractString, inputs::AbstractDict;
+                            token::AbstractString, verbose::Bool=true,
+                            deadline::Float64=Inf, estimate=cds_estimate_cost)
+    try
+        return estimate(dataset, inputs; token=token, verbose=verbose,
+                        deadline=deadline)
+    catch err
+        _cds_is_transient(err) || rethrow()
+        verbose && @warn "CDS cost pre-check unavailable; submitting the request anyway" dataset error = sprint(showerror, err)
+        return (NaN, Inf)
+    end
 end
 
 """
@@ -250,10 +426,14 @@ Submit a retrieval job and return its job id. The id is read from the response b
 `jobID`, falling back to the trailing path segment of the `Location` header.
 """
 function _cds_submit(dataset::AbstractString, inputs::AbstractDict;
-                     token::AbstractString)
+                     token::AbstractString, verbose::Bool=true, deadline::Float64=Inf)
     url = "$(_CDS_RETRIEVE_BASE)/processes/$(dataset)/execution"
-    response = _cds_post(url, inputs; token=token)
-    _cds_check_response(response, dataset, "submit"; inputs=inputs)
+    response = _cds_retry(; dataset=dataset, context="submit", verbose=verbose,
+                          deadline=deadline) do
+        r = _cds_post(url, inputs; token=token)
+        _cds_check_response(r, dataset, "submit"; inputs=inputs)
+        r
+    end
 
     body = JSON3.read(String(response.body))
     if haskey(body, :jobID)
@@ -292,8 +472,15 @@ function _cds_wait(dataset::AbstractString, job_id::AbstractString;
     attempt = 0
 
     while true
-        response = HTTP.request("GET", url, headers; status_exception=false)
-        _cds_check_response(response, dataset, "job status")
+        # A poll that hits a 5xx or a dropped connection must not lose the job: it is
+        # running server-side regardless, so retry the *poll* and keep waiting. Bounded by
+        # this wait's own deadline so a permanently broken service still gives up.
+        response = _cds_retry(; dataset=dataset, context="job status", verbose=verbose,
+                              deadline=started + timeout) do
+            r = HTTP.request("GET", url, headers; status_exception=false)
+            _cds_check_response(r, dataset, "job status")
+            r
+        end
         body = JSON3.read(String(response.body))
         status = haskey(body, :status) ? String(body[:status]) : "unknown"
 
@@ -382,10 +569,15 @@ end
 URL of a successful job's downloadable asset.
 """
 function _cds_result_href(dataset::AbstractString, job_id::AbstractString;
-                          token::AbstractString)
+                          token::AbstractString, verbose::Bool=true,
+                          deadline::Float64=Inf)
     url = "$(_CDS_RETRIEVE_BASE)/jobs/$(job_id)/results"
-    response = HTTP.request("GET", url, _cds_headers(token); status_exception=false)
-    _cds_check_response(response, dataset, "job results")
+    response = _cds_retry(; dataset=dataset, context="job results", verbose=verbose,
+                          deadline=deadline) do
+        r = HTTP.request("GET", url, _cds_headers(token); status_exception=false)
+        _cds_check_response(r, dataset, "job results")
+        r
+    end
     body = JSON3.read(String(response.body))
     try
         return String(body[:asset][:value][:href])
@@ -414,6 +606,12 @@ Safe to call from several concurrent tasks: a job CDS rejects for exceeding the
 per-dataset queued-request limit is resubmitted with backoff (see
 [`CDSQueueLimitError`](@ref)) instead of failing.
 
+Every step — costing, submission, status polls, results, download — is also retried on a
+**transient** failure: a CDS 5xx (see [`CDSTransientError`](@ref)) or a connection-level
+error. Bad requests (4xx) and jobs the server reports as `failed` still fail immediately.
+This matters for long runs, where a momentary proxy fault is otherwise indistinguishable
+from a real error and takes hours of accumulated work with it.
+
 # Keywords
 - `token`: CDS API key (see [`get_cds_api_key`](@ref)).
 - `poll_interval`: initial seconds between status polls; grows geometrically to 60 s.
@@ -422,13 +620,18 @@ per-dataset queued-request limit is resubmitted with backoff (see
   or collected later.
 - `check_cost`: when `true`, call [`cds_estimate_cost`](@ref) first and fail locally
   if the request exceeds the server limit, which gives a clearer message than the
-  server's rejection.
+  server's rejection. Advisory only — if the costing endpoint is unreachable the
+  request is submitted anyway (see the comment at the call site).
 """
 function cds_retrieve(dataset::AbstractString, inputs::AbstractDict, dest::AbstractString;
                       token::AbstractString, poll_interval::Real=10, timeout::Real=1800,
                       verbose::Bool=true, check_cost::Bool=true)
+    started = time()
+    deadline = timeout == Inf ? Inf : started + Float64(timeout)
+
     if check_cost
-        cost, limit = cds_estimate_cost(dataset, inputs; token=token)
+        cost, limit = _cds_advisory_cost(dataset, inputs; token=token, verbose=verbose,
+                                         deadline=deadline)
         if isfinite(cost) && isfinite(limit) && cost > limit
             throw(ArgumentError("""
             This CDS request is too large: cost $(cost) exceeds the limit of $(limit)
@@ -447,12 +650,12 @@ function cds_retrieve(dataset::AbstractString, inputs::AbstractDict, dest::Abstr
     # the identical submission succeeds once the queue drains — retrying here is what lets
     # callers order several jobs concurrently without hand-tuning their fan-out. `timeout`
     # bounds the retry loop as well as each wait, so a saturated queue cannot spin forever.
-    started = time()
     job_id = ""
     attempt = 0
     while true
         attempt += 1
-        job_id = _cds_submit(dataset, inputs; token=token)
+        job_id = _cds_submit(dataset, inputs; token=token, verbose=verbose,
+                             deadline=deadline)
         verbose && @info "Submitted CDS request" dataset job_id
         try
             _cds_wait(dataset, job_id; token=token, poll_interval=poll_interval,
@@ -475,12 +678,20 @@ function cds_retrieve(dataset::AbstractString, inputs::AbstractDict, dest::Abstr
             sleep(backoff)
         end
     end
-    href = _cds_result_href(dataset, job_id; token=token)
+    href = _cds_result_href(dataset, job_id; token=token, verbose=verbose,
+                            deadline=deadline)
 
     mkpath(dirname(dest))
     tmp = dest * ".part"
+    # The download is the longest single transfer in the exchange (tens of GB for a global
+    # albedo timestep), so it is the most likely to be cut off mid-stream. Retry it: the
+    # partial file is discarded first, so each attempt starts clean.
     try
-        Downloads.download(href, tmp)
+        _cds_retry(; dataset=dataset, context="download", verbose=verbose,
+                   deadline=deadline) do
+            isfile(tmp) && rm(tmp; force=true)
+            Downloads.download(href, tmp)
+        end
         mv(tmp, dest; force=true)
     catch e
         isfile(tmp) && rm(tmp; force=true)
