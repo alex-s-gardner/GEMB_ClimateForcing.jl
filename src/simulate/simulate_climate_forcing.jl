@@ -20,15 +20,38 @@ function simulation_parameter_sets(set_id::String)
 
     if set_id == "test_1"
         location_parameters = (
-            description = "parameters estimated using simulation_parameters_estimate_from_data.m as fit to original TEST_INPUT_1.mat data",
+            description = "parameters estimated using simulation_parameters_estimate_from_data.m as fit to original TEST_INPUT_1.mat data, raised to 2200 m so the site's one-year climatology is a faithful summary of its forcing (see the elevation comment below)",
             latitude = -73.3307,                         # [deg]
             longitude = 290.6250,                        # [deg]
-            elevation = 700.0,                           # [m]
+            # Raised from the fitted 700 m. At 700 m this site melts hard — 3.9% of steps
+            # at or above freezing, 332 kg m-2 yr-1 of melt — and melt is convex in
+            # temperature, so averaging the 32 years into one climatological year cancels
+            # the warm excursions that carry it: the climatology halved the temperature
+            # variance (sd 7.96 -> 4.75 K), never once reached 273.15 K, and produced
+            # *zero* melt and zero runoff. `forcing_climatology` is the intended spinup
+            # forcing, so a column spun up on it equilibrated a melt-free climate
+            # (FAC ~4.06 m) and then spent the whole transient run relaxing to the real
+            # attractor (FAC ~0.74 m) — a 7 m elevation drift that is an artifact of the
+            # mismatch, not a property of the site. It also made `spinup_smb_rate`
+            # (0.4447 m ice/yr, measured on the melt-free climatology) disagree with the
+            # transient's own SMB (0.2554), so `plot_output(detrend=:spinup)` removed too
+            # much and exaggerated the drift further.
+            #
+            # 2200 m keeps melt non-zero (13 kg m-2 yr-1, so the melt/refreeze path is
+            # still exercised) but small enough that annual averaging preserves it. The
+            # two SMB rates then agree to ~5% (0.4486 spinup vs 0.4251 transient) and a
+            # spun-up column holds its elevation: FAC drifts +0.17 m over the 32-year
+            # transient, against -5.57 m from a cold start. Convergence at
+            # `convergence_delta_density=0.01` takes 62 cycles; the docs examples cap
+            # `max_iterations` at 400 so the criterion, not the cap, ends the spinup.
+            elevation = 2200.0,                          # [m]
             start_year = 1994,                           # [year]
             end_year = 2025,                             # [year]
             wind_observation_height = 10.0,              # [m]
             temperature_observation_height = 2.0,        # [m]
-            temperature_air_mean = 259.4,                # [K]
+            # Mean of the simulated series at this elevation (was 259.4 at 700 m). Not a
+            # free label: it feeds fresh-snow density and the densification schemes.
+            temperature_air_mean = 249.4,                # [K]
             precipitation_mean = 1177.3,                 # [kg m-2 yr-1]
             time_step_hours = 1.0,                       # [hours]
             rand_seed = 42,                              # seed for RNG
