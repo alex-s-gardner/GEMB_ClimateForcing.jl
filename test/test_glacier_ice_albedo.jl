@@ -23,6 +23,21 @@ using GEMB_ClimateForcing: _low_percentile_mean, _LowPercentileTopK, _accumulate
     _format_duration, _grid_cache_path, _grid_cache_read, _grid_cache_write,
     _accumulate_blockwise!
 
+# Unmap an accumulator's scratch arrays deterministically.
+#
+# Dropping the reference and calling `GC.gc()` is *not* enough on Windows: the collector is
+# not obliged to run the mmap finalizers on any given pass, and while a file is mapped
+# Windows refuses to delete it (`rm` fails with ENOTEMPTY on the containing directory).
+# `finalize` on the array is Julia's documented way to release the mapping now. It is a
+# no-op for the in-memory accumulator, whose fields are plain `Array`s.
+function release_scratch!(acc)
+    for a in (acc.vals, acc.nfilled, acc.counts)
+        finalize(a)
+    end
+    GC.gc()
+    return nothing
+end
+
 @testset "Glacier bare-ice albedo" begin
 
     @testset "Low-percentile mean" begin
@@ -322,13 +337,14 @@ using GEMB_ClimateForcing: _low_percentile_mean, _LowPercentileTopK, _accumulate
         want, want_counts = _low_percentile_mean(obs, 0.5, 1)
 
         dir = mktempdir()
+        acc2 = nothing
         try
             acc = _LowPercentileTopK((4, 5), 4, 0.5, 1; scratch_dir=dir)
             for m in obs[1:2]
                 _accumulate!(acc, m)
             end
+            release_scratch!(acc)   # unmap, as a dying process would
             acc = nothing
-            GC.gc()   # release the mmap handles, as a dying process would
 
             # Reopen without truncating and finish the year.
             acc2 = _LowPercentileTopK((4, 5), 4, 0.5, 1; scratch_dir=dir, resume=true,
@@ -348,11 +364,9 @@ using GEMB_ClimateForcing: _low_percentile_mean, _LowPercentileTopK, _accumulate
             # a fifth observation is rejected rather than silently accepted.
             @test_throws ArgumentError _accumulate!(acc2, obs[1])
         finally
-            # Windows will not delete a directory whose files are still mapped, so every
-            # reference to the accumulator's mmaps must be collected before `rm` — the same
-            # ordering the driver's `discard_after_fold` needs, and for the same reason.
-            acc2 = nothing
-            GC.gc()
+            # Windows will not delete a mapped file, and `GC.gc()` alone does not reliably
+            # run the finalizers that unmap it — hence the explicit release.
+            isnothing(acc2) || release_scratch!(acc2)
             rm(dir; recursive=true, force=true)
         end
     end
@@ -361,8 +375,8 @@ using GEMB_ClimateForcing: _low_percentile_mean, _LowPercentileTopK, _accumulate
         dir = mktempdir()
         try
             acc = _LowPercentileTopK((4, 5), 4, 0.5, 1; scratch_dir=dir)
+            release_scratch!(acc)
             acc = nothing
-            GC.gc()
             # Same directory, different kmax (percentile) — reusing those arrays would
             # corrupt every pixel, so this must fail loudly rather than proceed.
             @test_throws ArgumentError _LowPercentileTopK((4, 5), 4, 0.25, 1;
