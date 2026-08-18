@@ -32,7 +32,7 @@ CodecZlib = "0.7.8"
 Dates = "1"
 DimensionalData = "0.30"
 Downloads = "1.6"
-EarthData = "0.1"
+EarthData = "0.1, 0.2"
 HTTP = "1"
 JSON3 = "1"
 Mmap = "1"
@@ -62,6 +62,11 @@ p7zip_jll = "17"
 #     https://github.com/evetion/EarthData.jl/issues/18, then drop this block and let the
 #     [compat] entry above resolve normally.
 #   - An upstream force-push to `main` breaks re-resolution (existing checkouts are fine).
+#   - A version bump on `main` breaks re-resolution until the [compat] bound above admits it:
+#     the bound has to cover whatever `main` currently calls itself, or Pkg reports
+#     "Unsatisfiable requirements detected for package EarthData — no versions left". `main`
+#     became 0.2.0 on 2026-08-18, hence the "0.1, 0.2" above. The three names this package
+#     uses — `request`, `granule_url`, `Granules.UMM_G` — are unchanged across that bump.
 #
 # Do NOT "simplify" by deleting this block: Pkg would silently resolve the broken v0.1.0 and
 # every MODIS granule query would fail in the schema parser, far from the cause.
