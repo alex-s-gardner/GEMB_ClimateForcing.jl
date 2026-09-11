@@ -41,31 +41,6 @@ const CEILING = parse(Float64, get(ENV, "RGI7_ALBEDO_CEILING", "1.0"))
 say(args...) = (println(args...); flush(stdout))
 
 """
-    assert_bulk_cache(path, why)
-
-Refuse to run with the cache under `tempdir()`.
-
-These runs are hundreds of gigabytes and the cache is the whole point of being able to resume
-or re-fold, so a temp-directory cache is never what was intended: it is reaped by the OS, and
-`/tmp` is usually on the root filesystem. Failing here costs a second; discovering it later
-costs a re-download.
-"""
-function assert_bulk_cache(path::AbstractString, why::AbstractString)
-    startswith(abspath(path), abspath(tempdir())) || return nothing
-    error("""
-        The MCD43A3 cache resolves to $(path), which is under tempdir().
-        $(why)
-        Set a bulk-storage location on a large volume (NOT a home directory, which is
-        commonly a small SSD with a quota):
-            export GEMB_CACHE_PATH=/big/volume/gemb_cache   # all products
-            export RGI7_CACHE_PATH=/big/volume/MCD43A3.061  # this cache only
-        """)
-end
-
-
-pooled_path(dir, hemi) = joinpath(dir, "rgi7_ice_albedo_pooled_$(hemi).csv.gz")
-
-"""
     write_pooled(path, cells, ice)
 
 One hemisphere's pooled result as gzipped CSV, keyed by cell and in the cells' canonical order.
@@ -140,7 +115,7 @@ function run_pooled(hemispheres = (:north, :south); cache_path = CACHE_PATH,
     say(@sprintf("percentile   : %g", percentile))
     say(@sprintf("albedo_range : %g … %g", albedo_range...))
     say("")
-    assert_bulk_cache(cache_path,
+    G._assert_bulk_cache(cache_path,
         "This script only re-folds samples that are already cached; it downloads " *
         "nothing, so an empty cache means there is nothing to pool.")
 
@@ -149,7 +124,7 @@ function run_pooled(hemispheres = (:north, :south); cache_path = CACHE_PATH,
     index_of = Dict(:north => north, :south => south)
 
     for hemi in hemispheres
-        path = pooled_path(dir, hemi)
+        path = bare_ice_albedo_path(dir, hemi)
         if isfile(path) && !force
             say("$(hemi): $(basename(path)) already present, skipping (force=true to redo)")
             continue

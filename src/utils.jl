@@ -264,3 +264,28 @@ function _is_writable_dir(dir::AbstractString)
         return false
     end
 end
+
+"""
+    _assert_bulk_cache(path, why)
+
+Refuse a cache location under `tempdir()`.
+
+[`_gemb_cache_root`](@ref) checks that the *default* location is writable; this checks that a
+location the caller chose — via `GEMB_CACHE_PATH`, `RGI7_CACHE_PATH` or an explicit `cache_path`
+— is somewhere bulk data can actually survive. The two are complementary, and only the
+hundreds-of-gigabytes workflows need the second: a temp directory is reaped by the OS, and
+`/tmp` is usually on the root filesystem. `why` names what the caller would lose, since that
+differs between a run that downloads a terabyte and one that only re-folds what is already
+cached.
+"""
+function _assert_bulk_cache(path::AbstractString, why::AbstractString)
+    startswith(abspath(path), abspath(tempdir())) || return nothing
+    error("""
+        The cache resolves to $(path), which is under tempdir().
+        $(why)
+        Set a bulk-storage location on a large volume (NOT a home directory, which is
+        commonly a small SSD with a quota):
+            export GEMB_CACHE_PATH=/big/volume/gemb_cache   # all products
+            export RGI7_CACHE_PATH=/big/volume/MCD43A3.061  # this cache only
+        """)
+end

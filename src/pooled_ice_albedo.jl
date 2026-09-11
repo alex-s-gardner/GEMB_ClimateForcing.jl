@@ -138,6 +138,9 @@ function pool_ice_albedo_from_cache(cells::AbstractVector{<:NTuple{4,Integer}};
         "percentile must be in (0, 1]; got $(percentile)"))
     albedo_range[1] < albedo_range[2] || throw(ArgumentError(
         "albedo_range must be (lo, hi) with lo < hi; got $(albedo_range)"))
+    isempty(qa_keep) && throw(ArgumentError(
+        "qa_keep is empty, so every observation would be rejected; pass at least " *
+        "one QA class (see MCD43A3_QA_KEEP)."))
     layer_list = layer isa Symbol ? [layer] : collect(layer)
     for l in layer_list
         l in MCD43A3_ALBEDO_LAYERS || throw(ArgumentError(

@@ -222,6 +222,7 @@ function climate_model_invariant(;
     cache_path::Union{String,Nothing}=nothing,
     force_download::Bool=false,
     cache_tiles::Bool=false,
+    max_concurrent_downloads::Integer=4,
     verbose::Bool=true,
 )
     (haskey(_INVARIANT_REGISTRY, model) || model in _INVARIANT_EXTENT_MODELS) ||
@@ -239,7 +240,9 @@ function climate_model_invariant(;
         if model == :copernicus_dem_30m
             return _load_copernicus_dem_30m(extent; cache_path=cache,
                                             force_download=force_download,
-                                            cache_tiles=cache_tiles, verbose=verbose)
+                                            cache_tiles=cache_tiles,
+                                            max_concurrent_downloads=max_concurrent_downloads,
+                                            verbose=verbose)
         end
     end
 

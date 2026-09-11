@@ -27,6 +27,14 @@ end
 
 @testset "bare_ice_albedo" begin
 
+    @testset "record span constant" begin
+        # Exported provenance for what "the record" means; asserted like its siblings
+        # GLACIER_ICE_ALBEDO_YEARS and MCD43A3_YEARS. Not a `bare_ice_albedo` argument — the
+        # product holds one pooled value per cell — so nothing else pins it.
+        @test BARE_ICE_ALBEDO_YEARS == 2000:2025
+        @test first(BARE_ICE_ALBEDO_YEARS) == 2000   # MCD43A3 begins 2000-02-16
+    end
+
     @testset "geometry classification and projection" begin
         pt = GI.Point(-30.0, 70.0)
         @test G._bia_shape(pt) === :point

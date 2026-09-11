@@ -102,28 +102,6 @@ while 966 MB were happily downloading. Every progress line in this script goes t
 through [`@printf_flush`](@ref).
 """
 
-"""
-    assert_bulk_cache(path, why)
-
-Refuse to run with the cache under `tempdir()`.
-
-These runs are hundreds of gigabytes and the cache is the whole point of being able to resume
-or re-fold, so a temp-directory cache is never what was intended: it is reaped by the OS, and
-`/tmp` is usually on the root filesystem. Failing here costs a second; discovering it later
-costs a re-download.
-"""
-function assert_bulk_cache(path::AbstractString, why::AbstractString)
-    startswith(abspath(path), abspath(tempdir())) || return nothing
-    error("""
-        The MCD43A3 cache resolves to $(path), which is under tempdir().
-        $(why)
-        Set a bulk-storage location on a large volume (NOT a home directory, which is
-        commonly a small SSD with a quota):
-            export GEMB_CACHE_PATH=/big/volume/gemb_cache   # all products
-            export RGI7_CACHE_PATH=/big/volume/MCD43A3.061  # this cache only
-        """)
-end
-
 function say(args...)
     println(args...)
     flush(stdout)
@@ -313,7 +291,7 @@ function run_rgi7_albedo(years = YEARS; hemispheres = HEMISPHERES, cache_path = 
     @printf_flush("statistic      : darkest %g%% mean, min_samples=%d, albedo_range=%s, qa_keep=%s\n",
             100 * PERCENTILE, MIN_SAMPLES, ALBEDO_RANGE, QA_KEEP)
     @printf_flush("token          : resolved (%d chars)\n", length(token))
-    assert_bulk_cache(cache_path,
+    G._assert_bulk_cache(cache_path,
         "A full year is ~1 TB of granule download, and the per-date sample cache is what " *
         "makes the run resumable and re-foldable.")
 

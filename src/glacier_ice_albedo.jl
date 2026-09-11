@@ -375,19 +375,46 @@ function _accumulate_block!(vals::AbstractMatrix{Float32}, nfilled::AbstractVect
         counts[p] += Int32(1)
         nf = Int(nfilled[p])
         if nf < kmax
+            # Grow the retained set, keeping the largest at index 1.
             vals[nf + 1, p] = v
             nfilled[p] = Int32(nf + 1)
-        else
-            # Evict the largest of the retained values, if this one is smaller. kmax is
-            # tiny (2 at the defaults), so a linear scan beats any heap bookkeeping.
-            worst, worst_v = 1, vals[1, p]
-            for j in 2:kmax
-                if vals[j, p] > worst_v
-                    worst, worst_v = j, vals[j, p]
-                end
-            end
-            v < worst_v && (vals[worst, p] = v)
+            _topk_siftup!(vals, p, nf + 1)
+        elseif v < vals[1, p]
+            # Full: displace the largest retained value, then restore the ordering.
+            vals[1, p] = v
+            _topk_siftdown!(vals, p, kmax)
         end
+    end
+    return nothing
+end
+
+# The retained values are kept as a max-heap in `vals[1:nfilled, p]`, so evicting the largest is
+# O(log k) rather than the O(k) linear scan this replaces. That scan was the right call when the
+# only caller was the per-year statistic, where `kmax` is 2-9; pooling a whole record raises it
+# to 223 and made the eviction the single largest cost of a fold.
+#
+# The heap changes only the order values are stored in, never which values are retained, and
+# `_finalize_into!` sorts them before averaging — so every reported statistic is bit-identical
+# to the linear-scan version.
+@inline function _topk_siftup!(vals::AbstractMatrix{Float32}, p::Int, i::Int)
+    @inbounds while i > 1
+        parent = i >> 1
+        vals[parent, p] >= vals[i, p] && break
+        vals[parent, p], vals[i, p] = vals[i, p], vals[parent, p]
+        i = parent
+    end
+    return nothing
+end
+
+@inline function _topk_siftdown!(vals::AbstractMatrix{Float32}, p::Int, n::Int)
+    i = 1
+    @inbounds while true
+        l = 2 * i
+        l > n && break
+        j = (l < n && vals[l + 1, p] > vals[l, p]) ? l + 1 : l
+        vals[j, p] <= vals[i, p] && break
+        vals[i, p], vals[j, p] = vals[j, p], vals[i, p]
+        i = j
     end
     return nothing
 end

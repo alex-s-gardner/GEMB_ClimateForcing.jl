@@ -230,15 +230,65 @@ Valid only for the non-negative integer key columns (`h`, `v`, `row`, `col`); th
 columns are floats and are parsed by `split` on the rows that survive, where the cost is
 irrelevant.
 """
-@inline function _bia_next_uint(buf::AbstractVector{UInt8}, i::Int, stop::Int)
+@inline function _bia_next_uint(buf::Union{AbstractVector{UInt8},String}, i::Int, stop::Int)
     v = 0
     while i <= stop
-        c = buf[i]
+        c = buf isa String ? codeunit(buf, i) : buf[i]
         c == UInt8(',') && break
         v = 10 * v + Int(c - 0x30)
         i += 1
     end
     return v, i + 1
+end
+
+"""
+    _bia_field_end(str, i, stop) -> j
+
+Index of the delimiter (or `stop + 1`) ending the field that starts at `i`.
+"""
+@inline function _bia_field_end(str::String, i::Int, stop::Int)
+    j = i
+    while j <= stop && codeunit(str, j) != UInt8(',')
+        j += 1
+    end
+    return j
+end
+
+"""
+    _bia_parse_fixed4(str, i, j) -> Float32
+
+Parse `str[i:j-1]` as a Float32, fast-pathing the `%.4f` form the pooled tables are written in.
+
+`parse(Float32, ::AbstractString)` is general and correspondingly slow: 15.5 M calls to it cost
+6.3 s, against 0.66 s to decompress the whole table. Digits in a known fixed format are just
+integer arithmetic, so the common case is done directly.
+
+Anything not matching `[-]d+.dddd` — `NaN` above all, but also any future reformatting — falls
+through to `parse`, so the fast path can only ever be an accelerator and never a second,
+divergent number parser.
+"""
+@inline function _bia_parse_fixed4(str::String, i::Int, j::Int)
+    len = j - i
+    neg = len > 0 && codeunit(str, i) == UInt8('-')
+    k = neg ? i + 1 : i
+    intpart = 0
+    while k < j
+        c = codeunit(str, k)
+        c == UInt8('.') && break
+        (UInt8('0') <= c <= UInt8('9')) || return parse(Float32, SubString(str, i, j - 1))
+        intpart = 10 * intpart + Int(c - UInt8('0'))
+        k += 1
+    end
+    # Exactly four fractional digits, which is what `%.4f` emits.
+    (k < j && j - k == 5) || return parse(Float32, SubString(str, i, j - 1))
+    frac = 0
+    for m in (k + 1):(j - 1)
+        c = codeunit(str, m)
+        (UInt8('0') <= c <= UInt8('9')) || return parse(Float32, SubString(str, i, j - 1))
+        frac = 10 * frac + Int(c - UInt8('0'))
+    end
+    val = Float32((intpart * 10_000 + frac) / 10_000)
+    return neg ? -val : val
 end
 
 """
@@ -253,28 +303,115 @@ _bia_hemisphere(v::Integer) = v <= 8 ? :north : :south
 
 
 """
+    _PooledAlbedoTable
+
+One hemisphere's pooled table, column by column, with `cells` in canonical order.
+
+A concrete struct rather than a `NamedTuple` so the memo's element type is concrete: values
+pulled back out of [`_BIA_TABLE_CACHE`](@ref) are then statically typed, and the field access and
+`searchsortedfirst` in [`_bia_read`](@ref) specialize instead of dispatching at runtime. Mirrors
+`GlacierDecoupling` and `RGI7ModisCells`, which cache their vendored tables the same way.
+"""
+struct _PooledAlbedoTable
+    cells::Vector{NTuple{4,Int32}}
+    bsa::Vector{Float32}
+    wsa::Vector{Float32}
+    nb::Vector{Int32}
+    nw::Vector{Int32}
+    kb::Vector{Int32}
+    kw::Vector{Int32}
+end
+
+"""
+    _BIA_TABLE_CACHE
+
+One parsed hemisphere table per `(dir, hemisphere)`, kept for the process's lifetime.
+
+A query needs a handful of cells, but the table is one gzip member: answering it costs a full
+decompress and scan of every glacierized cell on that half of the planet — 782 ms and 256 MiB
+for the north. Sampling is expected to be repeated (per glacier, per point list), so the table
+is parsed once and afterwards a query is two binary searches per cell.
+
+Same reasoning and same shape as [`glacier_decoupling_table`](@ref) and
+[`rgi7_modis_cells`](@ref), which memoize their vendored tables for exactly this reason. The
+resident cost is ~40 B per cell: 103 MB for the north, 31 MB for the south.
+"""
+const _BIA_TABLE_CACHE = Dict{Tuple{String,Symbol},_PooledAlbedoTable}()
+
+"""
+    _bia_table(dir, hemisphere) -> NamedTuple
+
+The parsed pooled table for one hemisphere, from [`_BIA_TABLE_CACHE`](@ref) or read once.
+
+`cells` comes back in the file's own canonical order, which is what lets a lookup be a binary
+search. The order is asserted rather than assumed: a file written out of order would make
+`searchsortedfirst` silently miss rows.
+"""
+function _bia_table(dir::AbstractString, hemi::Symbol)
+    key = (String(dir), hemi)
+    haskey(_BIA_TABLE_CACHE, key) && return _BIA_TABLE_CACHE[key]
+
+    path = bare_ice_albedo_path(dir, hemi)
+    isfile(path) || throw(ArgumentError(
+        "no pooled bare-ice albedo file at $(path). Generate it with " *
+        "`julia --project=. data/run_rgi7_pooled_albedo.jl $(hemi)` — that re-folds the " *
+        "cached samples and downloads nothing."))
+
+    # Decompressed whole rather than iterated with `eachline`, which allocates a `String` per
+    # row. `String(::Vector{UInt8})` takes ownership of the buffer instead of copying it, so the
+    # scan below can take non-allocating `SubString` views for the float fields — building a
+    # `String` and `split`ing per row costs ~7 allocations × 2.58 M rows and measured 9.5 s
+    # against 1 s here.
+    str = String(open(io -> read(GzipDecompressorStream(io)), path))
+    n = ncodeunits(str)
+    # Rows estimated from the buffer size rather than counted: an exact `count` is a second
+    # full pass over ~104 MB, and `sizehint!` only needs to be close enough to avoid repeated
+    # growth. A row is `h,v,row,col` plus six numeric fields, ~40 bytes.
+    nrow = n ÷ 40
+    cells = sizehint!(NTuple{4,Int32}[], nrow)
+    bsa, wsa = sizehint!(Float32[], nrow), sizehint!(Float32[], nrow)
+    nb, nw, kb, kw = (sizehint!(Int32[], nrow) for _ in 1:4)
+
+    i = 1
+    while i <= n
+        e = something(findnext(==('\n'), str, i), n + 1)
+        stop = e - 1
+        c1 = codeunit(str, i)
+        if c1 != UInt8('#') && c1 != UInt8('h')
+            h, j = _bia_next_uint(str, i, stop)
+            v, j = _bia_next_uint(str, j, stop)
+            row, j = _bia_next_uint(str, j, stop)
+            col, j = _bia_next_uint(str, j, stop)
+            push!(cells, (Int32(h), Int32(v), Int32(row), Int32(col)))
+            f = _bia_field_end(str, j, stop); push!(bsa, _bia_parse_fixed4(str, j, f)); j = f + 1
+            f = _bia_field_end(str, j, stop); push!(wsa, _bia_parse_fixed4(str, j, f)); j = f + 1
+            for counts in (nb, nw, kb, kw)
+                u, j = _bia_next_uint(str, j, stop)
+                push!(counts, Int32(u))
+            end
+        end
+        i = e + 1
+    end
+
+    issorted(cells) || error(
+        "$(path) is not in canonical (h, v, row, col) order, so a cell cannot be located by " *
+        "binary search. Regenerate it with data/run_rgi7_pooled_albedo.jl.")
+
+    table = _PooledAlbedoTable(cells, bsa, wsa, nb, nw, kb, kw)
+    _BIA_TABLE_CACHE[key] = table
+    return table
+end
+
+"""
     _bia_read(cells, dir) -> NamedTuple
 
-Pooled values for `cells`, as one vector per column of the pooled tables.
+Pooled values for `cells`, one vector per column, gathered from the cached hemisphere tables.
 
-Only the hemisphere files the cells actually occupy are opened, so a northern geometry never
-touches a southern file. Rows are located in `cells` by `searchsortedfirst`, not by position:
-the files and `cells` share a canonical sort, but a file holds every glacierized cell on its
-half of the planet while `cells` holds a handful, so nothing about the order can be assumed.
+Only the hemispheres the cells actually occupy are touched, so a northern geometry never parses
+the southern table.
 """
 function _bia_read(cells::Vector{NTuple{4,Int}}, dir::AbstractString)
     ncell = length(cells)
-    hemis = unique(_bia_hemisphere(c[2]) for c in cells)
-    for hemi in hemis
-        path = bare_ice_albedo_path(dir, hemi)
-        isfile(path) || throw(ArgumentError(
-            "no pooled bare-ice albedo file at $(path). Generate it with " *
-            "`julia --project=. data/run_rgi7_pooled_albedo.jl $(hemi)` — that re-folds the " *
-            "cached samples and downloads nothing."))
-    end
-
-    # The tiles the cells occupy, for the cheap prefilter in the read loop below.
-    tiles = Set((c[1], c[2]) for c in cells)
     bsa, wsa = fill(NaN32, ncell), fill(NaN32, ncell)
     nb, nw = zeros(Int32, ncell), zeros(Int32, ncell)
     kb, kw = zeros(Int32, ncell), zeros(Int32, ncell)
@@ -284,44 +421,17 @@ function _bia_read(cells::Vector{NTuple{4,Int}}, dir::AbstractString)
     # caller tell "not glacier" from "glacier, no data".
     found = falses(ncell)
 
-    for hemi in hemis
-        # Decompressed whole rather than iterated with `eachline`, which allocates a `String`
-        # per row: a hemisphere file is 2.58 M rows, so line-based reading built millions of
-        # throwaway strings and spent most of its time in GC.
-        buf = open(io -> read(GzipDecompressorStream(io)), bare_ice_albedo_path(dir, hemi))
-        n = length(buf)
-        i = 1
-        while i <= n
-            e = something(findnext(isequal(UInt8('\n')), buf, i), n + 1)
-            stop = e - 1
-            c1 = buf[i]
-            if c1 != UInt8('#') && c1 != UInt8('h')
-                h, j = _bia_next_uint(buf, i, stop)
-                v, j = _bia_next_uint(buf, j, stop)
-                if (h, v) in tiles
-                    row, j = _bia_next_uint(buf, j, stop)
-                    col, j = _bia_next_uint(buf, j, stop)
-                    cell = (h, v, row, col)
-                    k = searchsortedfirst(cells, cell)
-                    if k <= ncell && cells[k] == cell
-                        # Only the surviving rows pay for string handling, which for a
-                        # glacier-scale geometry is a handful out of millions.
-                        f = split(String(@view buf[j:stop]), ',')
-                        length(f) == 6 || error(
-                            "$(bare_ice_albedo_path(dir, hemi)) row for cell $(cell) has " *
-                            "$(length(f) + 4) columns, expected 10. The file was written by a " *
-                            "different version of data/run_rgi7_pooled_albedo.jl.")
-                        found[k] = true
-                        bsa[k] = parse(Float32, f[1])
-                        wsa[k] = parse(Float32, f[2])
-                        nb[k] = parse(Int32, f[3])
-                        nw[k] = parse(Int32, f[4])
-                        kb[k] = parse(Int32, f[5])
-                        kw[k] = parse(Int32, f[6])
-                    end
-                end
-            end
-            i = e + 1
+    for hemi in unique(_bia_hemisphere(c[2]) for c in cells)
+        t = _bia_table(dir, hemi)
+        for (k, c) in pairs(cells)
+            _bia_hemisphere(c[2]) === hemi || continue
+            key = (Int32(c[1]), Int32(c[2]), Int32(c[3]), Int32(c[4]))
+            j = searchsortedfirst(t.cells, key)
+            (j <= length(t.cells) && t.cells[j] == key) || continue
+            found[k] = true
+            bsa[k] = t.bsa[j];  wsa[k] = t.wsa[j]
+            nb[k] = t.nb[j];    nw[k] = t.nw[j]
+            kb[k] = t.kb[j];    kw[k] = t.kw[j]
         end
     end
     return (; bsa, wsa, nb, nw, kb, kw, found)
@@ -435,22 +545,48 @@ function bare_ice_albedo(geometry, reducer = nothing;
               cells = length(cells))
     end
 
-    if reducer !== nothing
-        out = Pair{Symbol,Any}[]
-        for (alb, nval, kused, label) in ((v.bsa, v.nb, v.kb, "bsa"), (v.wsa, v.nw, v.kw, "wsa"))
-            keep = findall(!isnan, alb)
-            red = length(keep) >= min_cells ? Float32(reducer(alb[keep])) : NaN32
-            push!(out, Symbol("albedo_", label) => red)
-            push!(out, Symbol("n_cells_", label) => length(keep))
-            push!(out, Symbol("n_valid_", label) => sum(Int, nval[keep]; init = 0))
-            push!(out, Symbol("k_used_", label) => sum(Int, kused[keep]; init = 0))
-        end
-        push!(out, :n_cells => length(cells))
-        push!(out, :n_cells_in_product => count(v.found))
-        push!(out, :reduction => _rgi7_reduction_name(reducer))
-        return NamedTuple(out)
-    end
+    return reducer === nothing ? _bia_stack(v, cells, burn, boundary) :
+                                _bia_reduce(v, cells, reducer, min_cells)
+end
 
+"""
+    _bia_layers(v) -> Tuple
+
+The `(albedo, n_valid, k_used, label)` columns of a [`_bia_read`](@ref) result, one entry per
+sky. Named once so the two result builders below cannot disagree about the column order.
+"""
+_bia_layers(v) = ((v.bsa, v.nb, v.kb, "bsa"), (v.wsa, v.nw, v.kw, "wsa"))
+
+"""
+    _bia_reduce(v, cells, reducer, min_cells) -> NamedTuple
+
+Reduce the selected cells to one scalar per layer.
+
+`reducer` never sees a `NaN`: unresolved cells are dropped first, which is what makes
+`n_cells_*` meaningful.
+"""
+function _bia_reduce(v, cells, reducer, min_cells::Integer)
+    out = Pair{Symbol,Any}[]
+    for (alb, nval, kused, label) in _bia_layers(v)
+        keep = findall(!isnan, alb)
+        red = length(keep) >= min_cells ? Float32(reducer(alb[keep])) : NaN32
+        push!(out, Symbol("albedo_", label) => red)
+        push!(out, Symbol("n_cells_", label) => length(keep))
+        push!(out, Symbol("n_valid_", label) => sum(Int, nval[keep]; init = 0))
+        push!(out, Symbol("k_used_", label) => sum(Int, kused[keep]; init = 0))
+    end
+    push!(out, :n_cells => length(cells))
+    push!(out, :n_cells_in_product => count(v.found))
+    push!(out, :reduction => _rgi7_reduction_name(reducer))
+    return NamedTuple(out)
+end
+
+"""
+    _bia_stack(v, cells, burn, boundary) -> DimStack
+
+Every selected cell over `Dim{:cell}`, with the cell centres and provenance.
+"""
+function _bia_stack(v, cells, burn::Symbol, boundary::Symbol)
     cell_dim = Dim{:cell}(1:length(cells))
     alb_meta(label) = Dict{String,Any}(
         "units" => "1",
@@ -458,7 +594,7 @@ function bare_ice_albedo(geometry, reducer = nothing;
         "source" => "MODIS MCD43A3 v061, pooled 2000-2025",
         "note" => "NOT clamped to 1; pooled over all dates, not a per-year value")
     out = Pair{Symbol,Any}[]
-    for (alb, nval, kused, label) in ((v.bsa, v.nb, v.kb, "bsa"), (v.wsa, v.nw, v.kw, "wsa"))
+    for (alb, nval, kused, label) in _bia_layers(v)
         push!(out, Symbol("albedo_", label) => DimArray(alb, (cell_dim,);
             metadata = alb_meta(label)))
         push!(out, Symbol("n_valid_", label) => DimArray(nval, (cell_dim,);

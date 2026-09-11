@@ -319,7 +319,8 @@ single covering tile is opened directly at native resolution. Reads go through G
 `/vsicurl/`, so nothing is fetched until the raster is indexed/cropped/`read`.
 """
 function _load_copernicus_dem_30m(extent; cache_path::String, force_download::Bool,
-                                  cache_tiles::Bool=false, verbose::Bool=true)
+                                  cache_tiles::Bool=false, max_concurrent_downloads::Integer=4,
+                                  verbose::Bool=true)
     _configure_gdal_http()
     index = _copernicus_dem_tile_index(; cache_path=cache_path, force=force_download, verbose=verbose)
 
@@ -352,9 +353,16 @@ function _load_copernicus_dem_30m(extent; cache_path::String, force_download::Bo
     end
     if cache_tiles
         isempty(ids) || verbose && @info "Copernicus DEM: caching $(length(ids)) tile(s) locally" dir=_copernicus_dem_tile_dir(cache_path)
-        sources = [_copernicus_dem_cache_tile(id; cache_path=cache_path,
-                                              force=force_download, verbose=verbose)
-                   for id in ids]
+        # Fanned out rather than looped: each tile is an independent 19-40 MB HTTPS GET, so
+        # serially the wall time is the sum of the transfers instead of roughly the longest.
+        # `_run_concurrent_jobs` is the same primitive `mcd43a3_granules` uses for granule
+        # downloads, with no submission stagger — these are bandwidth-bound, not queued.
+        sources = Vector{String}(undef, length(ids))
+        _run_concurrent_jobs(length(ids), max_concurrent_downloads, 0;
+                             verbose=false) do k, _gate
+            sources[k] = _copernicus_dem_cache_tile(ids[k]; cache_path=cache_path,
+                                                    force=force_download, verbose=verbose)
+        end
     else
         sources = _copernicus_dem_vsicurl.(ids)
     end
