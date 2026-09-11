@@ -13,7 +13,7 @@ import HTTP
 import Downloads
 
 using GEMB_ClimateForcing: _cmr_granules, _granule_id, _granule_data_url, _granule_bytes,
-    _size_unit_factor, _classifying_requester,
+    _size_unit_factor, _classifying_requester, _assert_hdf4, _HDF4_MAGIC,
     _earthdata_is_transient, _earthdata_retry_after, _earthdata_check_response,
     _earthdata_body_excerpt, _netrc_credentials, EarthdataTransientError,
     _EARTHDATA_RETRY_ATTEMPTS, _EARTHDATA_RETRY_MAX, _EARTHDATA_RETRY_AFTER_MAX
@@ -265,6 +265,39 @@ end
         @test _size_unit_factor("GB") == 1024^3
         @test _size_unit_factor(nothing) == 1024^2   # absent unit: MB, as the DAACs report
         @test_throws ArgumentError _size_unit_factor("furlongs")
+    end
+
+    @testset "Downloads are verified by signature, not by size" begin
+        # A truncated transfer needs no guard of ours: `Downloads.download` compares the body
+        # against Content-Length and throws, so it never becomes a file. What survives that is a
+        # COMPLETE response with the wrong body — an auth or error page returned as 200 somewhere
+        # in LP DAAC's 303-to-CloudFront chain — and only a content check catches it.
+        @test _HDF4_MAGIC == UInt8[0x0e, 0x03, 0x13, 0x01]
+
+        mktempdir() do dir
+            good = joinpath(dir, "g.hdf")
+            write(good, vcat(_HDF4_MAGIC, rand(UInt8, 64)))
+            @test isnothing(_assert_hdf4(good, "https://example/g.hdf"))
+
+            # An error page served as a complete 200.
+            html = joinpath(dir, "b.hdf")
+            write(html, "<html><body>Login required</body></html>")
+            @test_throws "not an HDF4 file" _assert_hdf4(html, "https://example/b.hdf")
+            # Retryable: the redirect chain failing is transient, not a bad request.
+            err = try (_assert_hdf4(html, "u"); nothing) catch e; e end
+            @test err isa EarthdataTransientError
+            @test _earthdata_is_transient(err)
+
+            # A wrong file of exactly the right length — which a size comparison would accept.
+            same = joinpath(dir, "s.hdf")
+            write(same, rand(UInt8, filesize(good)))
+            @test_throws "not an HDF4 file" _assert_hdf4(same, "https://example/s.hdf")
+
+            # An empty body is rejected rather than read past the end.
+            empty = joinpath(dir, "e.hdf")
+            write(empty, "")
+            @test_throws "not an HDF4 file" _assert_hdf4(empty, "https://example/e.hdf")
+        end
     end
 
     @testset "Transient classification of CMR responses" begin

@@ -530,7 +530,7 @@ function mcd43a3_granules(date::Date, tiles::AbstractVector{<:Tuple{Integer,Inte
                 # over one absent granule. The cost of dropping it is one fewer sample for that
                 # tile-date, which is what a record gap already means.
                 try
-                    _earthdata_download(spec.url, path; token=tok, expected_bytes=spec.bytes,
+                    _earthdata_download(spec.url, path; token=tok,
                                         verbose=verbose, timeout=timeout, deadline=deadline)
                 catch e
                     e isa InterruptException && rethrow()
@@ -548,7 +548,7 @@ function mcd43a3_granules(date::Date, tiles::AbstractVector{<:Tuple{Integer,Inte
                     return nothing
                 end
             else
-                _earthdata_download(spec.url, path; token=tok, expected_bytes=spec.bytes,
+                _earthdata_download(spec.url, path; token=tok,
                                     verbose=verbose, timeout=timeout, deadline=deadline)
             end
             results[i] = tile => path

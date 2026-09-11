@@ -593,23 +593,21 @@ end
 
 # ------------------------------------------------------------------------- downloading
 
-# Tolerance on the CMR-reported size, as a fraction. `granule_size` is a rounded megabyte
-# figure, so it cannot be compared exactly; this is wide enough to absorb the rounding and
-# narrow enough to catch a truncated transfer (which would silently corrupt an HDF4 file,
-# and GDAL's error for that is unhelpful).
+# Tolerance on the CMR-reported size, as a fraction. Used only to judge whether an *already
+# cached* granule looks complete enough to reuse without re-downloading — post-download
+# verification is [`_assert_hdf4`](@ref), which is exact and needs no size at all. The figure
+# cannot be compared strictly: `Size` is a rounded megabyte value whose `SizeUnit` leaves MB
+# ambiguous between 1000² and 1024².
 const _EARTHDATA_SIZE_TOLERANCE = 0.01
 
 """
-    _earthdata_download(url, dest; token, expected_bytes=0, verbose=true,
-                        timeout=Inf, deadline=Inf) -> String
+    _earthdata_download(url, dest; token, verbose=true, timeout=Inf, deadline=Inf) -> String
 
 Download `url` to `dest` with an Earthdata Login bearer token, returning `dest`.
 
 Writes to `dest * ".part"` and `mv`s on success, so an interrupted transfer never leaves a
-plausible-looking truncated file in a cache. When `expected_bytes > 0` the final size is
-checked against it within `_EARTHDATA_SIZE_TOLERANCE`; a short file is treated as a
-transient failure and re-downloaded, because a truncated HDF4 granule fails much later and
-far less legibly.
+plausible-looking partial file in a cache, and the body is checked by [`_assert_hdf4`](@ref)
+before the rename.
 
 An existing `dest` is returned untouched — cache-hit handling belongs to the caller only
 insofar as it chooses the path.
@@ -622,7 +620,7 @@ insofar as it chooses the path.
     not arise on this path. Do not add redirect handling "to be safe"; it was measured.
 """
 function _earthdata_download(url::AbstractString, dest::AbstractString;
-                             token::AbstractString, expected_bytes::Integer=0,
+                             token::AbstractString,
                              verbose::Bool=true, timeout::Real=Inf,
                              deadline::Float64=Inf)
     mkpath(dirname(dest))
@@ -635,13 +633,7 @@ function _earthdata_download(url::AbstractString, dest::AbstractString;
                          deadline=limit) do
             isfile(tmp) && rm(tmp; force=true)
             Downloads.download(url, tmp; headers=headers)
-            n = filesize(tmp)
-            if expected_bytes > 0 &&
-               n < expected_bytes * (1 - _EARTHDATA_SIZE_TOLERANCE)
-                # Retryable: a short body is a cut-off transfer, not a bad request.
-                throw(EarthdataTransientError("download $(basename(dest))", 0,
-                    "Got $(n) bytes, expected ≈$(expected_bytes) — transfer was truncated."))
-            end
+            _assert_hdf4(tmp, url)
             return nothing
         end
         mv(tmp, dest; force=true)
@@ -650,4 +642,46 @@ function _earthdata_download(url::AbstractString, dest::AbstractString;
         rethrow()
     end
     return dest
+end
+
+# First four bytes of an HDF4 file, verified against a real MCD43A3 granule
+# (MCD43A3.A2019196.h15v03.061 begins `0e 03 13 01 00 10 00 00`).
+const _HDF4_MAGIC = UInt8[0x0e, 0x03, 0x13, 0x01]
+
+"""
+    _assert_hdf4(path, url)
+
+Throw unless `path` begins with the HDF4 signature.
+
+A *truncated* transfer needs no guard: `Downloads.download` compares the body against
+`Content-Length` and raises `RequestError: end of response with N bytes missing`, so a cut-off
+download never becomes a file. What it cannot catch is a **complete** response carrying the
+wrong content — LP DAAC answers a bearer-authenticated GET with a 303 into CloudFront, and a
+failure anywhere in that chain can return a perfectly valid 200 whose body is an HTML error
+page. Cached unnoticed, that file is then handed to GDAL, whose HDF4 error message points
+nowhere near the real cause.
+
+Checking the signature rather than the CMR-reported size: the size is advisory at best, since
+`SizeUnit` leaves MB ambiguous between 1000² and 1024² (the UMM-G schema docs say so), which is
+why it could only ever be compared with slack. Four bytes are exact, need nothing from CMR, and
+also reject a wrong file that happens to be the right length.
+
+Retryable, because the redirect chain failing is transient.
+
+!!! note "Temporary"
+    UMM-G has an optional `Checksum` field and EarthData.jl is gaining support for it, but no
+    DAAC populates it for these collections yet — a live CMR query returns
+    `[{"Name": "Not provided", "Size": 51.2943, "SizeUnit": "MB"}]` for MCD43A3, and nothing for
+    ATL06 or HLSL30 either. Replace this with checksum verification once that arrives.
+"""
+function _assert_hdf4(path::AbstractString, url::AbstractString)
+    magic = open(path, "r") do io
+        read(io, length(_HDF4_MAGIC))
+    end
+    magic == _HDF4_MAGIC && return nothing
+    throw(EarthdataTransientError("download $(basename(path))", 0,
+        "The response is not an HDF4 file: it begins $(join(string.(magic; base=16, pad=2), " ")) " *
+        "rather than $(join(string.(_HDF4_MAGIC; base=16, pad=2), " ")), and is $(filesize(path)) " *
+        "bytes. A complete but wrong body — usually an authentication or error page returned as " *
+        "200 somewhere in the redirect chain from $(url)."))
 end
