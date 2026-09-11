@@ -133,7 +133,9 @@ using GEMB_ClimateForcing: _copernicus_dem_tile_id, _copernicus_dem_tile_url,
             end
         end
         # Tiles live apart from tileList.txt and the generated .vrt files.
-        @test _copernicus_dem_tile_dir("/a/b") == joinpath("/a", "b", "tiles")
+        # Both sides built with `joinpath`: a hardcoded "/a/b" literal is not normalized, so it
+        # compares unequal on Windows ("/a/b\\tiles" vs "/a\\b\\tiles").
+        @test _copernicus_dem_tile_dir(joinpath("/a", "b")) == joinpath("/a", "b", "tiles")
 
         # Asking for a persistent cache while the location is a temp directory must fail, not
         # write tiles the OS will clear — the caller would re-pay the download while believing
