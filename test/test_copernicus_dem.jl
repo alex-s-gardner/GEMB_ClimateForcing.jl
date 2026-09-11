@@ -139,11 +139,16 @@ using GEMB_ClimateForcing: _copernicus_dem_tile_id, _copernicus_dem_tile_url,
         # write tiles the OS will clear — the caller would re-pay the download while believing
         # it was cached. (The default is durable, so this needs the variable pointed at tmp.)
         mktempdir() do tmproot
-            withenv("GEMB_CACHE_PATH" => joinpath(tempdir(), basename(tmproot))) do
+            cache = joinpath(tempdir(), basename(tmproot))
+            withenv("GEMB_CACHE_PATH" => cache) do
                 @test_throws "needs a cache location that survives" climate_model_invariant(
                     model=:copernicus_dem_30m, extent=Extent(X=(-51.0, -50.9), Y=(66.5, 66.6)),
                     cache_tiles=true, verbose=false)
             end
+            # And it must refuse before touching the network. The guard originally sat after the
+            # tileList.txt fetch, which made this "offline" test pull 1.1 MB from AWS and fail in
+            # CI. Nothing may be written under the cache root.
+            @test !isdir(cache) || isempty(readdir(cache))
         end
 
         # A present tile is reused without touching the network, which is the whole point.

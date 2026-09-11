@@ -321,6 +321,17 @@ single covering tile is opened directly at native resolution. Reads go through G
 function _load_copernicus_dem_30m(extent; cache_path::String, force_download::Bool,
                                   cache_tiles::Bool=false, max_concurrent_downloads::Integer=4,
                                   verbose::Bool=true)
+    # Asking for a persistent cache while the location is a temp directory is refused rather
+    # than honored: the tiles would be written, reported as cached, and then reaped, so the
+    # caller would pay the download repeatedly while believing they had paid it once.
+    if cache_tiles && startswith(abspath(cache_path), abspath(tempdir()))
+        throw(ArgumentError(
+            "cache_tiles=true needs a cache location that survives the OS clearing " *
+            "$(tempdir()), but cache_path resolves to $(cache_path). Set " *
+            "ENV[\"GEMB_CACHE_PATH\"] to a bulk-storage volume (not a home directory, which " *
+            "is commonly a small SSD with a quota), or pass `cache_path` explicitly. Leave " *
+            "cache_tiles=false to read over /vsicurl/ without caching anything."))
+    end
     _configure_gdal_http()
     index = _copernicus_dem_tile_index(; cache_path=cache_path, force=force_download, verbose=verbose)
 
@@ -339,18 +350,6 @@ function _load_copernicus_dem_30m(extent; cache_path::String, force_download::Bo
     # so subsequent reads — in this session or any later one — touch no network. Off by default:
     # the /vsicurl/ path reads only the bytes it needs, which is the cheaper choice for a
     # one-off crop and the only tractable one for a continental extent.
-    #
-    # Asking for a persistent cache while the location is a temp directory is refused rather
-    # than honored: the tiles would be written, reported as cached, and then reaped, so the
-    # caller would pay the download repeatedly while believing they had paid it once.
-    if cache_tiles && startswith(abspath(cache_path), abspath(tempdir()))
-        throw(ArgumentError(
-            "cache_tiles=true needs a cache location that survives the OS clearing " *
-            "$(tempdir()), but cache_path resolves to $(cache_path). Set " *
-            "ENV[\"GEMB_CACHE_PATH\"] to a bulk-storage volume (not a home directory, which " *
-            "is commonly a small SSD with a quota), or pass `cache_path` explicitly. Leave " *
-            "cache_tiles=false to read over /vsicurl/ without caching anything."))
-    end
     if cache_tiles
         isempty(ids) || verbose && @info "Copernicus DEM: caching $(length(ids)) tile(s) locally" dir=_copernicus_dem_tile_dir(cache_path)
         # Fanned out rather than looped: each tile is an independent 19-40 MB HTTPS GET, so
