@@ -28,7 +28,30 @@ export CDS_API_KEY="your-token-here"
 # Mint at https://urs.earthdata.nasa.gov/profile/edit/user_tokens — 60-day life, MAX TWO
 # concurrent (a third request 403s). `earthdata_token_from_netrc()` mints one from ~/.netrc.
 export EARTHDATA_TOKEN="your-token-here"
+
+# Where every product caches its downloads. Optional; defaults to this repository's own
+# data/ directory. Point it at bulk storage if the checkout's volume is not sized for
+# hundreds of GB — the MCD43A3 per-date sample cache alone reaches 184 GB.
+export GEMB_CACHE_PATH=/big/volume/gemb_cache
 ```
+
+**One cache root, `_gemb_cache_root()` in `utils.jl`.** `ENV["GEMB_CACHE_PATH"]` if set, else the
+repository's `data/` directory; each product appends its own gitignored subdirectory
+(`MCD43A3.061/`, `satellite_albedo/`, `invariant/<model>/`). Every function still takes an
+explicit `cache_path` that overrides it, and the `data/` driver scripts keep their own `RGI7_*`
+variables for per-run overrides. Read at call time, so setting the variable mid-session works.
+
+- **Defaulting into the checkout is deliberate** — it puts caches beside the vendored tables and
+  the derived products, which is what lets the driver scripts run with no environment set. The
+  cost is that the checkout's filesystem has to be sized for the product being built.
+- **A `Pkg.add`-installed copy has a read-only source tree**, so the default is unusable there and
+  `_gemb_cache_root` throws naming the variable to set. Deliberate: silently falling back to
+  `tempdir()` would put 184 GB somewhere the OS reaps, turning a ~27 min re-fold into a ~1 TB
+  re-download.
+- **`_assert_bulk_cache(path, why)`** is the companion guard, used by the bulk driver scripts:
+  `_gemb_cache_root` checks the *default* is writable, this checks a *caller-chosen* location is
+  not under `tempdir()`. Nothing in the package writes to `$HOME`; the only paths derived from it
+  are credential reads (`~/.cdsapirc`, `~/.netrc`, `~/.edl_token`).
 
 ### Testing
 ```bash
@@ -50,7 +73,20 @@ glacier-decoupling lookup + adjustment against the vendored table, the bare-ice 
 reduction kernel / QC mask / QFLAG legend parsing, the Earthdata token resolution and
 transient/permanent split, the CMR granule search run end-to-end against a trimmed real
 UMM-G response injected through `EarthData.jl`'s `requester` hook, and the MODIS
-sinusoidal tile/cell arithmetic, granule-id parsing and point deduplication).
+sinusoidal tile/cell arithmetic, granule-id parsing and point deduplication, and the
+RGI 7.0 burn kernel — burn-grid/cell-grid bit-identity, the smallest-wins tie-break's
+order-independence, interior-ring exclusion against two real RGI 7.0 outlines in
+`test/fixtures/rgi7_iceland_outlines.tsv`, the antimeridian guard, a PROJ cross-check of the
+closed-form sinusoidal, and the round-trip identity over every one of the 3.4M vendored rows;
+the vendored-table testset self-skips until `data/make_rgi7_modis_cells.jl` has been run), plus
+the pooled statistic against an independent brute force over a synthetic sample cache (the
+`k_used` identity for every count, QA whitelisting, the 0.001 scale and fill rejection, and the
+cache-integrity errors that stop a pooled value being computed over an unknown subset of the
+record), and the geometry sampler (trait classification and projection, burn-target/cell-grid
+bit-identity, agreement with `Rasters.extract` where `extract` works and the multipoint case where
+it does not, cross-tile deduplication, and read/reduce against synthetic pooled tables in a
+tempdir — its final testset pins real values and self-skips until
+`data/run_rgi7_pooled_albedo.jl` has been run). **20,206 tests, all passing.**
 Network-dependent tests are opt-in via environment variables so CI stays
 offline by default:
 - `CDS_API_KEY` — enables ERA5-Land Zarr integration tests
@@ -66,6 +102,9 @@ offline by default:
   a live CMR query, the geotransform-vs-`_modis_tile_origin` check, the `/vsicurl/` HDF4
   false-positive guard, and two end-to-end `compute_glacier_ice_albedo_modis` runs (one per
   `keep_granules` setting). ~1 min and ~500 MB — no queue latency, unlike the CDS suites.
+  Also asserts the **batched CMR index equals the per-tile query** it replaces, and that a
+  bbox-free query genuinely pages past the 2000-hit ceiling — the equivalence proof for
+  dropping the tile bounding box (17,613 serial queries per melt-season year → ~171).
 
 There is no per-file test runner; run a single suite by editing `include`s in
 `test/runtests.jl` or invoking the file directly with the package loaded.
@@ -99,6 +138,41 @@ julia --project=. examples/glacier_ice_albedo_example.jl
 # latency, but ~70 MB downloaded per tile-date — the example's 41-day window is ~3 GB.
 export EARTHDATA_TOKEN="your-token-here"
 julia --project=. examples/glacier_ice_albedo_modis_example.jl
+```
+
+### Building the global RGI 7.0 bare-ice albedo product
+
+Four separate steps on purpose: the burn is CPU-only and offline, the albedo run is ~1 TB of
+download per year, the pooled re-fold is CPU-only from cache, and only the Parquet write needs a
+dependency the package does not have. Splitting them means a Parquet column rename never
+re-triggers a terabyte.
+
+```bash
+# 1. RGI 7.0 -> MCD43A3 cell list. Package env; downloads ~422 MB of shapefiles once.
+#    Writes the two vendored .csv.gz tables. RGI7_REGIONS=06 restricts it for debugging.
+julia --project=. data/make_rgi7_modis_cells.jl [source_dir]
+
+# 2. The albedo run. ~1 TB/year, two hemisphere passes, resumable — just re-invoke.
+#    dry_run first: prints cells, tiles, dates, sample-cache keys and the volume estimate.
+#    Downloads the granules and leaves the per-date SAMPLE CACHE behind, which is what
+#    makes step 3 possible. The per-year files it also writes are superseded by step 3.
+export EARTHDATA_TOKEN="your-token-here"
+julia --project=. -e 'include("data/run_rgi7_ice_albedo_modis.jl"); run_rgi7_albedo([2019]; dry_run=true)'
+julia --project=. -t auto data/run_rgi7_ice_albedo_modis.jl 2019
+
+# 3. The POOLED product — one value per cell over the whole record. DOWNLOADS NOTHING;
+#    re-folds the sample cache in ~27 min (north 21.5, south 5.6, runnable concurrently).
+#    This is what `bare_ice_albedo` reads. Re-run it to change percentile/floor/qa_keep.
+julia --project=. data/run_rgi7_pooled_albedo.jl            # both hemispheres
+julia --project=. data/run_rgi7_pooled_albedo.jl north &    # or one each, concurrently
+julia --project=. data/run_rgi7_pooled_albedo.jl south &
+
+# 4. GeoParquet. SCRATCH ENV — GeoParquet.jl is deliberately not a package dependency.
+#    `cd` out of the package directory first, or Pkg.add writes into ITS Project.toml.
+cd /tmp && julia --project=/tmp/rgi7parquet_env -e 'using Pkg
+    Pkg.add(["GeoParquet", "DataFrames", "GeoFormatTypes", "CodecZlib"])
+    Pkg.develop(path="/path/to/GEMB_ClimateForcing.jl")'
+julia --project=/tmp/rgi7parquet_env data/make_rgi7_ice_albedo_parquet.jl 2019
 ```
 
 ## Architecture
@@ -195,7 +269,15 @@ julia --project=. examples/glacier_ice_albedo_modis_example.jl
 
 7. **`src/datasets/copernicus_dem.jl`** - Copernicus GLO-30 DEM loader
    - Reads 1°×1° Cloud-Optimized GeoTIFF tiles from AWS Open Data via GDAL `/vsicurl/` byte-range
-     reads (tiles never downloaded in full); mosaics covering tiles into an on-the-fly VRT.
+     reads; mosaics covering tiles into an on-the-fly VRT. Tiles are **not** downloaded in full
+     unless `cache_tiles=true`, which fetches each covering tile (19–40 MB) into
+     `cache_path/tiles/` and reads locally afterwards. That exists because **GDAL has no on-disk
+     cache for `/vsicurl/`** — its block cache lives in the process, so repeated point lookups
+     across sessions otherwise re-request the same bytes. It refuses to run when the resolved
+     cache is under `tempdir()`, and fetches through `_run_concurrent_jobs`
+     (`max_concurrent_downloads=4`) since each tile is an independent GET. Off by default:
+     `/vsicurl/` reads only the bytes a crop needs, which is cheaper for a one-off window and the
+     only tractable choice for a continental extent.
    - Tile geometry is analytical (derived from tile id + published `tileList.txt`), so building
      the global mosaic opens zero tiles.
    - `_configure_gdal_http()` points GDAL's curl at Julia's CA bundle (`NetworkOptions.ca_roots_path()`)
@@ -482,11 +564,25 @@ julia --project=. examples/glacier_ice_albedo_modis_example.jl
        `_classifying_requester` restores the split at the injected `requester`, the one place
        the status is still visible. That same hook drives the offline fixture test.
    - **QA is a small-integer class, not a bitmask, and there is no per-pixel `_ERR`.** Hence
-     `qa_keep` is a **whitelist** (`[0]` = full BRDF inversion; `1` = magnitude inversion,
-     opt-in; `2`–`7` = v061 Terra detector-failure cases; `255` = fill) and there is no
-     `max_error`. A whitelist rejects fill *and* any class a later version adds; a reject-list
-     cannot. Snow flags live in a separate granule (**MCD43A2**) — out of scope, and
-     unnecessary: bright snowy days are discarded by the low percentile, as in item 10.
+     `qa_keep` is a **whitelist** and there is no `max_error`. A whitelist rejects fill *and*
+     any class a later version adds; a reject-list cannot. Snow flags live in a separate
+     granule (**MCD43A2**) — out of scope, and unnecessary: bright snowy days are discarded by
+     the low percentile, as in item 10.
+   - **The QA class decomposes, and `[0]` was the wrong default.** Read from a granule's own
+     `Description` attribute: the **low bit is inversion quality** (even = full BRDF inversion,
+     odd = magnitude inversion) and the **upper bits are Band 5/6 detector health** (`÷2`: 0 =
+     both fine, 1 = Band 6 fill, 2 = Band 5 fill, 3 = both), where "fill" means non-functional
+     or noisy detectors. So `2`, `4`, `6` are **full-quality inversions merely missing a
+     shortwave-infrared spectral band** — irrelevant to the broadband `shortwave` layer this
+     workflow reduces, and common rather than exotic (Aqua Band 6 has 15 of 20 detectors
+     non-functional). `MCD43A3_QA_KEEP` is therefore `[0, 2, 4, 6]`, *every full inversion*;
+     it was a bare `[0]`, which silently discarded good data. Do not "tidy" it back.
+   - **The QA whitelist, not data quality, is usually the binding filter.** Measured over 200
+     real Iceland cells on three late-June dates: class `0` 13–14 %, class **`1` 64–72 %**,
+     `3` ~2 %, `7` ~0.5 %, fill 12–20 %. That is why a 3-date smoke test resolved only 7 % of
+     cells. If `min_samples` is unreachable, adding the odd (magnitude-inversion) classes —
+     `qa_keep=[0, 1, 2, 4, 6]` or all of `0:7` — multiplies the sample several-fold, at the
+     cost of an assumed BRDF *shape* and hence a less trustworthy black-sky/white-sky split.
    - **The 0.001 scale is applied by us, not GDAL** (`_valid_albedo`'s `scale` keyword). Valid
      range reaches 32766, so albedo **can legitimately exceed 1.0** — `albedo_range`'s upper
      bound is QC and **no physical clamp should be added**. Fill 32767 × 0.001 = 32.767 is
@@ -555,6 +651,225 @@ julia --project=. examples/glacier_ice_albedo_modis_example.jl
      backoff constants. All `_CDS_*` constants stayed put, so `test_cds_retrieve.jl` needed
      zero edits.
 
+10c. **RGI 7.0 glacier cells + the global bare-ice albedo product** (workflow 5, third piece) —
+   `src/rgi7_modis_cells.jl` plus three `data/` scripts. Rasterizes RGI 7.0 outlines onto the
+   **native** MCD43A3 500 m sinusoidal grid, then evaluates item 10b's statistic at every
+   glacierized cell on Earth and writes GeoParquet.
+   - **Measured, not estimated** (all from the real artifact, so treat these as the reference
+     numbers): 274,531 glaciers / 706,744 km² → **103 MODIS tiles**, 3,271,893 burned cells
+     (**99.4 %** of published area), **3,360,716 distinct cells** after forcing, 3,375,423
+     `(cell, glacier)` rows. Split **63 northern tiles / 40 southern**, 2,584,232 / 776,484
+     cells. Vendored as `data/rgi7_modis_cells.csv.gz` (9.4 MB) + `data/rgi7_glaciers.csv.gz`
+     (2.7 MB), both **committed**; `data/rgi7_source/` and all run products are gitignored.
+   - **`Rasters.rasterize!`, not GDAL rasterize, and the reason is bit-exactness.** Rasters
+     burns against the coordinate vectors *we* supply, so `_rgi7_tile_dims` hands it cell
+     centres built by the same expression `_modis_cell_center` uses (explicit `Vector`, not a
+     range; `Regular` span; `Intervals(Center())`). The burn grid is therefore
+     **bit-identical** to the cell grid at all 2400 X and Y values, and the round trip
+     `_modis_cell(_modis_cell_center(c...)...) === c` holds *by construction* rather than
+     because two implementations happen to agree. GDAL would rederive the grid from a
+     geotransform, i.e. the `ulx + T` pattern `_modis_tile_edge_x` exists to forbid.
+     `rasterize!` specifically (not `rasterize`): the global `min` accumulates across all 19
+     regional shapefiles into one persistent per-tile grid.
+   - **Vertices are reprojected with the closed-form `_modis_lonlat_to_sinu`, not PROJ**, for
+     the same one-implementation reason. PROJ appears **only** as a test oracle, and that test
+     must use a longlat source on the MODIS *sphere* — a WGS84 source makes PROJ apply an
+     ellipsoid→sphere datum shift and the test then measures the shift, not the projection.
+     Measured agreement: **4e-9 m**.
+   - **Three burn rules, each the opposite of the obvious choice:**
+     - **Centre-in-polygon, never `ALL_TOUCHED`** — rejected on *physical* grounds, not to save
+       space. A perimeter cell is majority off-glacier (rock, moraine, water), all **darker**
+       than ice, so it adds cells biased low in exactly the quantity being measured and the
+       darkest-5 % reduction *amplifies* that bias. It would also add ~+45 % cells.
+     - **A contested cell goes to the SMALLER glacier** (burn an ascending-area rank, reduce
+       with `minimum`). A 500-cell glacier concedes one cell and loses 0.2 %; a one-cell
+       glacier concedes its only cell and **vanishes**. `min` is commutative, so the vendored
+       file does not depend on the order the 19 shapefiles are read in.
+     - **A forced cell is ADDED, never substituted.** 37.7 % of RGI 7.0 (103,530 glaciers) is
+       smaller than a 0.2146 km² cell and gets the single cell holding its
+       `ArchGDAL.pointonsurface` — *not* its centroid, which for a crescent or multi-lobed
+       glacier lands off-ice. Letting it displace the existing owner under smallest-wins was
+       tried and **measured wrong**: on Iceland it displaced 13 owners and left 8 glaciers
+       (1.4 %) with nothing. So **a cell may carry more than one glacier, and only ever when a
+       glacier would otherwise have none** — 14,707 rows (0.44 %).
+   - **Consequence: rows are unique as `(cell, glacier)` pairs, not as cells.** The albedo point
+     list is `rgi7_modis_unique_cells`, *not* the raw columns, or the download is over-counted.
+     `length(cells)` is rows; `n_glaciers` is glaciers.
+   - **`forced` is a correctness trap, not a rounding error.** Those cells are majority
+     non-glacier and biased dark, and they are a third of RGI by count (~2 % by area). The flag
+     propagates all the way into the Parquet. Averaging over all rows without filtering gives a
+     wrong global bare-ice albedo — the most likely way this product gets misused.
+   - **Interior rings are pervasive and load-bearing**: 23.5 % of Arctic Canada North outlines,
+     **37 % of Svalbard**, up to **457 rings** on one glacier. Filling them would inflate cell
+     counts in exactly the big-ice-cap regions that dominate the area total. Pinned against a
+     real 14-ring Iceland outline (147 cells held, 154 if holes are filled).
+   - **RGI 7.0 ships `wkbPolygon25D`, not `wkbPolygon`.** A type test matching only the 2D
+     constant rejects *every* outline. Ids are `RGI2000-v7.0-G-01-00001` — **dash** before the
+     number, not a dot.
+   - **`data/make_rgi7_modis_cells.jl` runs in the package environment** (ArchGDAL, Rasters,
+     CodecZlib are deps; Tar/Downloads/SHA are stdlibs). Source defaults to an open Bremen
+     mirror but takes a **local directory as its primary interface**, and records a SHA-256 per
+     tarball in the output header, because the authoritative NSIDC endpoint
+     (`https://doi.org/10.5067/f6jmovy5navz`) needs Earthdata auth and the mirror has no
+     archival guarantee. `RGI7_REGIONS=06,07` restricts the run for debugging.
+   - **`data/run_rgi7_ice_albedo_modis.jl` calls the albedo function TWICE per year, split by
+     hemisphere, with EXPLICIT windows** — mandatory, not an optimization.
+     `_resolve_doy_range(:melt_season, lat)` returns `nothing` (the **whole year**) for any
+     equator-straddling list, and a global list always straddles: 1.2 TB becomes 2.4 TB for no
+     benefit. The split is exact and free because `_MODIS_UL_Y == 9 · _MODIS_TILE_SPAN_M` to
+     the bit, so `_modis_tile_edge_y(9) === 0.0` and **`v <= 8` *is* the northern hemisphere**;
+     no tile straddles the equator, so the two tile sets are disjoint and nothing downloads
+     twice. Skipping the south is not an option — 23.2 % of global glacier area, region 19
+     alone 133,432 km².
+   - **Cost: measured 745 GB north + 261 GB south = 0.98 TB per year**, peak disk 4.4 GB
+     (north) / 1.5 GB (south) per date with `keep_granules=false`. Taken from real CMR granule
+     sizes over three probe dates per hemisphere, so prefer these over the package's own
+     `@info "Download volume estimate"`, which assumes 70 MB/granule and reads ~1.2 TB.
+     Southern granules are far smaller (median **6 MB** — those tiles are mostly ocean) and one
+     southern tile has no granule at all, a permanent gap that is handled rather than fatal.
+     **Probe each hemisphere inside its own window**: the south measures 0.79 GB/date sampled
+     in July and 1.48 GB/date in its actual `(300,110)` season, a 2× error.
+     Resumability is two-level: a completed `(year, hemisphere)` intermediate is skipped
+     outright, and within one the per-date sample cache means a crash re-downloads nothing.
+   - **Batched CMR discovery, measured live**: one bbox-free query returns **297 tiles in 23 s**
+     (3 pages). That is ~171 queries and ~1 h of discovery per melt-season year, against 17,613
+     queries and ~5 h for the per-tile path — and a fully-cached re-run issues none at all.
+   - **A failed download must NEVER be cached, and this bit us.** A tile absent from CMR is a
+     permanent record gap and caching it as missing is correct; a tile whose *download* failed
+     is transient, and caching that freezes an outage into the record forever because the cache
+     is trusted on every later run. Measured during the first 2000–2025 attempt: an LP DAAC DNS
+     outage (`Could not resolve host: data.lpdaac.earthdatacloud.nasa.gov`) lost all 63 northern
+     tiles of 2002-09-09, and the date was written as **2,584,232 rows of `NA`** that a resumed
+     run would have believed. So `mcd43a3_granules` takes a `failed` vector, and
+     `compute_glacier_ice_albedo_modis` writes the sample cache **only when it is empty**,
+     reporting the rest as `degraded_dates` / `n_degraded_dates` in the stack metadata. The
+     driver then **refuses to write that year's intermediate at all**, because `already_done`
+     would otherwise skip it forever. Re-invoking the script retries exactly the affected dates.
+     This is the direct consequence of `skip_failed_downloads=true`: without the pairing, that
+     keyword trades a loud crash for silent corruption.
+   - **Distinguish a gap from a failure by asking CMR, not by looking at the cache** — they are
+     indistinguishable after the fact. Verified during that incident: 2001-06-24 has **0**
+     MCD43A3 granules globally and 2000-02-16/20 likewise, so those all-`NA` dates are true
+     archive gaps and their years are valid; 2001-06-23 has 101 against a normal day's 297, so
+     it is a genuinely partial day. Only 2002-09-09 was a real download failure. A normal date
+     measures 0.0–0.1 % `NA`, so a 100 %-`NA` date is the signal to investigate.
+   - **A DNS outage costs ~8 h per date, not seconds.** `_earthdata_is_transient` treats
+     `Downloads.RequestError` — including an unresolvable host — as transient, so each granule
+     burns the full `download_timeout` (3600 s) across 60 attempts before being skipped; at 63
+     tiles and 8 concurrent that is ~8 h for one date, against a ~43 s norm. Watch the progress
+     bar's `elapsed` for a jump (observed: 1:33:59 at date 132 → 9:27:01 at date 133) and stop
+     the run rather than let it grind. A supervisor that waits for the host to resolve before
+     each attempt is the right wrapper; the driver's resumability is what makes that safe.
+   - **The sample-cache key hashes the WHOLE cell list**, so regenerating the vendored table
+     silently *orphans* (does not delete) every cached date. The canonical `(h,v,row,col)` sort
+     is what makes the key reproducible; the driver logs it for exactly this reason.
+   - **`data/make_rgi7_ice_albedo_parquet.jl` is the only step needing a scratch environment**,
+     because GeoParquet.jl is deliberately **not** a dependency — same reasoning as HDF5.jl
+     above. Verified at full scale: 3,375,423 rows → **71.2 MB (22.1 B/row)**, round-tripped
+     through GeoParquet.jl *and* independently through GDAL/OGR (`crs=nothing` resolves to
+     OGC:CRS84; geometry is `POINT(lon lat)`). Fallback if it ever breaks: this repo's
+     `GDAL_jll` exports `RegisterOGRParquet`.
+   - **`rgi7_ice_albedo_climatology(years; reduction=median, ...)`
+     (`src/rgi7_ice_albedo_climatology.jl`) reduces the per-year files, and needs no scratch
+     env** — each row of those files is already a cell's *annual* darkest-percentile mean, so a
+     climatology is a pure read. `reduction` is a **function handle** (`median`, `mean`,
+     `minimum`, `x -> quantile(x, 0.1)`, …) applied per cell to that cell's valid annual values;
+     it **never sees a `NaN`** (unresolved cell-years are dropped first, which is what makes
+     `:n_years_*` meaningful) and `min_years` reports a thin cell as `NaN` rather than reducing
+     over one value.
+     - **It reduces annual statistics, it does not pool observations.** `median` is the median
+       *of the annual values*, weighting years equally — a **different quantity** from one
+       darkest-5 % over all years pooled, which would be dominated by the darkest years. The
+       pooled form needs the per-date samples under `<cache_path>/samples/` (a CPU re-fold, not
+       a re-download) and is deliberately not implemented here.
+     - Memory is `cells × years` because an arbitrary handle cannot be folded incrementally:
+       ~670 MB for two layers over 25 years at 3.36M cells. Documented, not worked around.
+     - Restricting `hemispheres` to one half is a supported mode and **must not warn** about the
+       other half being absent; the coverage warning fires only when both were requested. A
+       `@test_logs` assertion pins that, because a warning per year would bury the real one.
+     - Its testset builds a **40-cell synthetic `RGI7ModisCells`** rather than using the vendored
+       table: analytic answers, independent of whether the burn has been run, and 7.7 s instead
+       of the 4 min a full-table version took.
+   - **Do not `Pkg.add` into a scratch env from the package directory.** `--project=<empty dir>`
+     with the package as cwd resolves to the *package's* `Project.toml`, and Pkg will add
+     GeoParquet/DataFrames as hard deps and strip the `[sources]` comment block. `cd` out first.
+
+10d. **The POOLED product, and sampling it at a geometry** (workflow 5, the current form) —
+   `src/pooled_ice_albedo.jl` + `src/bare_ice_albedo.jl` + `data/run_rgi7_pooled_albedo.jl`.
+   **This supersedes the per-year product for most uses.** Everything in 10b/10c still stands: it
+   is what downloads the granules and leaves the sample cache the pooled form re-folds.
+   - **The problem it solves.** Per-*year* coverage is far too variable for an annual value to be
+     comparable — the fraction of cells resolving in one year runs 21.6 % (2001) to 6.5 % (2025)
+     north and 0.6–6.2 % south. So most cell-years are `NaN`, and a mean or median *of* those
+     values weights a sparse year equally with a well-covered one.
+   - `pool_ice_albedo_from_cache(cells; percentile, albedo_range, qa_keep, layer, dates)` →
+     `DimStack` over `Dim{:point}` with `:albedo_bsa` / `:albedo_wsa`,
+     `:n_valid_observations_*` and **`:k_used_*`** (how many of the darkest were averaged,
+     `ceil(percentile · n_valid)` — derived, not returned from the accumulator, and exact).
+   - **Measured coverage, pooled vs per-year** — this is the whole justification:
+
+     | | per-year | pooled |
+     |---|---|---|
+     | cells resolved | 6.5–21.6 % N, 0.6–6.2 % S | **95.0 % N, 72.6 % S** |
+     | glaciers with a value | 30.8 % | **83.7 %** |
+     | RGI area with a value | 84.2 % | **97.5 %** |
+     | area with `n_valid ≥ 30` | 61.3 % | **93.7 %** |
+
+     Area-weighted global bare-ice albedo **0.451**; median `n_valid` 264 N / 60 S, max 3386.
+     Per-region coverage is ≥90 % everywhere except region 16 (Low Latitudes, 34 %) and 17
+     (Southern Andes, 66 %) — persistent cloud. Output is 34.7 MB for all 3.36 M cells.
+   - **`POOLED_ICE_ALBEDO_RANGE` is `(0.25, 1.0)`, not the per-year run's `(0.3, 1.0)`.** Every
+     per-year file has `minimum == exactly 0.3000`, i.e. that floor was clipping the dark tail it
+     was meant to bound. Verified on a synthetic cache: raising 0.25→0.30 drops real retrievals
+     and brightens the answer (0.263 → 0.305).
+   - **No sample-count threshold at all.** `min_samples` is gone from this path; `n_valid` and
+     `k_used` are reported and filtering is the caller's. A cell with one retrieval reports that
+     retrieval — which is why the counts are load-bearing, not decoration.
+   - **It re-folds the cache and downloads NOTHING**, and that is possible only because the
+     sample cache stores **raw DNs plus the QA class**, not post-QC values. So `percentile`,
+     `albedo_range` and `qa_keep` are all free to change by re-folding; only the date list, cell
+     list and layer set are fixed at download time. A requested date that is **not** cached is an
+     **error**, never a gap: a pooled statistic over an unknown subset of the record is not
+     interpretable.
+   - **Sibling of `compute_glacier_ice_albedo_modis`, not a `pool_years=true` keyword on it.**
+     Pooling needs one accumulator across every date rather than one per year, and this path needs
+     none of the parent's download, CMR or degraded-date machinery. It does duplicate the parent's
+     argument checks — keep them in step (the `isempty(qa_keep)` guard was missed once).
+   - **`kmax` is `ceil(percentile · n_dates)` = 223 for a 26-year northern record**, against 2–9
+     per year. That is 4.3 GiB of accumulator (north) / 1.3 GiB (south), held in RAM, and it is
+     what forced the heap in `_accumulate_block!` (see Deliberate performance choices).
+   - **`bare_ice_albedo(geometry, reducer = nothing; dir, boundary, shape, min_cells)`** samples
+     the result at any GeoInterface geometry in **(lon, lat) degrees** — point, multipoint, line,
+     ring, polygon, multipolygon. `reducer === nothing` → `DimStack` over `Dim{:cell}`; a function
+     handle → a `NamedTuple` of scalars reduced across cells (it never sees a `NaN`).
+     - **`Rasters.boolmask` does the burn, NOT `Rasters.extract`.** In Rasters 0.15 `extract`
+       cannot index a 3-D `(X, Y, Ti)` raster at all (`MethodError` in the `Extractor`
+       constructor) and **throws on any multipoint** (`TypeError: non-boolean (Int64) used in
+       boolean context`, from the `::Bool` assertion in its `AbstractMultiPointTrait` method).
+       `boolmask` handles every trait. A test pins that the two agree cell-for-cell where
+       `extract` works.
+     - The geometry is reprojected into the sinusoidal grid with the **same closed form** the
+       vendored cell table was burned with, and the burn target is sliced from `_rgi7_tile_dims`,
+       so the burn grid is **bit-identical** to the cell grid and no albedo value is resampled.
+       Never warp the albedo to lon/lat instead.
+     - **`:in_product` distinguishes off-glacier from glacierized-but-unresolved.** Both read
+       `NaN`, and conflating them is the easiest way to misread the product. Note RGI 7.0's "G"
+       product **excludes the ice sheets** — region 05 is Greenland *periphery* — so an interior
+       ice-sheet point is legitimately absent.
+     - **The parsed hemisphere table is memoized** (`_PooledAlbedoTable`, `_BIA_TABLE_CACHE`),
+       same pattern as `glacier_decoupling_table` and `rgi7_modis_cells`: a query otherwise
+       decompresses and scans 2.58 M rows to fetch a handful of cells. 782 ms → 0.026 ms warm, at
+       99 MiB resident per hemisphere; the first parse is ~1.7 s. **A concrete struct, not a
+       `NamedTuple`** — an abstract cached type left every field access dynamically dispatched and
+       cost a 573-cell polygon query 3117 of its 3267 allocations.
+     - `_bia_burn` is 0.025 ms — 0.005 % of a query. Do not optimize it.
+   - **Region 19 sits at 0.721** against 0.31–0.46 elsewhere: Antarctic-periphery cells rarely
+     expose bare ice even in their darkest 5 %, so that number is snow. Filtering on albedo alone
+     silently mixes the two populations.
+   - `rgi7_ice_albedo_climatology` (10c) still reads the **per-year** files and is the older
+     answer to the same question. Prefer the pooled product; keep the climatology for
+     year-to-year inspection.
+
 11. **`src/simulate/simulate_climate_forcing.jl`** - Synthetic forcing (workflow 4)
    - `simulate_climate_forcing(set_id, time_step_hours=0)` — generates a full stochastic forcing
      `DimStack` from a named parameter set (`simulation_parameter_sets`, e.g. `"test_1"`), seeded
@@ -600,6 +915,27 @@ slower or breaks bit-exactness. Comments at each site record the same thing.
   The E-step is where the time goes and *is* optimized (the responsibility matrix is hoisted out
   of the iteration loop and row slicing removed: 112M → 1.6k allocations). Its `P[k] * (pdf)`
   grouping is also load-bearing for bit-exactness.
+- **`_accumulate_block!` keeps its retained values as a max-heap, not a linear scan.** The scan
+  was right when the only caller was the per-year statistic, where `kmax` is 2–9; pooling a whole
+  record raises it to 223 and made eviction the largest single cost of a fold — 95 ms per date per
+  layer against 11 ms now (8.8×). Only the storage *order* changes, never which values are
+  retained, and `_finalize_into!` sorts before averaging, so every reported statistic stays
+  bit-identical. The existing streamed-vs-batch equivalence test pins that.
+- **`_modis_sample_cache_read` scans one byte buffer; it does not use `readlines` + `split`.**
+  A hemisphere-year is 2.58 M rows, so the line-based form allocated a `String` and a `Vector` of
+  `SubString`s per row: 4.15 s per northern date against **0.14 s** (29× north, 38× south),
+  bit-identically. That is the whole difference between a ~7 h whole-record re-fold and a ~27 min
+  one. It throws on a non-digit byte rather than skipping: a silently mis-parsed DN becomes a
+  plausible albedo, and the cache is trusted on every later run.
+- **`_bia_table` sizes its vectors from the buffer length, not an exact newline count.** An exact
+  `count` is a second full pass over ~104 MB for a `sizehint!` that only has to be close.
+- **`transcode(GzipDecompressor, read(path))` was tried and reverted** in `_bia_table`: it wins
+  the isolated microbenchmark (885 ms vs 977 ms) and loses in context (1846 → 2022 ms). The
+  streaming `read(GzipDecompressorStream(io))` stays.
+- **An in-place `_valid_albedo!` was considered and skipped.** It allocates 9.9 MiB × 2 per date,
+  i.e. ~186 GB of garbage across a full run, which sounds compelling — but allocating 10 MiB is
+  ~2–3 ms of an 18 ms kernel, so the recoverable share is ~2 % of fold runtime, against coupling a
+  scratch buffer through a kernel shared with the C3S blockwise/`Mmap` path.
 - **`PrecompileTools` workload in `src/GEMB_ClimateForcing.jl` is deliberately network-free** —
   no Zarr, CDS, or `/vsicurl/` — so precompilation stays offline and CI-safe. `climate_forcing`
   is therefore not covered. It costs ~1.4 s of precompile time and buys ~2.6 s of first-call

@@ -144,7 +144,7 @@ const _ALBEDO_NON_DATA_LAYERS = (:crs,)
 
 Default on-disk cache directory for ordered albedo files.
 """
-_default_albedo_cache() = joinpath(tempdir(), "GEMB_ClimateForcing", "satellite_albedo")
+_default_albedo_cache() = joinpath(_gemb_cache_root(), "satellite_albedo")
 
 """
     _albedo_era_tag() -> String

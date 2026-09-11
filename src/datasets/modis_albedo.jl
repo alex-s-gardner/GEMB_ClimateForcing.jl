@@ -32,11 +32,32 @@ band but a raw `ArchGDAL.read` returns the unscaled integer. Valid range 0–327
 32767, so albedo may legitimately exceed 1.0 and **no physical clamp belongs here** —
 `albedo_range` is quality control, not a unit fix.
 
-Quality (`BRDF_Albedo_Band_Mandatory_Quality_*`, `UInt8`, fill 255) is a small-integer
-*class*, not a bitfield: `0` = full BRDF inversion, `1` = magnitude inversion, `2`–`7` =
-v061 Terra band 5/6 detector-failure cases. Hence the whitelist (`keep_values`) rather than
-the C3S reject-mask, and hence no per-pixel uncertainty layer — MCD43A3 has none. Snow flags
-and full per-band QA live in a *separate* granule (MCD43A2) and are out of scope.
+Quality (`BRDF_Albedo_Band_Mandatory_Quality_*`, `UInt8`, `valid_range` 0–254, fill 255) is a
+small-integer **class**, not a bitfield — hence the whitelist (`keep_values`) rather than the
+C3S reject-mask. There is no per-pixel uncertainty layer at all, so the class is the only
+quality lever; snow flags and full per-band QA live in a *separate* granule (MCD43A2) and are
+out of scope.
+
+The eight classes, verbatim from a granule's own `Description` attribute:
+
+| | inversion | Band 5 | Band 6 |
+|---|---|---|---|
+| `0` | full BRDF | ok | ok |
+| `1` | magnitude | ok | ok |
+| `2` | full BRDF | ok | fill |
+| `3` | magnitude | ok | fill |
+| `4` | full BRDF | fill | ok |
+| `5` | magnitude | fill | ok |
+| `6` | full BRDF | fill | fill |
+| `7` | magnitude | fill | fill |
+
+"fill" here means the band was dropped for *non-functional or noisy detectors*. The value
+**decomposes** — its `units` are `"concatenated flags"` — with the low bit carrying inversion
+quality (even = full, odd = magnitude) and the upper bits carrying detector health. So `2`,
+`4` and `6` are **full-quality inversions missing a shortwave-infrared spectral band**, not
+degraded ones, which is why [`MCD43A3_QA_KEEP`](@ref) defaults to `[0, 2, 4, 6]` rather than
+to a bare `[0]`: for the broadband `shortwave` layer this workflow reduces, Band 5/6 detector
+health is largely beside the point, and Aqua's Band 6 has 15 of 20 detectors non-functional.
 """
 
 using Rasters
@@ -335,6 +356,36 @@ function _modis_granule_tile(id::AbstractString)
 end
 
 """
+    _modis_granule_production(id) -> Int
+
+Production timestamp of a granule, from the 13-digit `YYYYDDDHHMMSS` field its
+`producer_granule_id` carries after the version.
+
+Only used to pick deterministically between two granules for the same `(date, tile)`, which
+reprocessing does produce. Returns `0` when the field is absent rather than throwing: an
+unparseable timestamp should lose a comparison, not abort a run.
+"""
+function _modis_granule_production(id::AbstractString)
+    m = match(r"\.(\d{13})\.", id)
+    return isnothing(m) ? 0 : parse(Int, m[1])
+end
+
+"""
+    _modis_granule_prefer(a_id, b_id) -> Bool
+
+Whether granule `a_id` should be preferred over `b_id` for the same `(date, tile)`.
+
+Newer production wins; ties break on the id string so the choice is total and reproducible.
+The per-tile CMR path took whichever granule CMR happened to list first, which is *not*
+deterministic — batching the query surfaced that, so the rule is made explicit here.
+"""
+function _modis_granule_prefer(a::AbstractString, b::AbstractString)
+    pa, pb = _modis_granule_production(a), _modis_granule_production(b)
+    pa != pb && return pa > pb
+    return a > b
+end
+
+"""
     _modis_tile_bbox(h, v) -> String
 
 CMR `bounding_box` ("W,S,E,N") covering tile `(h, v)`, from the geographic corners of its
@@ -366,7 +417,11 @@ end
 # ----------------------------------------------------------------------------- retrieval
 
 _default_modis_cache() =
-    joinpath(tempdir(), "GEMB_ClimateForcing", "$(MCD43A3_SHORT_NAME).$(MCD43A3_VERSION)")
+    joinpath(_gemb_cache_root(), "$(MCD43A3_SHORT_NAME).$(MCD43A3_VERSION)")
+
+# Tile count at or above which one bbox-free CMR query for the whole date beats one query per
+# tile. Below it the per-tile box is cheaper (1 request for 1 tile, vs ~3 pages globally).
+const _MODIS_CMR_BATCH_MIN = 8
 
 """
     mcd43a3_granules(date, tiles; token=nothing, cache_path=nothing, force_download=false,
@@ -379,17 +434,30 @@ Local paths to the MCD43A3 granules for one **nominal** `date` and the requested
 Tiles with no granule for that date are simply absent from the result — a gap in the record
 is normal and is not an error.
 
-CMR is queried once per tile (the tile's bounding box), and results are filtered on the
-granule id's nominal date *and* tile, because `temporal` alone returns 16 dates. Downloads
-run concurrently through [`_run_concurrent_jobs`](@ref) with no submission stagger: unlike
-the CDS path there is no queue limiter to trip, only bandwidth to share.
+CMR is queried **once for the whole date** when `length(tiles) >= $(_MODIS_CMR_BATCH_MIN)`
+(see [`_mcd43a3_granule_index`](@ref)) and once per tile below that, and results are filtered on
+the granule id's nominal date *and* tile, because `temporal` alone returns 16 dates. Pass
+`granule_index` to reuse an index already fetched for this date. Downloads run concurrently
+through [`_run_concurrent_jobs`](@ref) with no submission stagger: unlike the CDS path there is
+no queue limiter to trip, only bandwidth to share.
+
+With `skip_failed_downloads=true` (the default) a granule that will not download is logged and
+omitted rather than aborting. That matters at scale: `_earthdata_is_transient` classifies a
+`Downloads.RequestError` — including a genuine 404 — as transient, so one permanently-missing
+granule otherwise burns the whole `timeout` and then takes the run down through
+`_run_concurrent_jobs`' `@sync`. Over the 17,613 granules of a single melt-season year at 103
+tiles that is not survivable, and a missing tile-date is already normal (see above).
 """
 function mcd43a3_granules(date::Date, tiles::AbstractVector{<:Tuple{Integer,Integer}};
                           token::Union{Nothing,AbstractString}=nothing,
                           cache_path::Union{Nothing,AbstractString}=nothing,
                           force_download::Bool=false, verbose::Bool=true,
                           timeout::Real=Inf, deadline::Float64=Inf,
-                          max_concurrent_downloads::Integer=4)
+                          max_concurrent_downloads::Integer=4,
+                          granule_index=nothing,
+                          batch_query_min_tiles::Integer=_MODIS_CMR_BATCH_MIN,
+                          skip_failed_downloads::Bool=true,
+                          failed::Union{Nothing,Vector{Tuple{Int,Int}}}=nothing)
     isempty(tiles) && return Dict{Tuple{Int,Int},String}()
     cache = isnothing(cache_path) ? _default_modis_cache() : cache_path
     mkpath(cache)
@@ -400,28 +468,45 @@ function mcd43a3_granules(date::Date, tiles::AbstractVector{<:Tuple{Integer,Inte
     wanted = Dict{Tuple{Int,Int},NamedTuple{(:path, :url, :bytes),Tuple{String,String,Int}}}()
     found = Dict{Tuple{Int,Int},String}()
 
+    # One listing for the whole call rather than one per tile — see _modis_cached_granule.
+    listing = isdir(cache) ? readdir(cache) : String[]
+    missing_tiles = Tuple{Int,Int}[]
     for tile in tile_list
-        cached = _modis_cached_granule(cache, date, tile)
-        if !force_download && !isnothing(cached)
-            found[tile] = cached
-            continue
+        cached = force_download ? nothing :
+            _modis_cached_granule(cache, date, tile; listing=listing)
+        isnothing(cached) ? push!(missing_tiles, tile) : (found[tile] = cached)
+    end
+
+    if !isempty(missing_tiles)
+        # A batched index is worth its extra pages only for a large tile set; and if the
+        # caller already has one for this date, never query again.
+        index = granule_index
+        if isnothing(index) && length(missing_tiles) >= batch_query_min_tiles
+            index = _mcd43a3_granule_index(date; verbose=verbose, deadline=deadline)
         end
-        temporal = _modis_cmr_temporal(date)
-        granules = _cmr_granules(; short_name=MCD43A3_SHORT_NAME, version=MCD43A3_VERSION,
-                                 temporal=temporal, bounding_box=_modis_tile_bbox(tile...),
-                                 verbose=verbose, deadline=deadline)
-        hit = nothing
-        for g in granules
-            # BOTH filters are required: `temporal` returns 16 nominal dates, and the tile
-            # bounding box overlaps neighbouring tiles.
-            (_modis_granule_date(g.id) == date && _modis_granule_tile(g.id) == tile) ||
-                continue
-            hit = g
-            break
+
+        for tile in missing_tiles
+            hit = nothing
+            if !isnothing(index)
+                hit = get(index, tile, nothing)
+            else
+                granules = _cmr_granules(; short_name=MCD43A3_SHORT_NAME,
+                                         version=MCD43A3_VERSION,
+                                         temporal=_modis_cmr_temporal(date),
+                                         bounding_box=_modis_tile_bbox(tile...),
+                                         verbose=verbose, deadline=deadline)
+                for g in granules
+                    # BOTH filters are required: `temporal` returns 16 nominal dates, and the
+                    # tile bounding box overlaps neighbouring tiles.
+                    (_modis_granule_date(g.id) == date &&
+                     _modis_granule_tile(g.id) == tile) || continue
+                    (isnothing(hit) || _modis_granule_prefer(g.id, hit.id)) && (hit = g)
+                end
+            end
+            isnothing(hit) && continue
+            wanted[tile] = (; path=joinpath(cache, _modis_granule_filename(hit.id)),
+                            url=hit.url, bytes=hit.bytes)
         end
-        isnothing(hit) && continue
-        wanted[tile] = (; path=joinpath(cache, _modis_granule_filename(hit.id)),
-                        url=hit.url, bytes=hit.bytes)
     end
 
     if !isempty(wanted)
@@ -439,8 +524,33 @@ function mcd43a3_granules(date::Date, tiles::AbstractVector{<:Tuple{Integer,Inte
                 return nothing
             end
             verbose && @info "Downloading MCD43A3 granule" date tile size_mb = round(spec.bytes / 1024^2; digits=1)
-            _earthdata_download(spec.url, path; token=tok, expected_bytes=spec.bytes,
-                                verbose=verbose, timeout=timeout, deadline=deadline)
+            if skip_failed_downloads
+                # Logged and dropped, not rethrown: an exception here escapes the enclosing
+                # `@sync` as a CompositeException that nothing catches, killing a multi-day run
+                # over one absent granule. The cost of dropping it is one fewer sample for that
+                # tile-date, which is what a record gap already means.
+                try
+                    _earthdata_download(spec.url, path; token=tok, expected_bytes=spec.bytes,
+                                        verbose=verbose, timeout=timeout, deadline=deadline)
+                catch e
+                    e isa InterruptException && rethrow()
+                    @warn("MCD43A3 granule unavailable, omitting it from this date",
+                          date, tile, exception=(e, catch_backtrace()))
+                    rm(path * ".part"; force=true)
+                    # Recorded so the caller can tell a *failed download* from a genuine
+                    # record gap. They look identical in `found` but must be treated
+                    # oppositely: a gap is permanent and safe to cache, whereas a failure is
+                    # transient and caching it would freeze an outage into the record. `push!`
+                    # is safe unlocked only because each task owns a distinct tile — the array
+                    # is appended to from several `@async` tasks, and Julia's tasks do not
+                    # preempt mid-`push!` without a yield point.
+                    isnothing(failed) || push!(failed, tile)
+                    return nothing
+                end
+            else
+                _earthdata_download(spec.url, path; token=tok, expected_bytes=spec.bytes,
+                                    verbose=verbose, timeout=timeout, deadline=deadline)
+            end
             results[i] = tile => path
             return nothing
         end
@@ -458,11 +568,18 @@ _modis_granule_filename(id::AbstractString) =
 
 # A granule's production-timestamp field is unpredictable, so a cached file is found by
 # globbing on the fields that *are* known: product, nominal date and tile.
-function _modis_cached_granule(cache::AbstractString, date::Date, tile::Tuple{Integer,Integer})
+#
+# `listing` is the cache directory's contents, read **once per `mcd43a3_granules` call** rather
+# than once per tile. With `keep_granules=true` the flat cache holds a granule per tile-date —
+# 17,613 files for one melt-season year at 103 tiles — and a `readdir` per tile made this
+# quadratic in the cache size. Passing `nothing` re-reads it, which is only for direct callers.
+function _modis_cached_granule(cache::AbstractString, date::Date, tile::Tuple{Integer,Integer};
+                               listing::Union{Nothing,Vector{String}}=nothing)
     isdir(cache) || return nothing
+    files = isnothing(listing) ? readdir(cache) : listing
     stem = string(MCD43A3_SHORT_NAME, ".A", year(date), lpad(dayofyear(date), 3, '0'),
                   ".h", lpad(tile[1], 2, '0'), "v", lpad(tile[2], 2, '0'), ".")
-    for f in readdir(cache)
+    for f in files
         startswith(f, stem) && endswith(f, ".hdf") && return joinpath(cache, f)
     end
     return nothing
@@ -479,6 +596,44 @@ further is impossible; widening it only costs more filtering.
 """
 _modis_cmr_temporal(date::Date) =
     string(date, "T00:00:00Z,", date, "T23:59:59Z")
+
+"""
+    _mcd43a3_granule_index(date; token, verbose, deadline, page_size)
+        -> Dict{Tuple{Int,Int},NamedTuple{(:id,:url,:bytes),Tuple{String,String,Int}}}
+
+Every MCD43A3 granule for one **nominal** `date`, keyed by tile, from a *single* CMR query.
+
+This is the batched alternative to querying per tile, and for a large tile set it is the
+difference between a run starting and a run spending its first hours on metadata: a
+melt-season year over 103 tiles is 17,613 serial per-tile queries, versus ~171 batched ones.
+
+The tile `bounding_box` is dropped, which is safe because it was never load-bearing —
+[`mcd43a3_granules`](@ref) already filtered on the granule id's nominal date *and* tile, since
+`temporal` alone returns 16 nominal dates either way. Without the box a query returns roughly
+16 dates × ~300 land tiles ≈ 4,800 hits, so **this is the first caller in the package for which
+CMR paging actually runs more than once** (three pages at the 2000 ceiling).
+
+Where reprocessing has produced two granules for the same `(date, tile)`, the newer one wins by
+[`_modis_granule_prefer`](@ref) — the per-tile path silently took whichever CMR listed first.
+"""
+function _mcd43a3_granule_index(date::Date; verbose::Bool=true, deadline::Float64=Inf,
+                                page_size::Integer=_CMR_PAGE_SIZE)
+    granules = _cmr_granules(; short_name=MCD43A3_SHORT_NAME, version=MCD43A3_VERSION,
+                             temporal=_modis_cmr_temporal(date), bounding_box=nothing,
+                             page_size=page_size, verbose=verbose, deadline=deadline)
+    out = Dict{Tuple{Int,Int},NamedTuple{(:id, :url, :bytes),Tuple{String,String,Int}}}()
+    for g in granules
+        _modis_granule_date(g.id) == date || continue
+        tile = try
+            _modis_granule_tile(g.id)
+        catch
+            continue          # a granule id without a tile field is not ours to interpret
+        end
+        prev = get(out, tile, nothing)
+        (isnothing(prev) || _modis_granule_prefer(g.id, prev.id)) && (out[tile] = g)
+    end
+    return out
+end
 
 """
     _modis_read_window(path, layer, rows, cols) -> Matrix

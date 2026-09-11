@@ -10,6 +10,7 @@ CodecZlib = "944b1d66-785c-5afd-91f1-9de20f533193"
 Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
 DimensionalData = "0703355e-b756-11e9-17c0-8b28908087d0"
 Downloads = "f43a241f-c20a-4ad4-852c-f6b1247861c6"
+GeoInterface = "cf35fbd7-0cd7-5166-be24-54bfbe79505f"
 EarthData = "0ce7a1f8-0645-46c2-a0bb-6c09c29d93e9"
 HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
 JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
@@ -33,6 +34,7 @@ Dates = "1"
 DimensionalData = "0.30"
 Downloads = "1.6"
 EarthData = "0.1, 0.2"
+GeoInterface = "1.6"
 HTTP = "1"
 JSON3 = "1"
 Mmap = "1"
@@ -71,7 +73,11 @@ p7zip_jll = "17"
 # Do NOT "simplify" by deleting this block: Pkg would silently resolve the broken v0.1.0 and
 # every MODIS granule query would fail in the schema parser, far from the cause.
 [sources]
-EarthData = {url = "https://github.com/evetion/EarthData.jl", rev = "main"}
+# Pinned to a COMMIT, not to `main`. `Manifest.toml` is gitignored, so CI resolves this
+# dependency fresh on every run: tracking the branch means any upstream push can turn CI red
+# with no change here, which is exactly what happened when `request` gained an `AbstractRequest`
+# argument. Bump this deliberately, together with `_cmr_granules` in src/earthdata.jl.
+EarthData = {url = "https://github.com/evetion/EarthData.jl", rev = "1dd47b1981035e802ddabb752f35c6c8d3128b97"}
 
 [extras]
 BenchmarkTools = "6e4b80f9-dd63-53aa-95a3-0cdb28fa8baf"

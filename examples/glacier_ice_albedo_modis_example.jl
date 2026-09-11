@@ -192,7 +192,7 @@ function summarize(ice, points)
         w = filter(!isnan, collect(wsa[p, :]))
         if isempty(b)
             @printf("  point %d: unresolved — try a lower `albedo_range` floor, a smaller \
-                    `min_samples`, or `qa_keep=[0, 1]`\n", p)
+                    `min_samples`, or `qa_keep=[0, 1, 2, 4, 6]`\n", p)
         else
             @printf("  point %d: BSA %.3f   WSA %.3f\n", p, mean(b),
                     isempty(w) ? NaN : mean(w))
@@ -263,7 +263,7 @@ ice = run_example()
 # doubles the sample count at the cost of weaker retrievals, and relaxing `min_samples`
 # resolves more points:
 #
-#     ice = run_example(2019; qa_keep = [0, 1], min_samples = 10)
+#     ice = run_example(2019; qa_keep = [0, 1, 2, 4, 6], min_samples = 10)
 #
 # The spectral bands are in the same granules, so requesting more layers costs NO extra
 # download — only the reduction runs again:

@@ -16,7 +16,8 @@ using GEMB_ClimateForcing: _modis_tile_origin, _modis_tile_bounds, _modis_lonlat
     _mcd43a3_quality_layer, _modis_granule_filename, _modis_cached_granule,
     _MODIS_TILE_SPAN_M, _MODIS_PIXEL_M, _MODIS_TILE_PIXELS, _MODIS_UL_X, _MODIS_UL_Y,
     _MODIS_SPHERE_R, _MCD43A3_SCALE, _modis_dedup_points, _low_percentile_mean,
-    _LowPercentileTopK, _accumulate!, _finalize
+    _LowPercentileTopK, _accumulate!, _finalize,
+    _modis_sample_cache_read, _modis_sample_cache_write, _modis_sample_cache_path
 
 @testset "MODIS MCD43A3 albedo" begin
 
@@ -249,6 +250,49 @@ using GEMB_ClimateForcing: _modis_tile_origin, _modis_tile_bounds, _modis_lonlat
             batch = _low_percentile_mean(obs, percentile, 1)
             @test streamed == batch[1]
             @test counts == batch[2]
+        end
+    end
+
+    @testset "Sample cache round trip and reject paths" begin
+        # The cache is trusted on every later run and is what makes a re-fold cheap (~26 min
+        # for 2000–2025 instead of a ~1 TB/year re-download), so a stale or corrupt file must
+        # be rejected outright rather than half-read. The reader parses raw bytes; these pin
+        # the cases a line-based reader got for free.
+        mktempdir() do dir
+            L = [:Albedo_BSA_shortwave, :Albedo_WSA_shortwave]
+            w(name, s) = (p = joinpath(dir, name); write(p, s); p)
+
+            samples = Dict{Symbol,Vector{Union{Missing,Int}}}(
+                :Albedo_BSA_shortwave => Union{Missing,Int}[10, missing, 32767, 0],
+                :Albedo_WSA_shortwave => Union{Missing,Int}[missing, 25, 1, 32766])
+            p = _modis_sample_cache_write(joinpath(dir, "rt.tsv"), L, samples)
+            got = _modis_sample_cache_read(p, L, 4)
+            @test all(isequal(got[l], samples[l]) for l in L)
+
+            # Requested layers may be a subset of the header, in any order, and a column that
+            # is present but unrequested must be walked past rather than mis-attributed.
+            three = w("three.tsv", "a\tz\tb\n1\t9\t2\nNA\t8\t30\n")
+            @test _modis_sample_cache_read(three, [:a, :b], 2)[:a] |> x -> isequal(x, [1, missing])
+            @test _modis_sample_cache_read(three, [:b, :a], 2)[:b] == [2, 30]
+            @test _modis_sample_cache_read(three, [:b], 2)[:b] == [2, 30]
+
+            # A file with no trailing newline is still complete.
+            @test _modis_sample_cache_read(w("nonl.tsv", "a\tb\n1\t2\n3\t4"), [:a], 2)[:a] == [1, 3]
+
+            # Rejected, not partially trusted: absent, empty, header-only, wrong row count in
+            # either direction, and a layer set that does not match.
+            @test _modis_sample_cache_read(joinpath(dir, "absent.tsv"), [:a], 2) === nothing
+            @test _modis_sample_cache_read(w("empty.tsv", ""), [:a], 2) === nothing
+            @test _modis_sample_cache_read(w("hdr.tsv", "a\tb\n"), [:a], 2) === nothing
+            @test _modis_sample_cache_read(w("few.tsv", "a\tb\n1\t2\n"), [:a], 2) === nothing
+            @test _modis_sample_cache_read(w("many.tsv", "a\tb\n1\t2\n3\t4\n5\t6\n"), [:a], 2) === nothing
+            @test _modis_sample_cache_read(w("ok2.tsv", "a\tb\n1\t2\n3\t4\n"), [:nope], 2) === nothing
+
+            # Corruption throws: a silently mis-parsed DN would become a plausible albedo.
+            @test_throws "sample cache is corrupt" _modis_sample_cache_read(
+                w("bad.tsv", "a\tb\n1\t2\n3\tx9\n"), [:a, :b], 2)
+            @test_throws "sample cache is corrupt" _modis_sample_cache_read(
+                w("blankfield.tsv", "a\tb\n1\t2\n3\t\n"), [:a, :b], 2)
         end
     end
 
@@ -518,6 +562,62 @@ if get(ENV, "GEMB_TEST_MODIS_ALBEDO", "") == "1"
                 2019; doy_range=(180, 182), min_samples=1, cache_path=cache,
                 verbose=false, progress=false)
             @test isequal(parent(ice2[:albedo_bsa]), parent(ice[:albedo_bsa]))
+        end
+
+        # ---- batched CMR discovery must agree with the per-tile query it replaces
+        #
+        # This is the equivalence proof for dropping the tile `bounding_box`: at 103 tiles a
+        # melt-season year is 17,613 serial per-tile queries against ~171 batched ones, so the
+        # batch path is what makes a global run start in minutes rather than hours. Safe only
+        # because the nominal-date + tile filter on the granule id was always the real filter.
+        @testset "batched granule index == per-tile query" begin
+            using GEMB_ClimateForcing: _mcd43a3_granule_index, _CMR_PAGE_SIZE
+
+            index = _mcd43a3_granule_index(date; verbose=false)
+            # A bbox-free query covers every land tile, not just one.
+            @test length(index) > 250
+            @test all(t -> 0 <= t[1] <= 35 && 0 <= t[2] <= 17, keys(index))
+            # Exactly one granule per tile survives, and every id is for the asked-for date.
+            @test all(g -> _modis_granule_date(g.id) == date, values(index))
+            @test all(kv -> _modis_granule_tile(kv[2].id) == kv[1], collect(index))
+
+            # The whole point: identical granule for tiles resolved either way.
+            for t in ((16, 2), (17, 2), (15, 3), (23, 4), (11, 3))
+                gs = _cmr_granules(; short_name=MCD43A3_SHORT_NAME, version=MCD43A3_VERSION,
+                                   temporal=_modis_cmr_temporal(date),
+                                   bounding_box=_modis_tile_bbox(t...), verbose=false)
+                m = filter(g -> _modis_granule_date(g.id) == date &&
+                                _modis_granule_tile(g.id) == t, gs)
+                if isempty(m)
+                    @test !haskey(index, t)
+                else
+                    @test haskey(index, t)
+                    @test index[t].id == only(m).id
+                    @test index[t].url == only(m).url
+                    @test index[t].bytes == only(m).bytes
+                end
+            end
+
+            # This is the first caller in the package for which CMR paging runs more than
+            # once — ~16 nominal dates x ~300 tiles is well past the 2000-hit page ceiling.
+            # A single page would mean the query was silently truncated.
+            raw = _cmr_granules(; short_name=MCD43A3_SHORT_NAME, version=MCD43A3_VERSION,
+                                temporal=_modis_cmr_temporal(date), bounding_box=nothing,
+                                verbose=false)
+            @test length(raw) > _CMR_PAGE_SIZE
+
+            # And mcd43a3_granules must reach the same files through the batch path. A tile
+            # set at or above _MODIS_CMR_BATCH_MIN selects it automatically.
+            mktempdir() do cache
+                tiles = [(16, 2), (17, 2), (15, 3), (16, 3), (17, 3),
+                         (15, 2), (18, 2), (18, 3)]
+                # Reusing a prepared index must make it issue no query at all.
+                paths = mcd43a3_granules(date, tiles; cache_path=cache, verbose=false,
+                                         granule_index=index, max_concurrent_downloads=4)
+                @test !isempty(paths)
+                @test all(p -> isfile(p), values(paths))
+                @test all(t -> _modis_granule_tile(basename(paths[t])) == t, keys(paths))
+            end
         end
     end
 else

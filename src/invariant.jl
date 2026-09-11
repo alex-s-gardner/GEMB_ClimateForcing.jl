@@ -62,7 +62,7 @@ _invariant_supported_models() =
 Default on-disk cache directory for a model's downloaded invariant files.
 """
 _default_invariant_cache(model::Symbol) =
-    joinpath(tempdir(), "GEMB_ClimateForcing", "invariant", string(model))
+    joinpath(_gemb_cache_root(), "invariant", string(model))
 
 """
     _download_invariant(model, parameter; cache_path, force) -> String
@@ -129,7 +129,7 @@ Two kinds of source are supported:
 - **Tiled, extent-based models** (e.g. `:copernicus_dem_30m`): a high-resolution DEM
   served as Cloud-Optimized GeoTIFF tiles. Selected with `extent`; the covering tiles
   are read over HTTP byte ranges (GDAL `/vsicurl/`) and mosaicked lazily — no full
-  tile is ever downloaded.
+  tile is downloaded unless `cache_tiles=true`.
 
 In both cases no array data is read until the returned raster is indexed, cropped, or
 `read`/`collect`ed.
@@ -155,6 +155,17 @@ In both cases no array data is read until the returned raster is indexed, croppe
 - `cache_path::Union{String,Nothing}=nothing`: directory for downloaded files / the
   DEM tile index. Defaults to a per-model folder under `tempdir()`.
 - `force_download::Bool=false`: re-download even if a cached file exists.
+- `cache_tiles::Bool=false`: (tiled models only) download each covering tile in full to
+  `cache_path/tiles/` and read from there, so later calls touch no network at all. Off by
+  default because `/vsicurl/` fetches only the bytes a crop needs, which is cheaper for a
+  one-off window — and a continental extent is thousands of tiles. Turn it on when the same
+  area is sampled repeatedly, especially across sessions: GDAL's block cache lives in the
+  process, so nothing else here persists between runs. GLO-30 tiles are 19–40 MB each.
+
+  **Requires a durable `cache_path`.** With none set the cache resolves under `tempdir()`
+  (see [`_gemb_cache_root`](@ref)) and `cache_tiles=true` throws rather than writing tiles the
+  OS will reap — set `ENV["GEMB_CACHE_PATH"]` or pass `cache_path`. Passing `true` for a
+  file-based model is likewise an error, not a no-op.
 - `verbose::Bool=true`: print progress/status messages. Set `false` to silence all
   output (useful when loading many extents in a loop).
 
@@ -210,6 +221,8 @@ function climate_model_invariant(;
     extent=nothing,
     cache_path::Union{String,Nothing}=nothing,
     force_download::Bool=false,
+    cache_tiles::Bool=false,
+    max_concurrent_downloads::Integer=4,
     verbose::Bool=true,
 )
     (haskey(_INVARIANT_REGISTRY, model) || model in _INVARIANT_EXTENT_MODELS) ||
@@ -226,9 +239,19 @@ function climate_model_invariant(;
                                 "a `parameter`; pass `extent` (or omit it for full extent)."))
         if model == :copernicus_dem_30m
             return _load_copernicus_dem_30m(extent; cache_path=cache,
-                                            force_download=force_download, verbose=verbose)
+                                            force_download=force_download,
+                                            cache_tiles=cache_tiles,
+                                            max_concurrent_downloads=max_concurrent_downloads,
+                                            verbose=verbose)
         end
     end
+
+    # Only the tiled models read from a bucket of per-tile COGs, so only they have tiles to
+    # cache. Silently ignoring the keyword on the NetCDF path would leave a caller believing
+    # they had arranged persistent caching.
+    cache_tiles && throw(ArgumentError(
+        "cache_tiles applies only to tiled models ($(join(sort(collect(_INVARIANT_EXTENT_MODELS)), ", "))); " *
+        "model $(repr(model)) already downloads its NetCDF in full to `cache_path`."))
 
     params = _INVARIANT_REGISTRY[model]
 

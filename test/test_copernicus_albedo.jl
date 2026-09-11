@@ -200,7 +200,18 @@ using GEMB_ClimateForcing: _albedo_nominal_days, _albedo_timesteps, _albedo_vali
         @test _albedo_area_tag(area) == _albedo_area_tag(copy(area))
         @test _albedo_area_tag(area) != _albedo_area_tag([68.0, -48.0, 66.5, -47.5])
 
-        @test startswith(_default_albedo_cache(), tempdir())
+        # Caches default under the repository's data/ directory, and each product gets its own
+        # subdirectory so ordered timesteps can never collide with another product's files.
+        withenv("GEMB_CACHE_PATH" => nothing) do
+            @test _default_albedo_cache() ==
+                joinpath(normpath(joinpath(pkgdir(GEMB_ClimateForcing), "data")),
+                         "satellite_albedo")
+        end
+        mktempdir() do root
+            withenv("GEMB_CACHE_PATH" => root) do
+                @test _default_albedo_cache() == joinpath(root, "satellite_albedo")
+            end
+        end
         @test _albedo_era_tag() == "sentinel_3_v3_1_300m"
     end
 

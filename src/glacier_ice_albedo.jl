@@ -168,10 +168,12 @@ Two products share this kernel, and the keywords cover both quality conventions:
   the C3S product's `QFLAG` (see [`_qflag_rejects`](@ref)).
 - `keep_values` — a **whitelist**, for a product whose quality band is a small-integer
   *class* rather than a bitfield, as MCD43A3's
-  `BRDF_Albedo_Band_Mandatory_Quality_shortwave` is (`0` = full BRDF inversion, `1` =
-  magnitude inversion, `2`–`7` = v061 detector-failure cases, `255` = fill). A whitelist is
-  the right shape there: it rejects fill *and* every unforeseen class for free, whereas a
-  reject-list has to enumerate them and silently admits any class added by a later version.
+  `BRDF_Albedo_Band_Mandatory_Quality_shortwave` is. There the class's low bit is inversion
+  quality (**even** = full BRDF inversion, **odd** = magnitude inversion) and its upper bits
+  are Band 5/6 detector health, so the eight classes are four inversion-quality pairs and
+  `255` is fill — see [`MCD43A3_QA_KEEP`](@ref). A whitelist is the right shape: it rejects
+  fill *and* every unforeseen class for free, whereas a reject-list has to enumerate them and
+  silently admits any class added by a later version.
 
 `scale` multiplies the raw value **before** the range check, for a product stored as scaled
 integers (MCD43A3 albedo is `Int16` × 0.001). `scale=1` is exact in IEEE, so the C3S path
@@ -373,19 +375,46 @@ function _accumulate_block!(vals::AbstractMatrix{Float32}, nfilled::AbstractVect
         counts[p] += Int32(1)
         nf = Int(nfilled[p])
         if nf < kmax
+            # Grow the retained set, keeping the largest at index 1.
             vals[nf + 1, p] = v
             nfilled[p] = Int32(nf + 1)
-        else
-            # Evict the largest of the retained values, if this one is smaller. kmax is
-            # tiny (2 at the defaults), so a linear scan beats any heap bookkeeping.
-            worst, worst_v = 1, vals[1, p]
-            for j in 2:kmax
-                if vals[j, p] > worst_v
-                    worst, worst_v = j, vals[j, p]
-                end
-            end
-            v < worst_v && (vals[worst, p] = v)
+            _topk_siftup!(vals, p, nf + 1)
+        elseif v < vals[1, p]
+            # Full: displace the largest retained value, then restore the ordering.
+            vals[1, p] = v
+            _topk_siftdown!(vals, p, kmax)
         end
+    end
+    return nothing
+end
+
+# The retained values are kept as a max-heap in `vals[1:nfilled, p]`, so evicting the largest is
+# O(log k) rather than the O(k) linear scan this replaces. That scan was the right call when the
+# only caller was the per-year statistic, where `kmax` is 2-9; pooling a whole record raises it
+# to 223 and made the eviction the single largest cost of a fold.
+#
+# The heap changes only the order values are stored in, never which values are retained, and
+# `_finalize_into!` sorts them before averaging — so every reported statistic is bit-identical
+# to the linear-scan version.
+@inline function _topk_siftup!(vals::AbstractMatrix{Float32}, p::Int, i::Int)
+    @inbounds while i > 1
+        parent = i >> 1
+        vals[parent, p] >= vals[i, p] && break
+        vals[parent, p], vals[i, p] = vals[i, p], vals[parent, p]
+        i = parent
+    end
+    return nothing
+end
+
+@inline function _topk_siftdown!(vals::AbstractMatrix{Float32}, p::Int, n::Int)
+    i = 1
+    @inbounds while true
+        l = 2 * i
+        l > n && break
+        j = (l < n && vals[l + 1, p] > vals[l, p]) ? l + 1 : l
+        vals[j, p] <= vals[i, p] && break
+        vals[i, p], vals[j, p] = vals[j, p], vals[i, p]
+        i = j
     end
     return nothing
 end
@@ -692,6 +721,12 @@ function _report_progress(label::AbstractString, done::Integer, total::Integer, 
     elapsed = time() - t0
     eta = done > 0 ? elapsed / done * (total - done) : NaN
     @info "$(label) $(_progress_bar(done, total))  elapsed $(_format_duration(elapsed))  eta $(_format_duration(eta))"
+    # Flushed explicitly, which is the whole point of this being a plain-text bar: these runs
+    # are `nohup`-ed for days with output redirected to a file, and Julia block-buffers a
+    # non-TTY stream, so without this the log stays *empty* for hours and the run looks hung.
+    # Measured: a 26-year global run wrote 0 bytes in its first 3.5 minutes while happily
+    # downloading 966 MB.
+    flush(stderr)
     return nothing
 end
 
