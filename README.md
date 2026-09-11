@@ -13,7 +13,7 @@ Pure Julia — no Python. Reanalysis data is read from Analysis-Ready, Cloud-Opt
 - **Invariant fields** — lazy `Raster`s for land–sea mask, geopotential/orography, vegetation/soil/lake, and a 30 m global DEM (`climate_model_invariant`).
 - **Chunk mapping** — visualize Zarr download locality before batch queries (`climate_chunk_map`).
 - **Satellite albedo** — 10-daily C3S surface albedo (Sentinel-3, 300 m) as a lazy `RasterSeries`, ordered from the CDS Retrieve API (`satellite_albedo`).
-- **Glacier bare-ice albedo** — observed bare-ice albedo per pixel-year, as the mean of each year's darkest few percent of albedo retrievals (`compute_glacier_ice_albedo`), or the same statistic at a point list from MODIS MCD43A3 500 m, in black-sky and white-sky forms (`compute_glacier_ice_albedo_modis`).
+- **Glacier bare-ice albedo** — observed bare-ice albedo as the mean of the darkest few percent of albedo retrievals: per pixel-year from C3S (`compute_glacier_ice_albedo`), the same statistic at a point list from MODIS MCD43A3 500 m in black-sky and white-sky forms (`compute_glacier_ice_albedo_modis`), or **one value per cell pooled over the whole 2000–2025 record** (`pool_ice_albedo_from_cache`), sampled at any GeoInterface point, line or polygon with `bare_ice_albedo`.
 - **Global glacier cell list** — RGI 7.0 outlines rasterized onto the native MCD43A3 500 m grid: 3.36 M cells over 274,531 glaciers and 103 MODIS tiles, vendored and offline (`rgi7_modis_cells`).
 
 ## Installation
@@ -34,6 +34,32 @@ Pkg.instantiate()   # resolves EarthData.jl from git — see the note below
 > means this package cannot be registered in General until upstream tags a release; missing
 > functionality is being contributed upstream rather than kept local. `Pkg.instantiate()`
 > fetches the pinned revision automatically — nothing extra to install.
+
+## Download caches
+
+Every product that downloads caches under one root, so a re-run reuses whatever is already on
+disk. The root is `ENV["GEMB_CACHE_PATH"]` if set, otherwise this repository's own `data/`
+directory, and each product appends its own gitignored subdirectory:
+
+```
+data/MCD43A3.061/         # MODIS granules and per-date samples
+data/satellite_albedo/    # C3S ordered timesteps
+data/invariant/<model>/   # ERA5-Land NetCDFs, Copernicus DEM tiles
+```
+
+```bash
+export GEMB_CACHE_PATH=/big/volume/gemb_cache   # to put them somewhere else
+```
+
+**These caches reach hundreds of gigabytes** — the MCD43A3 per-date sample cache alone is 184 GB
+— so set `GEMB_CACHE_PATH` if the volume holding the checkout is not sized for the product you are
+building. Avoid a home directory, which is commonly a small SSD with a quota. Nothing here writes
+to `$HOME`; the only paths derived from it are credential *reads* (`~/.cdsapirc`, `~/.netrc`,
+`~/.edl_token`). Every function also takes an explicit `cache_path` that overrides the root, and a
+`Pkg.add`-installed copy (read-only source tree) requires `GEMB_CACHE_PATH` and says so.
+
+Losing the MCD43A3 sample cache is the expensive case: it turns a ~27 minute re-fold into a ~1 TB
+re-download.
 
 ## Quick Start
 
@@ -207,12 +233,25 @@ inv = climate_model_invariant()                         # all params as a lazy R
 
 Available ERA5-Land parameters (GRIB shortName): `:lsm`, `:z`, `:cl` (lake cover), `:dl` (lake depth), `:cvl`/`:cvh` (low/high vegetation cover), `:tvl`/`:tvh` (low/high vegetation type), `:slt` (soil type), `:glm` (glacier mask). See `ERA5_LAND_INVARIANT_PARAMETERS`.
 
-The 30 m global Copernicus DEM is available via `model=:copernicus_dem_30m`, served from Cloud-Optimized GeoTIFFs with byte-range reads (tiles are never downloaded in full):
+The 30 m global Copernicus DEM is available via `model=:copernicus_dem_30m`, served from Cloud-Optimized GeoTIFFs with byte-range reads, so only the bytes a crop needs are fetched:
 
 ```julia
 dem = climate_model_invariant(model=:copernicus_dem_30m,
                               extent=Extents.Extent(X=(-38.5, -38.0), Y=(72.5, 72.8)))
+dem[X(Near(-38.2)), Y(Near(72.6))]      # point elevation, metres above the EGM2008 geoid
 ```
+
+Pass `cache_tiles=true` to download each covering tile (19–40 MB) once and read locally
+afterwards. GDAL has **no on-disk cache for `/vsicurl/`** — its block cache lives in the process —
+so without this, repeated lookups across sessions re-request the same bytes. Tiles are fetched
+concurrently (`max_concurrent_downloads=4`), and the call refuses to run if the resolved cache is
+a temp directory. Leave it off for a one-off window or a continental extent.
+
+> [!NOTE]
+> `surface_elevation(:era5land, lat, lon)` is the other elevation entry point, but it returns the
+> **reanalysis grid cell's** elevation (~9 km) from the geopotential invariant, not a point
+> elevation. In steep terrain the two differ by hundreds of metres — which is why
+> `climate_adjust_for_elevation` exists.
 
 > **Grid convention.** ERA5-Land invariants use **0–359.9°E** longitude and **descending** latitude (90→−90°N). The `X = a .. b` / `Y = a .. b` selector takes `min .. max` regardless of axis order.
 
@@ -281,7 +320,7 @@ Quality control runs per observation before any statistic is formed — missing/
 
 > **`snow_presence` is deliberately *not* rejected** by the QFLAG filter — a snow-covered timestep is a bright observation that the low percentile discards on its own, and rejecting it up front would bias the sample count instead. The v3.1 QFLAG legend is not a cloud mask at all; see `GLACIER_ICE_ALBEDO_QFLAG_REJECT`.
 
-> **Budget 30–90 minutes per cold year** (~3 CDS jobs, ordered concurrently); cached years are nearly free. Pass a durable `cache_path`, since the default is under `tempdir()` and a lost cache means reordering everything. Request the full year range in one call — looping over months by hand re-serialises the ordering and is much slower.
+> **Budget 30–90 minutes per cold year** (~3 CDS jobs, ordered concurrently); cached years are nearly free. Caches default under this repository's `data/` directory (set `GEMB_CACHE_PATH` to move them); a lost cache means reordering everything. Request the full year range in one call — looping over months by hand re-serialises the ordering and is much slower.
 
 See `examples/glacier_ice_albedo_example.jl` for a runnable workflow — per-year summary, the multi-year mean GEMB consumes, and a NetCDF write. It runs on `include` and leaves `run_example(years; kwargs...)` callable for other settings.
 
@@ -440,14 +479,91 @@ reduced over almost nothing. Returns a `DimStack` over `Dim{:point}` aligned wit
 > *of the annual bare-ice albedos*, weighting every year equally. That is normally what
 > "bare-ice albedo climatology" means, and it is a **different quantity** from one darkest-5 %
 > taken over all years pooled, which would be dominated by whichever years were darkest. The
-> pooled version is possible — the per-date raw samples also stay on disk under
-> `<cache_path>/samples/`, so it is a CPU re-fold rather than a re-download — but nothing here
-> computes it.
+> pooled version is what `pool_ice_albedo_from_cache` computes (see below), from the per-date raw
+> samples that stay on disk under `<cache_path>/samples/` — a CPU re-fold, not a re-download.
+
+### `pool_ice_albedo_from_cache(cells; ...)` — one value per cell, over the whole record
+
+Year-to-year MCD43A3 coverage is far too variable for an annual bare-ice albedo to be comparable:
+the fraction of glacier cells resolving in a *single* year runs from 21.6 % (2001) down to 6.5 %
+(2025) in the north, and 0.6–6.2 % in the south. Pooling every valid retrieval in the record into
+one darkest-5 % mean per cell fixes that:
+
+| | per-year | pooled |
+|---|---|---|
+| cells resolved | 6.5–21.6 % N, 0.6–6.2 % S | **95.0 % N, 72.6 % S** |
+| glaciers with a value | 30.8 % | **83.7 %** |
+| RGI 7.0 area with a value | 84.2 % | **97.5 %** |
+| area with `n_valid ≥ 30` | 61.3 % | **93.7 %** |
+
+Area-weighted global bare-ice albedo is **0.451**; the whole product is 34.7 MB for 3.36 M cells.
+
+```julia
+cells = rgi7_modis_unique_cells(rgi7_modis_cells())
+north = filter(c -> c[2] <= 8, cells)          # v <= 8 is exactly the northern hemisphere
+ice = pool_ice_albedo_from_cache(north)
+
+ice[:albedo_bsa]                  # one value per cell over 2000–2025
+ice[:n_valid_observations_bsa]    # retrievals behind it
+ice[:k_used_bsa]                  # how many of the darkest were averaged
+```
+
+**It downloads nothing.** The per-date sample cache stores raw digital numbers and the QA class
+rather than post-QC values, so `percentile`, `albedo_range` and `qa_keep` are all free to change by
+re-folding — only the date list, cell list and layer set are fixed at download time. A requested
+date that is not cached is an **error**, not a gap: a pooled statistic over an unknown subset of
+the record is not interpretable.
+
+`POOLED_ICE_ALBEDO_RANGE` is `(0.25, 1.0)`, not the per-year path's `(0.3, 1.0)` — every per-year
+file has `minimum == exactly 0.3000`, meaning that floor was clipping the dark tail it was supposed
+to bound. **No sample-count threshold is applied at all**; judge a cell by `n_valid`.
+
+> [!WARNING]
+> Region 19 (Antarctic periphery) averages **0.721** against 0.31–0.46 elsewhere: those cells
+> rarely expose bare ice even in their darkest 5 %, so that number is snow. Filtering on albedo
+> alone silently mixes the two populations.
+
+### `bare_ice_albedo(geometry, reducer = nothing; ...)` — sample it at a geometry
+
+```julia
+using GEMB_ClimateForcing, Statistics
+import GeoInterface as GI
+
+a = bare_ice_albedo(GI.Point(-29.0341, 69.9979))
+a[:albedo_bsa][1], a[:n_valid_bsa][1], a[:k_used_bsa][1]     # 0.253, 469, 24
+
+poly = GI.Polygon([GI.LinearRing([(-29.15, 69.94), (-28.91, 69.94),
+                                  (-28.91, 70.06), (-29.15, 70.06), (-29.15, 69.94)])])
+bare_ice_albedo(poly)              # DimStack over Dim{:cell}, one row per selected cell
+bare_ice_albedo(poly, median)      # NamedTuple of scalars: albedo_bsa 0.253, over 42 of 550 cells
+```
+
+Any GeoInterface geometry in **(lon, lat) degrees** — point, multipoint, line, ring, polygon or
+multipolygon. Selection is nearest-cell throughout: a point takes the cell containing it, a line
+every cell it passes through, a polygon every cell whose centre it covers (or `boundary=:touches`
+/ `:inside`). The geometry is reprojected into the MODIS sinusoidal grid and burned there, so the
+value reported for a cell is the value computed for that cell — nothing is interpolated or
+resampled.
+
+Layers are `:albedo_bsa` / `:albedo_wsa` with their `:n_valid_*` and `:k_used_*` counts, plus
+`:latitude`, `:longitude`, `:cell_id` and `:in_product`.
+
+> [!IMPORTANT]
+> `:in_product = false` means the cell is **off-glacier**, not merely cloudy — both read `NaN`.
+> RGI 7.0's glacier product **excludes the ice sheets** (region 05 is Greenland *periphery*), so
+> an interior ice-sheet point is legitimately absent rather than missing data.
+
+The first call parses a hemisphere table (~1.7 s) and memoizes it; later queries are ~0.03 ms at
+99 MiB resident per hemisphere. Albedo is **not clamped to 1** — MCD43A3's valid range reaches
+32766, and the QC range is a glaciological filter, not a physical clamp. Values are unsuitable
+as-is for GEMB's `albedo_ice`, which asserts `0.2 ≤ albedo_ice ≤ 0.6`.
 
 Regenerate the tables with `data/make_rgi7_modis_cells.jl` (offline apart from a one-off ~422 MB
 shapefile fetch); build the global albedo product with `data/run_rgi7_ice_albedo_modis.jl`
-(~1 TB of download per year — measured 745 GB north + 261 GB south — resumable) and `data/make_rgi7_ice_albedo_parquet.jl`. See
-`CLAUDE.md` item 10c for the full cost model and the reasoning behind each burn rule.
+(~1 TB of download per year — measured 745 GB north + 261 GB south — resumable), pool it with
+`data/run_rgi7_pooled_albedo.jl` (no download, ~27 min), and write GeoParquet with
+`data/make_rgi7_ice_albedo_parquet.jl`. See `CLAUDE.md` items 10c and 10d for the full cost model
+and the reasoning behind each burn rule.
 
 ## ERA5-Land Details
 

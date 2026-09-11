@@ -117,7 +117,6 @@ println("="^70)
     # real values and skips itself until data/run_rgi7_pooled_albedo.jl has been run.)
     include("test_bare_ice_albedo.jl")
 
-
     @testset "Input Validation" begin
         # Missing time_range
         @test_throws ArgumentError climate_forcing(:era5land, 72.0, -38.0)
