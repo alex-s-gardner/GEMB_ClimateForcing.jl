@@ -97,6 +97,27 @@ println("="^70)
     # EARTHDATA_TOKEN)
     include("test_modis_albedo.jl")
 
+    # Include RGI 7.0 → MCD43A3 rasterization tests (fully offline: burn-grid/cell-grid
+    # bit-identity, the smallest-wins tie-break, interior-ring exclusion against two real
+    # RGI7 outlines in test/fixtures/, the antimeridian guard, and a PROJ cross-check of the
+    # closed-form sinusoidal. The vendored-table testset skips itself until
+    # data/make_rgi7_modis_cells.jl has been run.)
+    include("test_rgi7_modis_cells.jl")
+
+    # Include the pooled (whole-record) bare-ice albedo re-fold (fully offline: the statistic
+    # against an independent brute force over a synthetic sample cache, the k_used identity,
+    # QA whitelisting, the 0.001 scale and fill rejection, and the cache-integrity errors that
+    # keep a pooled value from being computed over an unknown subset of the record).
+    include("test_pooled_ice_albedo.jl")
+
+    # Include the geometry sampler for that product (fully offline: geometry projection and
+    # trait classification, burn-target/cell-grid bit-identity, agreement with Rasters.extract
+    # where extract works, the multipoint case where it does not, cross-tile deduplication, and
+    # read/reduce against synthetic pooled tables written to a tempdir. The final testset pins
+    # real values and skips itself until data/run_rgi7_pooled_albedo.jl has been run.)
+    include("test_bare_ice_albedo.jl")
+
+
     @testset "Input Validation" begin
         # Missing time_range
         @test_throws ArgumentError climate_forcing(:era5land, 72.0, -38.0)

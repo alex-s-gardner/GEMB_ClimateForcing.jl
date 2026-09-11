@@ -14,6 +14,7 @@ Pure Julia — no Python. Reanalysis data is read from Analysis-Ready, Cloud-Opt
 - **Chunk mapping** — visualize Zarr download locality before batch queries (`climate_chunk_map`).
 - **Satellite albedo** — 10-daily C3S surface albedo (Sentinel-3, 300 m) as a lazy `RasterSeries`, ordered from the CDS Retrieve API (`satellite_albedo`).
 - **Glacier bare-ice albedo** — observed bare-ice albedo per pixel-year, as the mean of each year's darkest few percent of albedo retrievals (`compute_glacier_ice_albedo`), or the same statistic at a point list from MODIS MCD43A3 500 m, in black-sky and white-sky forms (`compute_glacier_ice_albedo_modis`).
+- **Global glacier cell list** — RGI 7.0 outlines rasterized onto the native MCD43A3 500 m grid: 3.36 M cells over 274,531 glaciers and 103 MODIS tiles, vendored and offline (`rgi7_modis_cells`).
 
 ## Installation
 
@@ -324,7 +325,21 @@ albedo_ice = [mean(filter(!isnan, collect(ice[:albedo_bsa][p, :]))) for p in 1:l
 >
 > **Pass `doy_range = :melt_season` rather than a hardcoded window.** The melt season is a different half of the year in each hemisphere, so a northern window like `(180, 220)` samples austral *midwinter* in Patagonia or Antarctica and resolves nothing. `:melt_season` reads the sign of the points' latitudes and picks `(120, 290)` or `(300, 110)`; a list straddling the equator falls back to the whole year, so split it by hemisphere and call twice. An explicit tuple with `first > last` wraps New Year, which is how the southern window is expressed — that pools the tail of one melt season with the start of the next inside a calendar year, which is acceptable for a darkest-percentile statistic. Granules are deleted after each date is folded (`keep_granules = false`, the default — *inverted* from the CDS path, where a re-order costs hours of queue latency rather than bandwidth-bound minutes), so peak disk stays at one date's tiles. Per-date sampled cell values are cached, so a re-run with the same points never re-downloads.
 
-Quality control mirrors the C3S path except in one respect: MCD43A3's quality band is a small-integer **class**, not a bitmask, so `qa_keep` is a **whitelist** (default `[0]`, full BRDF inversion; add `1` to admit magnitude inversions, which roughly doubles the sample count at high latitude). There is no per-pixel uncertainty layer and hence no `max_error`. The glaciological 0.3 `albedo_range` floor and the decision to keep bright snowy observations both transfer unchanged.
+Quality control mirrors the C3S path except in one respect: MCD43A3's quality band is a small-integer **class**, not a bitmask, so `qa_keep` is a **whitelist**. There is no per-pixel uncertainty layer and hence no `max_error`. The glaciological 0.3 `albedo_range` floor and the decision to keep bright snowy observations both transfer unchanged.
+
+The class decomposes: its **low bit is inversion quality** (even = full BRDF inversion, odd = magnitude inversion) and its **upper bits are Band 5/6 detector health** (`÷2` → 0 = both fine, 1 = Band 6 fill, 2 = Band 5 fill, 3 = both), with `255` for fill.
+
+| | inversion | Band 5 | Band 6 | | | inversion | Band 5 | Band 6 |
+|---|---|---|---|---|---|---|---|---|
+| `0` | full | ok | ok | | `4` | full | fill | ok |
+| `1` | magnitude | ok | ok | | `5` | magnitude | fill | ok |
+| `2` | full | ok | fill | | `6` | full | fill | fill |
+| `3` | magnitude | ok | fill | | `7` | magnitude | fill | fill |
+
+The default `qa_keep = [0, 2, 4, 6]` is therefore **every full BRDF inversion**: classes 2, 4 and 6 are full-quality retrievals that merely lack a shortwave-infrared *spectral* band, which does not matter for the broadband `shortwave` albedo reduced here — and Aqua's Band 6 has 15 of 20 detectors non-functional, so they are common.
+
+> [!TIP]
+> **The QA whitelist is usually the binding filter, not data quality.** Over 200 real Iceland cells in late June, class `1` (magnitude inversion) was 64–72 % of pixels against 13–14 % for class `0`. If `min_samples` is unreachable, adding the odd classes — `qa_keep = [0, 1, 2, 4, 6]`, or all of `0:7` — multiplies the usable sample several-fold. The trade is that a magnitude inversion scales an *a priori* BRDF shape to the observed magnitude, so the level stays observation-driven but the black-sky/white-sky split rests on an assumed shape.
 
 Requesting more layers costs **no extra download** — the spectral bands live in the same granules:
 
@@ -350,6 +365,89 @@ See `examples/glacier_ice_albedo_modis_example.jl` for a runnable workflow.
 | Credentials | CDS API key + licence acceptance | Earthdata Login token |
 
 Prefer MODIS for long records, per-point work, or when black-sky/white-sky are needed separately; prefer C3S for finer spatial detail over a contiguous area. The reduction statistic is identical, so the two are directly comparable.
+
+### `rgi7_modis_cells()` — every glacier on Earth, on the MODIS grid
+
+RGI 7.0 glacier outlines rasterized onto the **native** MCD43A3 500 m sinusoidal grid, vendored
+in `data/` and read with no network access. This is the point list the global bare-ice albedo
+product is evaluated at.
+
+```julia
+cells = rgi7_modis_cells()
+# RGI7ModisCells(3375423 rows over 274531 RGI 7.0 glaciers, 103 tiles, 103530 forced)
+
+north, south = rgi7_hemisphere_split(cells)          # exact: v ≤ 8 is the northern hemisphere
+pts = rgi7_modis_unique_cells(cells; index = north)  # 2,584,232 distinct cells, 63 tiles
+
+ice = compute_glacier_ice_albedo_modis(pts, 2019; doy_range = (120, 290), cell_id = false)
+
+rgi7_glacier_cells(cells, "RGI2000-v7.0-G-06-00241")  # that glacier's cell indices
+lat, lon = rgi7_modis_cell_points(cells)              # cell centres, recomputed not stored
+```
+
+| | |
+|---|---|
+| Glaciers / area | 274,531 / 706,744 km² (RGI 7.0 published totals) |
+| MODIS tiles | **103** — 63 northern, 40 southern, disjoint |
+| Distinct cells | **3,360,716** (99.4 % area closure before the forced-cell rule) |
+| Rows | 3,375,423 `(cell, glacier)` pairs |
+| Vendored size | 12 MB across two gzipped CSVs |
+
+Rasterizing *into* the product's own grid rather than warping the product onto a lat/lon grid is
+the point: resampling a single day mixes neighbouring pixels' albedo *before* the
+darkest-percentile reduction, biasing the very tail being measured.
+
+> [!IMPORTANT]
+> **Filter on `forced` before computing any aggregate.** 37.7 % of RGI 7.0 by count (but only
+> ~2 % by area) is smaller than one 0.2146 km² cell, so those glaciers are represented by the
+> single cell containing their representative point. That cell is majority *not* glacier — rock,
+> moraine and water are all darker than ice — so its bare-ice albedo is **biased low**. The flag
+> is carried through into the output product for exactly this reason.
+
+Two further consequences worth knowing:
+
+- **Rows are unique as `(cell, glacier)` pairs, not as cells.** A cell carries more than one
+  glacier only where a sub-cell glacier would otherwise have none (14,707 rows, 0.44 %) — two
+  tiny glaciers in one 463 m pixel genuinely share that pixel's albedo. Use
+  `rgi7_modis_unique_cells` for anything that *samples*, or the download is over-counted.
+- **A contested cell goes to the smaller glacier.** Otherwise a one-cell glacier would be erased
+  by a large neighbour, and since the reducer is `min` over an area rank it is commutative, so
+  the vendored file does not depend on the order the 19 regional shapefiles were read in.
+
+### `rgi7_ice_albedo_climatology(years; reduction = median, ...)`
+
+Reduce the per-year bare-ice albedo files over many years, per MODIS cell. Each of those files
+already holds one cell's *annual* darkest-percentile mean, so a climatology is a pure read — no
+download, no re-fold, no GeoParquet dependency.
+
+```julia
+clim = rgi7_ice_albedo_climatology(2001:2024)                          # median annual albedo
+clim = rgi7_ice_albedo_climatology(2001:2024; reduction = mean, min_years = 10)
+clim = rgi7_ice_albedo_climatology(2001:2024; reduction = x -> quantile(x, 0.1))
+
+clim[:albedo_bsa]     # reduced black-sky albedo per cell
+clim[:n_years_bsa]    # years each cell actually contributed
+```
+
+`reduction` is a **function handle** applied per cell to that cell's valid annual values. It
+never sees a `NaN` — unresolved cell-years are dropped first, which is what makes `:n_years`
+meaningful — and a cell with fewer than `min_years` valid years is reported `NaN` rather than
+reduced over almost nothing. Returns a `DimStack` over `Dim{:point}` aligned with
+`rgi7_modis_unique_cells`.
+
+> [!NOTE]
+> **This reduces annual statistics; it does not pool observations.** `median` gives the median
+> *of the annual bare-ice albedos*, weighting every year equally. That is normally what
+> "bare-ice albedo climatology" means, and it is a **different quantity** from one darkest-5 %
+> taken over all years pooled, which would be dominated by whichever years were darkest. The
+> pooled version is possible — the per-date raw samples also stay on disk under
+> `<cache_path>/samples/`, so it is a CPU re-fold rather than a re-download — but nothing here
+> computes it.
+
+Regenerate the tables with `data/make_rgi7_modis_cells.jl` (offline apart from a one-off ~422 MB
+shapefile fetch); build the global albedo product with `data/run_rgi7_ice_albedo_modis.jl`
+(~1 TB of download per year — measured 745 GB north + 261 GB south — resumable) and `data/make_rgi7_ice_albedo_parquet.jl`. See
+`CLAUDE.md` item 10c for the full cost model and the reasoning behind each burn rule.
 
 ## ERA5-Land Details
 

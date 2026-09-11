@@ -83,6 +83,75 @@ GDAL `/vsicurl/` source string for a tile, so GDAL reads it via HTTP byte ranges
 _copernicus_dem_vsicurl(id::AbstractString) = "/vsicurl/" * _copernicus_dem_tile_url(id)
 
 """
+    _copernicus_dem_tile_dir(cache_path) -> String
+
+Where cached tiles live: a `tiles/` subdirectory, kept apart from `tileList.txt` and the
+generated `.vrt` files so a tile sweep never has to pattern-match around them.
+"""
+_copernicus_dem_tile_dir(cache_path::AbstractString) = joinpath(cache_path, "tiles")
+
+"""
+    _copernicus_dem_remote_size(url) -> Union{Int,Nothing}
+
+`Content-Length` for `url`, or `nothing` if the server does not report one.
+
+Used only to detect a truncated download. A partial GeoTIFF is the failure mode worth guarding:
+GDAL reports it as an unrelated parse error, and once written it would be treated as cached and
+reused on every later call.
+"""
+function _copernicus_dem_remote_size(url::AbstractString)
+    try
+        r = Downloads.request(url; method = "HEAD", throw = false)
+        r isa Downloads.Response || return nothing
+        for (k, v) in r.headers
+            lowercase(k) == "content-length" && return tryparse(Int, strip(v))
+        end
+    catch
+        return nothing
+    end
+    return nothing
+end
+
+"""
+    _copernicus_dem_cache_tile(id; cache_path, force, verbose) -> String
+
+Local path of tile `id`, downloading it once if absent.
+
+This is what makes caching *persistent*. GDAL has no on-disk cache for `/vsicurl/` — its block
+cache lives in the process — so repeated point lookups across sessions otherwise re-issue HTTP
+range requests for the same bytes. Fetching the whole tile trades one 19–40 MB download for
+unlimited local reads.
+
+Downloads to `.part` and renames, so an interrupted fetch cannot leave a short file that later
+runs would trust; the length is checked against `Content-Length` when the server reports one.
+"""
+function _copernicus_dem_cache_tile(id::AbstractString; cache_path::AbstractString,
+                                    force::Bool = false, verbose::Bool = true)
+    dir = _copernicus_dem_tile_dir(cache_path)
+    mkpath(dir)
+    local_path = joinpath(dir, id * ".tif")
+    (!force && isfile(local_path)) && return local_path
+
+    url = _copernicus_dem_tile_url(id)
+    expected = _copernicus_dem_remote_size(url)
+    verbose && @info "Downloading Copernicus DEM tile" id size_MB = isnothing(expected) ?
+        missing : round(expected / 1e6; digits = 1)
+    tmp = local_path * ".part"
+    try
+        Downloads.download(url, tmp)
+        got = filesize(tmp)
+        if !isnothing(expected) && got != expected
+            error("truncated download: got $(got) bytes, expected $(expected)")
+        end
+        mv(tmp, local_path; force = true)
+    catch e
+        isfile(tmp) && rm(tmp; force = true)
+        error("Failed to download Copernicus DEM tile $(id) from $(url):\n$(e)")
+    end
+    return local_path
+end
+
+"""
     _copernicus_dem_tile_index(; cache_path, force) -> Set{String}
 
 Download the published `tileList.txt` once (cached under `cache_path`), and return the
@@ -198,7 +267,10 @@ are upsampled by GDAL on read (nearest), which reproduces direct tile reads exac
 Uncovered cells (absent ocean tiles) read as 0, matching the dataset's "height 0 over
 ocean" convention. Sources are `/vsicurl/` URLs, so reads confine to HTTP byte ranges.
 """
-function _copernicus_dem_write_vrt(ids::Vector{String}, path::String)
+function _copernicus_dem_write_vrt(ids::Vector{String}, path::String,
+                                   sources::Vector{String} = _copernicus_dem_vsicurl.(ids))
+    length(sources) == length(ids) || throw(DimensionMismatch(
+        "got $(length(sources)) sources for $(length(ids)) tiles"))
     corners = _copernicus_dem_parse_corner.(ids)
     west  = minimum(c[2] for c in corners)          # min SW-corner longitude
     east  = maximum(c[2] for c in corners) + 1       # max tile east edge
@@ -216,9 +288,8 @@ function _copernicus_dem_write_vrt(ids::Vector{String}, path::String)
         println(io, "  <SRS>EPSG:4326</SRS>")
         println(io, "  <GeoTransform>$(float(west)), $dx, 0, $(float(north)), 0, $dy</GeoTransform>")
         println(io, """  <VRTRasterBand dataType="Float32" band="1">""")
-        for (id, (lat_sw, lon_sw)) in zip(ids, corners)
+        for (src, (lat_sw, lon_sw)) in zip(sources, corners)
             nc = _copernicus_dem_ncols(lat_sw)
-            src = _copernicus_dem_vsicurl(id)
             dxoff = (lon_sw - west) * cols
             dyoff = (north - (lat_sw + 1)) * _COPERNICUS_DEM_ROWS
             println(io, "    <ComplexSource>")
@@ -247,7 +318,8 @@ tiles are opened** to build it — so even the global default is cheap to constr
 single covering tile is opened directly at native resolution. Reads go through GDAL
 `/vsicurl/`, so nothing is fetched until the raster is indexed/cropped/`read`.
 """
-function _load_copernicus_dem_30m(extent; cache_path::String, force_download::Bool, verbose::Bool=true)
+function _load_copernicus_dem_30m(extent; cache_path::String, force_download::Bool,
+                                  cache_tiles::Bool=false, verbose::Bool=true)
     _configure_gdal_http()
     index = _copernicus_dem_tile_index(; cache_path=cache_path, force=force_download, verbose=verbose)
 
@@ -262,14 +334,41 @@ function _load_copernicus_dem_30m(extent; cache_path::String, force_download::Bo
         verbose && @info "Copernicus DEM: $(length(ids)) tile(s) cover the requested extent"
     end
 
-    if length(ids) == 1
-        raster = Raster(_copernicus_dem_vsicurl(ids[1]); lazy=true)
+    # `cache_tiles` fetches each covering tile in full and points the sources at local files,
+    # so subsequent reads — in this session or any later one — touch no network. Off by default:
+    # the /vsicurl/ path reads only the bytes it needs, which is the cheaper choice for a
+    # one-off crop and the only tractable one for a continental extent.
+    #
+    # Asking for a persistent cache while the location is a temp directory is refused rather
+    # than honored: the tiles would be written, reported as cached, and then reaped, so the
+    # caller would pay the download repeatedly while believing they had paid it once.
+    if cache_tiles && startswith(abspath(cache_path), abspath(tempdir()))
+        throw(ArgumentError(
+            "cache_tiles=true needs a cache location that survives the OS clearing " *
+            "$(tempdir()), but cache_path resolves to $(cache_path). Set " *
+            "ENV[\"GEMB_CACHE_PATH\"] to a bulk-storage volume (not a home directory, which " *
+            "is commonly a small SSD with a quota), or pass `cache_path` explicitly. Leave " *
+            "cache_tiles=false to read over /vsicurl/ without caching anything."))
+    end
+    if cache_tiles
+        isempty(ids) || verbose && @info "Copernicus DEM: caching $(length(ids)) tile(s) locally" dir=_copernicus_dem_tile_dir(cache_path)
+        sources = [_copernicus_dem_cache_tile(id; cache_path=cache_path,
+                                              force=force_download, verbose=verbose)
+                   for id in ids]
     else
-        # Analytical VRT (no tile opens) referencing the /vsicurl/ sources. Unlike
-        # `Rasters.mosaic`, this stays lazy and never materializes the inputs.
+        sources = _copernicus_dem_vsicurl.(ids)
+    end
+
+    if length(ids) == 1
+        raster = Raster(sources[1]; lazy=true)
+    else
+        # Analytical VRT (no tile opens) referencing the sources. Unlike `Rasters.mosaic`, this
+        # stays lazy and never materializes the inputs. The mode is part of the filename because
+        # the same tile set yields different VRT content local vs remote.
         mkpath(cache_path)
-        vrt_path = joinpath(cache_path, "cop30_" * string(hash(ids); base=16) * ".vrt")
-        _copernicus_dem_write_vrt(ids, vrt_path)
+        tag = cache_tiles ? "local" : "vsicurl"
+        vrt_path = joinpath(cache_path, "cop30_$(tag)_" * string(hash(ids); base=16) * ".vrt")
+        _copernicus_dem_write_vrt(ids, vrt_path, sources)
         raster = Raster(vrt_path; lazy=true)
     end
 
@@ -280,6 +379,7 @@ function _load_copernicus_dem_30m(extent; cache_path::String, force_download::Bo
         "base_url"      => _COPERNICUS_DEM_30M_BASE,
         "resolution_m"  => 30,
         "n_tiles"       => length(ids),
+        "cached_tiles"  => cache_tiles,
         "extent"        => (X=(xmin, xmax), Y=(ymin, ymax)),
         "units"         => "m",
         "long_name"     => "surface elevation above EGM2008 geoid",

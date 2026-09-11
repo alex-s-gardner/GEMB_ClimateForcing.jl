@@ -19,7 +19,9 @@ using DimensionalData
 using GEMB_ClimateForcing: _copernicus_dem_tile_id, _copernicus_dem_tile_url,
     _copernicus_dem_vsicurl, _copernicus_dem_extent, _copernicus_dem_tiles_for_extent,
     _copernicus_dem_ncols, _copernicus_dem_parse_corner, _copernicus_dem_write_vrt,
-    _INVARIANT_EXTENT_MODELS, _COPERNICUS_DEM_30M_BASE
+    _INVARIANT_EXTENT_MODELS, _COPERNICUS_DEM_30M_BASE, _gemb_cache_root,
+    _copernicus_dem_tile_dir, _copernicus_dem_cache_tile, _default_invariant_cache,
+    _default_modis_cache, _default_albedo_cache
 
 @testset "Copernicus GLO-30 DEM" begin
 
@@ -79,6 +81,80 @@ using GEMB_ClimateForcing: _copernicus_dem_tile_id, _copernicus_dem_tile_url,
         @test occursin("""<DstRect xOff="0" yOff="0" xSize="3600" ySize="3600"/>""", xml)
         @test occursin("/vsicurl/", xml)
         rm(path; force=true)
+
+        # Explicit local sources: the same geometry, but nothing pointing at the network.
+        # This is what `cache_tiles=true` produces, and a stray `/vsicurl/` here would mean a
+        # "cached" mosaic still issued HTTP reads.
+        local_path = tempname() * ".vrt"
+        srcs = ["/somewhere/a.tif", "/somewhere/b.tif"]
+        _copernicus_dem_write_vrt(ids, local_path, srcs)
+        lxml = read(local_path, String)
+        @test !occursin("/vsicurl/", lxml)
+        @test occursin("<SourceFilename relativeToVRT=\"0\">/somewhere/a.tif</SourceFilename>", lxml)
+        # Geometry must be independent of where the sources live.
+        @test occursin("""rasterXSize="3600" rasterYSize="7200\"""", lxml)
+        @test occursin("<GeoTransform>-123.0, ", lxml)
+        # A source list that does not line up with the tiles is a bug, not something to
+        # silently truncate — the mosaic would place the wrong tile at the wrong offset.
+        @test_throws DimensionMismatch _copernicus_dem_write_vrt(ids, tempname() * ".vrt",
+                                                                 ["only-one"])
+        rm(local_path; force=true)
+    end
+
+    @testset "Persistent tile cache: layout and defaults (offline)" begin
+        # Unset, every product caches under the repository's own data/ directory, beside the
+        # vendored tables and the derived products — which is what lets the driver scripts run
+        # with no environment configured.
+        repo_data = normpath(joinpath(pkgdir(GEMB_ClimateForcing), "data"))
+        withenv("GEMB_CACHE_PATH" => nothing) do
+            @test _gemb_cache_root() == repo_data
+            @test _default_invariant_cache(:copernicus_dem_30m) ==
+                joinpath(repo_data, "invariant", "copernicus_dem_30m")
+            @test _default_modis_cache() == joinpath(repo_data, "MCD43A3.061")
+            @test _default_albedo_cache() == joinpath(repo_data, "satellite_albedo")
+            # Caches must be gitignored; the products beside them must not be.
+            @test !isempty(read(joinpath(pkgdir(GEMB_ClimateForcing), ".gitignore"), String))
+        end
+        mktempdir() do root
+            withenv("GEMB_CACHE_PATH" => root) do
+                # Read at call time, so setting it mid-session takes effect.
+                @test _gemb_cache_root() == root
+                @test _default_invariant_cache(:copernicus_dem_30m) ==
+                    joinpath(root, "invariant", "copernicus_dem_30m")
+                @test _default_invariant_cache(:era5_land) ==
+                    joinpath(root, "invariant", "era5_land")
+                @test _default_modis_cache() == joinpath(root, "MCD43A3.061")
+                @test _default_albedo_cache() == joinpath(root, "satellite_albedo")
+                # Distinct products never collide under one root.
+                paths = [_default_modis_cache(), _default_albedo_cache(),
+                         _default_invariant_cache(:era5_land),
+                         _default_invariant_cache(:copernicus_dem_30m)]
+                @test length(unique(paths)) == length(paths)
+            end
+        end
+        # Tiles live apart from tileList.txt and the generated .vrt files.
+        @test _copernicus_dem_tile_dir("/a/b") == joinpath("/a", "b", "tiles")
+
+        # Asking for a persistent cache while the location is a temp directory must fail, not
+        # write tiles the OS will clear — the caller would re-pay the download while believing
+        # it was cached. (The default is durable, so this needs the variable pointed at tmp.)
+        mktempdir() do tmproot
+            withenv("GEMB_CACHE_PATH" => joinpath(tempdir(), basename(tmproot))) do
+                @test_throws "needs a cache location that survives" climate_model_invariant(
+                    model=:copernicus_dem_30m, extent=Extent(X=(-51.0, -50.9), Y=(66.5, 66.6)),
+                    cache_tiles=true, verbose=false)
+            end
+        end
+
+        # A present tile is reused without touching the network, which is the whole point.
+        mktempdir() do dir
+            id = "Copernicus_DSM_COG_10_N67_00_W051_00_DEM"
+            mkpath(_copernicus_dem_tile_dir(dir))
+            fake = joinpath(_copernicus_dem_tile_dir(dir), id * ".tif")
+            write(fake, "not really a geotiff")
+            @test _copernicus_dem_cache_tile(id; cache_path=dir, verbose=false) == fake
+            @test read(fake, String) == "not really a geotiff"   # untouched
+        end
     end
 
     @testset "Extent normalization" begin
@@ -113,6 +189,10 @@ using GEMB_ClimateForcing: _copernicus_dem_tile_id, _copernicus_dem_tile_url,
         # DEM is extent-based and does not take a `parameter`.
         @test_throws ArgumentError climate_model_invariant(model=:copernicus_dem_30m,
                                         parameter=:z, extent=Extent(X=(0,1), Y=(0,1)))
+        # `cache_tiles` has no meaning for a file-based model, and silently ignoring it would
+        # leave the caller believing they had arranged persistent caching.
+        @test_throws "cache_tiles applies only to tiled models" climate_model_invariant(
+            model=:era5_land, parameter=:z, cache_tiles=true)
     end
 
     # ------------------------------------------------------------------

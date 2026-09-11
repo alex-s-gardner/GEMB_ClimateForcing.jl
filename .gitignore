@@ -52,3 +52,27 @@ test/.golden_forcing.jls
 
 # Generated example outputs (NetCDF data products)
 examples/output/
+
+# RGI 7.0 source shapefiles, fetched by data/make_rgi7_modis_cells.jl (~422 MB of tarballs
+# plus their extracted contents). The *derived* tables — data/rgi7_modis_cells.csv.gz and
+# data/rgi7_glaciers.csv.gz, 12 MB together — ARE committed; this is only the input.
+data/rgi7_source/
+
+# Global bare-ice albedo run products: ~1.2 TB of download per year condensed into ~30 MB of
+# intermediates and a ~71 MB GeoParquet. Regenerable (slowly) and far too large for git, so
+# only the generators are tracked.
+data/rgi7_ice_albedo_modis_*.csv.gz
+# The pooled product: 34.7 MB, regenerated from the sample cache by
+# data/run_rgi7_pooled_albedo.jl in ~27 minutes with no download.
+data/rgi7_ice_albedo_pooled_*.csv.gz
+data/rgi7_glacier_ice_albedo_modis*.parquet
+
+# Download caches. `_gemb_cache_root()` defaults to this directory, so every product's cache
+# lands here beside the vendored tables and the derived products. These are re-derivable bulk —
+# the MCD43A3 per-date samples alone reach 184 GB — and are never committed. Set
+# GEMB_CACHE_PATH to move them off the checkout's volume.
+# No trailing slash: the cache may be a symlink to bulk storage on another volume, and a
+# `dir/` pattern matches only real directories.
+data/MCD43A3.061
+data/satellite_albedo
+data/invariant

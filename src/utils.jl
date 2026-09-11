@@ -204,3 +204,63 @@ end
 # wrap: 540 → 180, −190 → 170). Used by the geoid grid and the glacier lookup table,
 # both of which are −180…180 while the ERA5-Land grids are 0–360.
 _wrap_longitude(lon::Real) = mod(lon + 180.0, 360.0) - 180.0
+
+"""
+    _gemb_cache_root() -> String
+
+Root directory under which every product caches its downloads.
+
+`ENV["GEMB_CACHE_PATH"]` if set, else the repository's own `data/` directory. Each product
+appends its own subdirectory, so one setting moves all of them together:
+
+    data/MCD43A3.061/         # MODIS granules and per-date samples
+    data/satellite_albedo/    # C3S ordered timesteps
+    data/invariant/<model>/   # ERA5-Land NetCDFs, Copernicus DEM tiles
+
+    export GEMB_CACHE_PATH=/big/volume/gemb_cache   # to put them elsewhere
+
+Defaulting beside the vendored tables and the derived products keeps everything for one
+checkout in one place, which is what makes the driver scripts work with no environment set.
+The cache subdirectories are gitignored; they are re-derivable bulk, unlike the products next
+to them.
+
+**These caches reach hundreds of gigabytes** — the MCD43A3 per-date samples alone are 184 GB —
+so the volume holding the checkout has to be sized for it. Point `GEMB_CACHE_PATH` at bulk
+storage if it is not. Avoid a home directory, which is commonly a small SSD with a quota;
+nothing here writes to `\$HOME`, and the only paths derived from it are credential *reads*
+(`~/.cdsapirc`, `~/.netrc`, `~/.edl_token`).
+
+A package installed by `Pkg.add` has a read-only source tree, so the default is unusable there
+and this throws rather than failing later inside a download. That is deliberate: the message
+names the variable to set, whereas a silent fall back to `tempdir()` would put 184 GB somewhere
+the OS reaps and turn a ~30 minute re-fold into a ~1 TB re-download.
+
+Read at call time, not cached in a constant, so setting the variable inside a session takes
+effect. Every function still takes an explicit `cache_path` that overrides this, and the
+`data/` driver scripts keep their own `RGI7_*` variables for per-run overrides.
+"""
+function _gemb_cache_root()
+    haskey(ENV, "GEMB_CACHE_PATH") && return ENV["GEMB_CACHE_PATH"]
+    dir = normpath(joinpath(@__DIR__, "..", "data"))
+    (isdir(dir) && _is_writable_dir(dir)) || throw(ErrorException(
+        "the default cache location $(dir) is not a writable directory — which is normal for " *
+        "a package installed by `Pkg.add`, whose source tree is read only. Set " *
+        "ENV[\"GEMB_CACHE_PATH\"] to a writable volume with room for the product you are " *
+        "using (the MCD43A3 sample cache alone reaches 184 GB), or pass `cache_path` " *
+        "explicitly."))
+    return dir
+end
+
+# Probe by creating and removing a file rather than reading the mode bits: the directory may sit
+# on a read-only mount, or be owned by another user, and neither shows up as a permission bit
+# the current process can usefully interpret.
+function _is_writable_dir(dir::AbstractString)
+    probe = joinpath(dir, ".gemb_write_probe")
+    try
+        touch(probe)
+        rm(probe; force = true)
+        return true
+    catch
+        return false
+    end
+end

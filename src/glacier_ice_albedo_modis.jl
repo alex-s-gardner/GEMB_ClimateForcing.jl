@@ -37,9 +37,36 @@ import SHA   # short stable key for the point set, so a cached sample cannot be 
 # 5 % of ten observations is noise.
 const _MODIS_ICE_MIN_SAMPLES = 30
 
-# MCD43A3 mandatory-quality classes accepted by default. `0` is a full BRDF inversion; `1`
-# (magnitude inversion) is a genuinely weaker retrieval and is opt-in.
-const MCD43A3_QA_KEEP = [0]
+"""
+    MCD43A3_QA_KEEP
+
+`BRDF_Albedo_Band_Mandatory_Quality_*` classes accepted by default: **every full BRDF
+inversion**, i.e. `[0, 2, 4, 6]`.
+
+The QA value decomposes (its `units` are literally `"concatenated flags"`): the **low bit is
+inversion quality** — even = full BRDF inversion, odd = magnitude inversion — and the **upper
+bits are detector health**, `÷2` giving 0 = Bands 5 and 6 both fine, 1 = Band 6 fill, 2 =
+Band 5 fill, 3 = both fill, where "fill" means non-functional or noisy detectors.
+
+So `2`, `4` and `6` are **not degraded retrievals**: they are full BRDF inversions that merely
+lack a shortwave-infrared *spectral* band. For the broadband `shortwave` albedo this workflow
+reduces, that is largely irrelevant — and it is common rather than exotic, since Aqua's Band 6
+has 15 of 20 detectors non-functional. A bare `[0]` therefore discards good data; it was the
+default here until the granule's own `Description` attribute was read.
+
+Odd classes (magnitude inversions) stay opt-in. A magnitude inversion has too few or too
+poorly distributed cloud-free looks to fit the three RossThick–LiSparse kernel weights, so it
+scales an *a priori* BRDF shape to the observed reflectance magnitude: the level is still
+observation-driven but the angular shape is assumed, which is what the black-sky/white-sky
+split depends on. They dominate at high latitude — measured over 200 Iceland cells in late
+June, class `1` alone was 64–72 % of pixels against 13–14 % for class `0` — so `qa_keep=[0, 1,
+2, 4, 6]` can multiply the sample several-fold if `min_samples` is otherwise unreachable.
+
+`255` is `_FillValue` and is never accepted; it is excluded by this whitelist rather than by
+`albedo_range`, which is why a whitelist is the right shape here (a reject-list would also
+have to enumerate every class a future version adds).
+"""
+const MCD43A3_QA_KEEP = [0, 2, 4, 6]
 
 """
     _modis_dedup_points(lat, lon) -> (cells, cell_of_point)
@@ -235,25 +262,90 @@ function _modis_sample_cache_write(path::AbstractString, layers::Vector{Symbol},
     return path
 end
 
+"""
+    _modis_sample_field(buf, i, stop, path, row) -> (Union{Missing,Int}, next_i)
+
+Parse one tab-delimited field of a sample-cache row from raw bytes, returning it and the
+position after the delimiter. `"NA"` becomes `missing`.
+
+A non-digit byte throws rather than being skipped: a silently mis-parsed DN would become a
+plausible albedo, and the cache is trusted on every later run.
+"""
+@inline function _modis_sample_field(buf::Vector{UInt8}, i::Int, stop::Int,
+                                     path::AbstractString, row::Int)
+    if i <= stop && buf[i] == UInt8('N')          # "NA"
+        while i <= stop && buf[i] != UInt8('\t')
+            i += 1
+        end
+        return missing, i + 1
+    end
+    neg = false
+    if i <= stop && buf[i] == UInt8('-')
+        neg = true
+        i += 1
+    end
+    v = 0
+    ndigit = 0
+    while i <= stop
+        c = buf[i]
+        c == UInt8('\t') && break
+        (UInt8('0') <= c <= UInt8('9')) || error(
+            "$(path) row $(row): unexpected byte '$(Char(c))' in a numeric field; the sample " *
+            "cache is corrupt. Delete the file and re-run to re-download that date.")
+        v = 10 * v + Int(c - 0x30)
+        ndigit += 1
+        i += 1
+    end
+    ndigit == 0 && error("$(path) row $(row): empty numeric field; the sample cache is corrupt.")
+    return (neg ? -v : v), i + 1
+end
+
+# Read from one whole byte buffer rather than with `readlines` + `split` + `parse`. A global
+# hemisphere-year is 2.58 M cells, so the line-based form allocated a `String` per cell and a
+# `Vector` of `SubString`s per cell on top: it measured 4.15 s for one northern date against
+# 0.14 s here, bit-identically — 29× on the north, 38× on the south. That is the whole cost of
+# re-deriving the annual statistic from cache, which is otherwise ~7 h for 2000–2025 and
+# ~26 min with this.
 function _modis_sample_cache_read(path::AbstractString, layers::Vector{Symbol}, ncell::Int)
     isfile(path) || return nothing
-    lines = readlines(path)
-    isempty(lines) && return nothing
-    header = Symbol.(split(lines[1], '\t'))
+    buf = read(path)
+    isempty(buf) && return nothing
+    eol = findfirst(isequal(UInt8('\n')), buf)
+    isnothing(eol) && return nothing
+    header = Symbol.(split(String(@view buf[1:eol-1]), '\t'))
     # A cached file written for a different layer set (or a different cell count) is
     # ignored, not partially trusted — mixing the two would sample the wrong layer.
     issubset(layers, header) || return nothing
-    length(lines) == ncell + 1 || return nothing
+
     out = Dict{Symbol,Vector{Union{Missing,Int}}}(
         l => Vector{Union{Missing,Int}}(missing, ncell) for l in layers)
-    cols = Dict(l => findfirst(==(l), header) for l in layers)
-    for i in 1:ncell
-        fields = split(lines[i + 1], '\t')
-        for l in layers
-            f = fields[cols[l]]
-            out[l][i] = f == "NA" ? missing : parse(Int, f)
-        end
+    # `layers` may be a subset of `header`, in any order, so every column is walked and only
+    # the wanted ones are stored. `dest[c] == 0` means column `c` is present but not requested.
+    ncol = length(header)
+    dest = zeros(Int, ncol)
+    for (li, l) in enumerate(layers)
+        dest[findfirst(==(l), header)] = li
     end
+    vecs = [out[l] for l in layers]
+
+    n = length(buf)
+    i = eol + 1
+    row = 0
+    while i <= n
+        e = something(findnext(isequal(UInt8('\n')), buf, i), n + 1)
+        e == i && break                            # trailing blank line
+        row += 1
+        row > ncell && return nothing               # more rows than cells: stale file
+        j = i
+        stop = e - 1
+        for c in 1:ncol
+            val, j = _modis_sample_field(buf, j, stop, path, row)
+            k = dest[c]
+            k == 0 || (vecs[k][row] = val)
+        end
+        i = e + 1
+    end
+    row == ncell || return nothing
     return out
 end
 
@@ -309,10 +401,20 @@ e.g. `:Albedo_BSA_vis` → `:albedo_bsa_vis` and `:n_valid_observations_bsa_vis`
 
 # Keywords — quality control
 - `qa_keep = $(MCD43A3_QA_KEEP)`: accepted `BRDF_Albedo_Band_Mandatory_Quality_*` classes,
-  as a **whitelist**. `0` is a full BRDF inversion; add `1` to admit magnitude inversions
-  (weaker, but they roughly double the sample count at high latitude). Classes `2`–`7` are
-  v061 Terra detector-failure cases and `255` is fill; a whitelist rejects those *and* any
-  class a later product version adds, which a reject-list cannot.
+  as a **whitelist**. The default is *every full BRDF inversion*: the QA value's low bit is
+  inversion quality (even = full, odd = magnitude) and its upper bits are Band 5/6 detector
+  health, so `2`, `4` and `6` are full-quality inversions merely missing a shortwave-infrared
+  spectral band — irrelevant to the broadband `shortwave` layer reduced here. See
+  [`MCD43A3_QA_KEEP`](@ref) for the full table.
+
+  Add the odd classes to admit magnitude inversions, which assume an *a priori* BRDF shape and
+  scale it to the observed magnitude. They dominate at high latitude — measured over 200
+  Iceland cells in late June, class `1` was 64–72 % of pixels against 13–14 % for class `0` —
+  so `qa_keep=[0, 1, 2, 4, 6]` can multiply the usable sample several-fold when `min_samples`
+  is otherwise unreachable, at the cost of a less trustworthy black-sky/white-sky split.
+
+  `255` is fill; a whitelist rejects it *and* any class a later product version adds, which a
+  reject-list cannot.
 
   Note there is no `max_error` equivalent: MCD43A3 carries no per-pixel uncertainty layer,
   and its snow flags live in a separate granule (MCD43A2) that is out of scope. Bright,
@@ -351,6 +453,12 @@ e.g. `:Albedo_BSA_vis` → `:albedo_bsa_vis` and `:n_valid_observations_bsa_vis`
 - `max_concurrent_downloads = 4`: parallel granule downloads. Bandwidth-bound, so there is
   no queue limiter to trip and no submission stagger — unlike the CDS path.
 - `download_timeout = 3600`: seconds per granule.
+- `dedup = true`: deduplicate the points to unique cells. Set `false` only when the points
+  are already distinct cell centres — it skips a `Dict{NTuple{4,Int},Int}` that costs ~350 MB
+  at 3.4M cells. The cells method sets it for you; prefer that over passing this by hand.
+- `cell_id = true`: include the `:cell_id` layer. It is exactly derivable from
+  `(h, v, row, col)`, and at 3.4M points those are ~200 MB of individual `String`s and the
+  call's dominant allocation, so a global run should pass `false`.
 - `progress = true`, `verbose = true`: plain-text progress bar / info logging.
 
 # Examples
@@ -362,9 +470,11 @@ ice = compute_glacier_ice_albedo_modis(lat, lon, 2019:2020; doy_range=(150, 260)
 ice[:albedo_bsa]                       # 2 × 2 (point × year)
 ice[:cell_id]                          # which 500 m cell each point sampled
 
-# Darkened ice, and admitting magnitude inversions to double the sample count.
+# Darkened ice, and admitting magnitude inversions (the odd QA classes) for a much larger
+# sample where cloud leaves too few full inversions.
 ice = compute_glacier_ice_albedo_modis(lat, lon, 2019;
-                                       albedo_range=(0.15, 1.0), qa_keep=[0, 1])
+                                       albedo_range=(0.15, 1.0),
+                                       qa_keep=[0, 1, 2, 3, 4, 5, 6, 7])
 ```
 
 # See Also
@@ -387,6 +497,7 @@ function compute_glacier_ice_albedo_modis(lat::AbstractVector{<:Real},
                                           force_download::Bool=false,
                                           max_concurrent_downloads::Integer=4,
                                           download_timeout::Real=3600,
+                                          dedup::Bool=true, cell_id::Bool=true,
                                           progress::Bool=true, verbose::Bool=true)
     # ---- validation, all before any network or disk work
     length(lat) == length(lon) || throw(ArgumentError(
@@ -432,7 +543,8 @@ function compute_glacier_ice_albedo_modis(lat::AbstractVector{<:Real},
     isempty(unknown) || throw(ArgumentError(
         "not MCD43A3 albedo layers: $(join(unknown, ", ")). Valid: $(join(MCD43A3_LAYERS, ", "))"))
     isempty(qa_keep) && throw(ArgumentError(
-        "qa_keep is empty, so every observation would be rejected; pass at least [0]"))
+        "qa_keep is empty, so every observation would be rejected; pass at least " *
+        "MCD43A3_QA_KEEP ($(MCD43A3_QA_KEEP), every full BRDF inversion)"))
 
     dates_by_year = Dict(y => _modis_dates(y, doy_range, stride) for y in year_list)
     empty_years = [y for y in year_list if isempty(dates_by_year[y])]
@@ -445,7 +557,18 @@ function compute_glacier_ice_albedo_modis(lat::AbstractVector{<:Real},
     _configure_gdal_http()
 
     # ---- dedup: this is what makes a point list cheap
-    cells, cell_of_point = _modis_dedup_points(lat, lon)
+    #
+    # `dedup=false` says the caller's points are already distinct cell centres, so the
+    # deduplication is an identity map and only the cell lookup is needed. That skips a
+    # `Dict{NTuple{4,Int},Int}` which, at the 3.4M cells of the global RGI 7.0 list, costs
+    # ~350 MB and several seconds to rediscover a cell list the caller already had exactly.
+    # The cells method below sets it; see `rgi7_modis_unique_cells`.
+    cells, cell_of_point = if dedup
+        _modis_dedup_points(lat, lon)
+    else
+        (NTuple{4,Int}[_modis_cell(lat[i], lon[i]) for i in eachindex(lat)],
+         collect(eachindex(lat)))
+    end
     ncell = length(cells)
     npoint = length(lat)
     cells_key = _modis_cells_key(cells)
@@ -475,6 +598,10 @@ function compute_glacier_ice_albedo_modis(lat::AbstractVector{<:Real},
     total_steps = sum(length(dates_by_year[y]) for y in year_list)
     t0 = time()
     done = 0
+    # Dates whose granule downloads partly failed. Such a date is folded (the data obtained is
+    # real) but deliberately NOT cached, so a re-run retries it — and it is reported so the
+    # caller can refuse to treat the result as final. See the per-date loop below.
+    degraded = Date[]
 
     for (yi, y) in enumerate(year_list)
         dates = dates_by_year[y]
@@ -487,13 +614,32 @@ function compute_glacier_ice_albedo_modis(lat::AbstractVector{<:Real},
                 _modis_sample_cache_read(_modis_sample_cache_path(cache, cells_key, date),
                                          cache_layers, ncell)
             if isnothing(samples)
+                failed = Tuple{Int,Int}[]
                 paths = mcd43a3_granules(date, tiles; token=tok, cache_path=cache,
                                          force_download=force_download, verbose=verbose,
                                          timeout=download_timeout,
-                                         max_concurrent_downloads=max_concurrent_downloads)
+                                         max_concurrent_downloads=max_concurrent_downloads,
+                                         failed=failed)
                 samples = _modis_sample_cells(paths, cells, cell_of_tile, layer_list)
-                _modis_sample_cache_write(
-                    _modis_sample_cache_path(cache, cells_key, date), cache_layers, samples)
+                # A date is cached only when every granule that exists was actually obtained.
+                #
+                # This distinction is load-bearing, not defensive. A tile with no CMR granule
+                # is a permanent record gap and caching it as missing is correct. A tile whose
+                # *download* failed is transient — and caching that freezes an outage into the
+                # record forever, because the cache is trusted on every later run. Measured
+                # during the 2000–2025 global run: an LP DAAC DNS outage
+                # ("Could not resolve host: data.lpdaac.earthdatacloud.nasa.gov") lost all 63
+                # northern tiles of 2002-09-09, and the date was written as 2,584,232 rows of
+                # `NA`, which a resumed run would have believed.
+                if isempty(failed)
+                    _modis_sample_cache_write(
+                        _modis_sample_cache_path(cache, cells_key, date), cache_layers, samples)
+                else
+                    push!(degraded, date)
+                    @warn("$(length(failed)) of $(length(tiles)) granule downloads failed, " *
+                          "so this date is NOT cached and a re-run will retry it",
+                          date, failed_tiles = length(failed))
+                end
                 if !keep_granules
                     # NCDatasets/GDAL hold each file open until its handle is collected, so
                     # the collection must precede the removal — same reason the C3S path's
@@ -533,13 +679,81 @@ function compute_glacier_ice_albedo_modis(lat::AbstractVector{<:Real},
 
     return _modis_ice_albedo_stack(albedo, counts, layer_list, cells, cell_of_point,
                                    year_list, percentile, min_samples, albedo_range,
-                                   qa_keep, doy_range, stride)
+                                   qa_keep, doy_range, stride; cell_id=cell_id,
+                                   degraded=degraded)
 end
 
 function compute_glacier_ice_albedo_modis(points::AbstractVector{<:Tuple{<:Real,<:Real}},
                                           years=MCD43A3_YEARS; kwargs...)
     isempty(points) && throw(ArgumentError("no points supplied"))
     return compute_glacier_ice_albedo_modis(first.(points), last.(points), years; kwargs...)
+end
+
+"""
+    compute_glacier_ice_albedo_modis(cells::AbstractVector{<:NTuple{4,Integer}},
+                                     years = MCD43A3_YEARS; kwargs...) -> DimStack
+
+Same statistic, evaluated at an explicit list of **MODIS grid cells** `(h, v, row, col)`
+rather than at lon/lat points.
+
+This is the entry point for the global RGI 7.0 product: [`rgi7_modis_unique_cells`](@ref)
+already yields exactly the distinct cells to sample, so re-deriving them from coordinates is
+wasted work — at 3.4M cells the deduplication `Dict` alone costs ~350 MB. Cells are converted
+to their centres and passed through with `dedup=false`, which is exact because every vendored
+cell is verified to satisfy `_modis_cell(_modis_cell_center(cell...)...) === cell`.
+
+`cells` must be **sorted and unique**: sorted so the sample-cache key is reproducible across
+runs (`_modis_cells_key` hashes the whole list), unique so no pixel is folded into the
+accumulator twice.
+
+`doy_range = :melt_season` resolves per hemisphere from the cells' own `v`, using the exact
+`v <= 8` test rather than a computed latitude — see [`rgi7_hemisphere_split`](@ref). As with
+the point methods, a list spanning both hemispheres resolves to the whole year, so split it
+and call twice.
+
+# Example
+```julia
+t = rgi7_modis_cells()
+north, _ = rgi7_hemisphere_split(t)
+ice = compute_glacier_ice_albedo_modis(rgi7_modis_unique_cells(t; index = north), 2019;
+                                       doy_range = (120, 290), cell_id = false)
+```
+"""
+function compute_glacier_ice_albedo_modis(cells::AbstractVector{<:Tuple{Integer,Integer,
+                                                                       Integer,Integer}},
+                                          years=MCD43A3_YEARS; kwargs...)
+    isempty(cells) && throw(ArgumentError("no cells supplied"))
+    cs = NTuple{4,Int}[(Int(c[1]), Int(c[2]), Int(c[3]), Int(c[4])) for c in cells]
+
+    for c in cs
+        (0 <= c[1] <= _MODIS_H_MAX && 0 <= c[2] <= _MODIS_V_MAX) || throw(ArgumentError(
+            "cell $(c) is outside the MODIS tile grid (h 0:$(_MODIS_H_MAX), v 0:$(_MODIS_V_MAX))"))
+        (1 <= c[3] <= _MODIS_TILE_PIXELS && 1 <= c[4] <= _MODIS_TILE_PIXELS) ||
+            throw(ArgumentError("cell $(c) has a row/col outside 1:$(_MODIS_TILE_PIXELS)"))
+    end
+    issorted(cs) || throw(ArgumentError(
+        "cells must be sorted by (h, v, row, col): the sample cache is keyed on a hash of " *
+        "the whole list, so an unsorted list silently orphans a previous run's cache"))
+    allunique(cs) || throw(ArgumentError(
+        "cells must be unique; use rgi7_modis_unique_cells to collapse a table whose rows " *
+        "are (cell, glacier) pairs"))
+
+    lat = Vector{Float64}(undef, length(cs))
+    lon = Vector{Float64}(undef, length(cs))
+    for (i, c) in enumerate(cs)
+        lat[i], lon[i] = _modis_cell_center(c...)
+    end
+
+    kw = Dict{Symbol,Any}(kwargs)
+    # Resolve :melt_season from the tile row, which is exact (v <= 8 is the northern
+    # hemisphere to the bit) and needs no latitude at all.
+    if get(kw, :doy_range, nothing) === :melt_season
+        north = any(c -> c[2] <= 8, cs)
+        south = any(c -> c[2] >= 9, cs)
+        kw[:doy_range] = (north && south) ? nothing :
+            _melt_season_doy_range(north ? 1.0 : -1.0)
+    end
+    return compute_glacier_ice_albedo_modis(lat, lon, years; dedup=false, kw...)
 end
 
 """
@@ -567,7 +781,8 @@ _modis_cell_id(cell::NTuple{4,Int}) =
 
 function _modis_ice_albedo_stack(albedo, counts, layer_list, cells, cell_of_point,
                                  year_list, percentile, min_samples, albedo_range,
-                                 qa_keep, doy_range, stride)
+                                 qa_keep, doy_range, stride; cell_id::Bool=true,
+                                 degraded::Vector{Date}=Date[])
     npoint = length(cell_of_point)
     point_dim = Dim{:point}(1:npoint)
     time_dim = Ti(Date.(year_list, 1, 1))
@@ -591,8 +806,11 @@ function _modis_ice_albedo_stack(albedo, counts, layer_list, cells, cell_of_poin
     push!(data, :longitude => DimArray([s[2] for s in sampled], (point_dim,);
         metadata=Dict("units" => "degrees_east",
                       "long_name" => "longitude of the sampled MODIS cell centre")))
-    push!(data, :cell_id => DimArray([_modis_cell_id(cells[cell_of_point[p]])
-                                      for p in 1:npoint], (point_dim,);
+    # Skippable because it is exactly derivable from (h, v, row, col) and, at the 3.4M points
+    # of a global run, 3.4M individual `String`s is ~200 MB of GC-tracked objects and the
+    # dominant allocation of the whole call. The global driver passes `cell_id=false`.
+    cell_id && push!(data, :cell_id => DimArray([_modis_cell_id(cells[cell_of_point[p]])
+                                                 for p in 1:npoint], (point_dim,);
         metadata=Dict("long_name" => "MCD43A3 sinusoidal grid cell (points sharing this share their albedo)")))
 
     metadata = Dict{String,Any}(
@@ -607,6 +825,11 @@ function _modis_ice_albedo_stack(albedo, counts, layer_list, cells, cell_of_poin
         "stride" => stride,
         "years" => collect(year_list),
         "layers" => String.(layer_list),
+        # Non-empty means at least one date lost granules to a failed download rather than to a
+        # genuine record gap, so the result is incomplete and those dates were left uncached.
+        # A caller writing a durable product should refuse to mark the year final.
+        "degraded_dates" => string.(sort(degraded)),
+        "n_degraded_dates" => length(degraded),
     )
     return DimStack(NamedTuple(data); metadata=metadata)
 end

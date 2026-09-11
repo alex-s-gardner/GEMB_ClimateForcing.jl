@@ -168,10 +168,12 @@ Two products share this kernel, and the keywords cover both quality conventions:
   the C3S product's `QFLAG` (see [`_qflag_rejects`](@ref)).
 - `keep_values` — a **whitelist**, for a product whose quality band is a small-integer
   *class* rather than a bitfield, as MCD43A3's
-  `BRDF_Albedo_Band_Mandatory_Quality_shortwave` is (`0` = full BRDF inversion, `1` =
-  magnitude inversion, `2`–`7` = v061 detector-failure cases, `255` = fill). A whitelist is
-  the right shape there: it rejects fill *and* every unforeseen class for free, whereas a
-  reject-list has to enumerate them and silently admits any class added by a later version.
+  `BRDF_Albedo_Band_Mandatory_Quality_shortwave` is. There the class's low bit is inversion
+  quality (**even** = full BRDF inversion, **odd** = magnitude inversion) and its upper bits
+  are Band 5/6 detector health, so the eight classes are four inversion-quality pairs and
+  `255` is fill — see [`MCD43A3_QA_KEEP`](@ref). A whitelist is the right shape: it rejects
+  fill *and* every unforeseen class for free, whereas a reject-list has to enumerate them and
+  silently admits any class added by a later version.
 
 `scale` multiplies the raw value **before** the range check, for a product stored as scaled
 integers (MCD43A3 albedo is `Int16` × 0.001). `scale=1` is exact in IEEE, so the C3S path
@@ -692,6 +694,12 @@ function _report_progress(label::AbstractString, done::Integer, total::Integer, 
     elapsed = time() - t0
     eta = done > 0 ? elapsed / done * (total - done) : NaN
     @info "$(label) $(_progress_bar(done, total))  elapsed $(_format_duration(elapsed))  eta $(_format_duration(eta))"
+    # Flushed explicitly, which is the whole point of this being a plain-text bar: these runs
+    # are `nohup`-ed for days with output redirected to a file, and Julia block-buffers a
+    # non-TTY stream, so without this the log stays *empty* for hours and the run looks hung.
+    # Measured: a 26-year global run wrote 0 bytes in its first 3.5 minutes while happily
+    # downloading 966 MB.
+    flush(stderr)
     return nothing
 end
 

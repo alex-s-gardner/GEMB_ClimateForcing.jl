@@ -65,6 +65,16 @@ export compute_glacier_ice_albedo, GLACIER_ICE_ALBEDO_YEARS,
 export compute_glacier_ice_albedo_modis, MCD43A3_ALBEDO_LAYERS, MCD43A3_LAYERS,
     MCD43A3_YEARS, MCD43A3_QA_KEEP
 
+# Export the RGI 7.0 glacier cell list on the MCD43A3 500 m grid — the point list the
+# global bare-ice albedo product is evaluated at
+export rgi7_modis_cells, RGI7ModisCells, n_glaciers, rgi7_modis_cell_tuples,
+    rgi7_modis_unique_cells, rgi7_modis_cell_points, rgi7_glacier_cells,
+    rgi7_hemisphere_split, rgi7_ice_albedo_climatology, rgi7_ice_albedo_path
+
+# Sample that product at a GeoInterface geometry (point / line / polygon)
+export bare_ice_albedo, bare_ice_albedo_path, bare_ice_albedo_points, BARE_ICE_ALBEDO_YEARS
+export pool_ice_albedo_from_cache, POOLED_ICE_ALBEDO_RANGE
+
 # Export on-glacier temperature decoupling (Shaw et al. 2025 lookup table)
 export glacier_decoupling, glacier_decoupling_table, GlacierDecoupling,
     climate_adjust_for_glacier
@@ -95,6 +105,23 @@ include("glacier_ice_albedo.jl")
 # Must follow both glacier_ice_albedo.jl (reduction kernels, _valid_albedo) and
 # datasets/modis_albedo.jl (grid math, granule access).
 include("glacier_ice_albedo_modis.jl")
+# RGI 7.0 outlines rasterized onto the MCD43A3 500 m grid, and the vendored cell list that
+# results. Must follow datasets/modis_albedo.jl (all the tile/cell arithmetic it burns
+# against) and glacier_ice_albedo_modis.jl (which consumes the cell list, and which its
+# docstrings cross-reference).
+include("rgi7_modis_cells.jl")
+# Multi-year reduction of the per-year albedo files the RGI7 driver writes. Must follow
+# rgi7_modis_cells.jl (it aligns to that cell list) and glacier_ice_albedo_modis.jl (whose
+# annual statistic it reduces); needs `median` from Statistics, already used module-wide.
+include("rgi7_ice_albedo_climatology.jl")
+# Bare-ice albedo pooled over the whole record rather than per year, re-folded from the
+# per-date sample cache. Must follow glacier_ice_albedo_modis.jl (the accumulator, the sample
+# cache and the layer naming it reuses) and datasets/modis_albedo.jl (cell arithmetic).
+include("pooled_ice_albedo.jl")
+# Sampling the albedo product at a GeoInterface geometry. Must follow rgi7_modis_cells.jl
+# (`_rgi7_tile_dims`, the burn grid it reuses as a boolmask target) and
+# rgi7_ice_albedo_climatology.jl (`rgi7_ice_albedo_path`, `_rgi7_reduction_name`).
+include("bare_ice_albedo.jl")
 include("geoid.jl")
 include("invariant.jl")
 include("elevation_adjustment.jl")
