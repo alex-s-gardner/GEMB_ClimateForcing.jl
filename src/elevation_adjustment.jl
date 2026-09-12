@@ -347,7 +347,10 @@ For `Δz = delta_elevation` and lapse rate `Γ` (K/km):
 - `precip′ = precip·eₛ(T′)/eₛ(T)` if `precip_scaling_method=:clausius_clapeyron`,
   else unchanged
 
-`Δz = 0` reproduces the input exactly.
+`Δz = 0` reproduces the input exactly for sub-saturated input. Where the input is
+supersaturated over ice (`e > eₛ(T)`, common in cold cloudy reanalysis steps), the
+RH clamp rewrites `e′` — and hence `LW′` — even at `Δz = 0`; `T′`, `P′`, and
+precipitation remain exact identities regardless.
 
 # Example
 ```julia
@@ -419,7 +422,13 @@ function climate_adjust_for_elevation(
 
     # 3. Vapor pressure: constant relative humidity (over-ice curve below 0 °C).
     #    Using the same saturation formula to diagnose and reconstruct RH makes
-    #    Δz = 0 an exact identity. Clamp RH to (0, 1] to avoid supersaturation.
+    #    Δz = 0 an exact identity for sub-saturated input. Clamp RH to (0, 1] to
+    #    avoid supersaturation — this is deliberate (Konzelmann's ε_cs was fitted
+    #    on sub-saturated data), but it means a supersaturated input step is
+    #    rewritten to RH = 1 even at Δz = 0, so `e′` and hence `LW′` are not
+    #    identities there. Real reanalysis dewpoints do give RH > 1 over ice in
+    #    cold cloudy conditions (~16% of steps in a maritime Alaska ERA5-Land
+    #    record), where e shifts by ≲20 Pa and LW by ≲1 W m⁻².
     es_T  = saturation_vapor_pressure.(T)
     es_T′ = saturation_vapor_pressure.(T′)
     RH = @. clamp(e / es_T, 0.0, 1.0)
