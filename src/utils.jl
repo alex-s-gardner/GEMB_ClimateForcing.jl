@@ -192,6 +192,11 @@ pressure `e′`, preserving the cloud/aerosol emissivity increment diagnosed fro
 `Δε = LW/(σT⁴) − ε_cs(e, T)` is the departure of the observed irradiance from the
 Konzelmann et al. (1994) clear-sky value; holding it fixed means only the clear-sky
 response and the `σT⁴` scaling change. Exact identity when `(e′, T′) == (e, T)`.
+
+Δε is preserved *additively* (Glover 1999) and is deliberately left unclamped, so it carries
+through unchanged even where the bulk emissivity `LW/(σT⁴)` exceeds 1 — which reanalysis does
+produce under a surface inversion with a cloud base warmer than the 2 m temperature. Δε < 0
+(ε_cs over-predicting) is likewise carried as-is.
 """
 function _adjust_longwave(LW, e, T, e′, T′)
     ε_cs  = konzelmann_clear_sky_emissivity.(e, T)
