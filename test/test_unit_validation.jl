@@ -20,7 +20,8 @@ function make_test_stack(;
     wind_speed = [5.0, 6.0, 7.0],
     shortwave_downward = [200.0, 250.0, 300.0],
     longwave_downward = [300.0, 310.0, 320.0],
-    vapor_pressure = [1000.0, 1100.0, 1200.0]
+    vapor_pressure = [1000.0, 1100.0, 1200.0],
+    metadata = Dict{String,Any}()
 )
     time_dim = Ti([DateTime(2020,1,1,i) for i in 1:length(temperature_air)])
     return DimStack((
@@ -31,7 +32,7 @@ function make_test_stack(;
         shortwave_downward = DimArray(shortwave_downward, (time_dim,)),
         longwave_downward = DimArray(longwave_downward, (time_dim,)),
         vapor_pressure = DimArray(vapor_pressure, (time_dim,))
-    ))
+    ); metadata)
 end
 
 @testset "Unit Validation" begin
@@ -93,13 +94,53 @@ end
     end
 
     @testset "Longwave radiation errors" begin
-        # Longwave too low (possibly in J/m² instead of W/m²)
+        # The J/m² to W/m² conversion applied twice: ÷3600² leaves a value near zero.
         bad_lw = make_test_stack(longwave_downward=[0.1, 0.2, 0.3])
-        @test_throws ArgumentError validate_climate_forcing_units(bad_lw)
+        @test_throws "conversion was applied twice" validate_climate_forcing_units(bad_lw)
 
         # Longwave in J/m² instead of W/m² (too large)
         bad_lw2 = make_test_stack(longwave_downward=[300.0, 310.0, 320.0] .* 3600)
-        @test_throws ArgumentError validate_climate_forcing_units(bad_lw2)
+        @test_throws "expected ≤ 500 W/m²" validate_climate_forcing_units(bad_lw2)
+    end
+
+    # LW = ε·σ·T⁴, so what counts as a plausible irradiance depends on the air temperature. A fixed
+    # W/m² floor cannot express that, and gets both ends wrong.
+    @testset "Longwave is bounded through emissivity, not irradiance" begin
+        # A dry clear sky at 220 K radiating 49 W/m² is ε = 0.37 — ordinary for a polar or
+        # high-altitude record, and exactly what a 50 W/m² floor rejected.
+        cold_dry = make_test_stack(temperature_air=[220.0, 222.0, 224.0],
+                                   longwave_downward=[49.0, 52.0, 55.0],
+                                   vapor_pressure=[1.0, 2.0, 3.0])
+        @test validate_climate_forcing_units(cold_dry) == true
+
+        # The same irradiance at 290 K is ε = 0.15, below the dry clear-sky limit of the
+        # parameterization: no atmosphere is that transparent. A 50 W/m² floor accepted this.
+        warm_dark = make_test_stack(temperature_air=[288.0, 289.0, 290.0],
+                                    longwave_downward=[60.0, 61.0, 62.0])
+        @test_throws "bulk emissivity" validate_climate_forcing_units(warm_dark)
+
+        # ε above 1 is real: a surface inversion with a cloud base warmer than the 2 m temperature.
+        inversion = make_test_stack(temperature_air=[220.0, 221.0, 222.0],
+                                    longwave_downward=[160.0, 162.0, 164.0])
+        @test validate_climate_forcing_units(inversion) == true
+    end
+
+    # The ceiling detects metres read as kg/m², a factor of 1000. A deliberate rescaling is the
+    # experiment, so re-testing its product against the source bound would reject valid runs.
+    @testset "Precipitation ceiling applies to ingested data only" begin
+        scaled = make_test_stack(precipitation=[0.0, 80.0, 120.0],
+                                 metadata=Dict{String,Any}("precipitation_scaling" => 4.0))
+        @test validate_climate_forcing_units(scaled) == true
+
+        # Identity scaling means nothing was rescaled, so the ceiling still holds.
+        unscaled = make_test_stack(precipitation=[0.0, 80.0, 120.0],
+                                   metadata=Dict{String,Any}("precipitation_scaling" => 1.0))
+        @test_throws "expected ≤ 100 kg/m²/hr" validate_climate_forcing_units(unscaled)
+
+        # Non-negativity is an invariant and survives scaling.
+        @test_throws "expected ≥ 0 kg/m²" validate_climate_forcing_units(
+            make_test_stack(precipitation=[-0.1, 0.5, 1.0],
+                            metadata=Dict{String,Any}("precipitation_scaling" => 4.0)))
     end
 
     @testset "Vapor pressure errors" begin

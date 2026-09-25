@@ -221,10 +221,22 @@ const _FORCING_VARS = (:temperature_air, :pressure_air, :vapor_pressure, :wind_s
 
     @testset "Out-of-range perturbation fails validation" begin
         stack = make_perturb_stack()
-        # Pushes temperature below the 180 K floor (and longwave below 50 W/m²).
-        @test_throws ArgumentError temperature_adjust(stack, -100.0)
-        # Pushes the hourly precipitation rate past the 100 kg/m²/hr ceiling.
-        @test_throws ArgumentError precipitation_adjust(stack, 1.0e4)
+        # Pushes temperature below the 180 K floor.
+        @test_throws "temperature_air" temperature_adjust(stack, -100.0)
+    end
+
+    @testset "A precipitation scaling is not a unit error" begin
+        stack = make_perturb_stack()
+        # The 100 kg/m²/hr ceiling exists to catch metres read as kg/m² in the ingested rate. A
+        # chosen factor is the experiment, so the product is not re-tested against it — otherwise a
+        # wet enough cell cannot be run at a large scaling at all.
+        adj = precipitation_adjust(stack, 1.0e4)
+        @test maximum(parent(adj[:precipitation])) > 100.0
+        @test metadata(adj)["precipitation_scaling"] == 1.0e4
+
+        # Composing with a temperature perturbation re-validates, and must not resurrect the ceiling.
+        @test precipitation_adjust(temperature_adjust(stack, -1.0), 1.0e4) isa DimStack
+        @test temperature_adjust(precipitation_adjust(stack, 1.0e4), -1.0) isa DimStack
     end
 
 end
