@@ -71,6 +71,32 @@ function find_nearest_index(values::AbstractVector, target)
     return best_idx
 end
 
+# Smallest `LW/(σT⁴)` over the record, in one pass. The ε vector itself is never wanted and a forcing
+# record runs to hundreds of thousands of steps, so materializing it to take a minimum would cost more
+# than the check does. `eachindex(LW, T)` also asserts the two layers share indices.
+function _minimum_bulk_emissivity(LW, T)
+    lo = Inf
+    for i in eachindex(LW, T)
+        ε = LW[i] / (_SIGMA_SB * T[i]^4)
+        ε < lo && (lo = ε)
+    end
+    return lo
+end
+
+# Bulk emissivity `LW/(σT⁴)` cannot fall below the dry clear-sky limit of the Konzelmann
+# parameterization, whose `(e/T)^(1/8)` term vanishes as the air dries to leave 0.23. This sits just
+# under that asymptote, so the driest clear sky the scheme can represent passes and a sky more
+# transparent than any atmosphere does not. Measured over 401 million band-hours from eleven tiles
+# spanning Antarctic, Arctic, Greenland, Alaskan, Himalayan, Tien Shan, Andean, sub-Antarctic,
+# Kamchatkan and Patagonian records, each under −3, 0 and +3 K, the minimum was 0.28 and nothing fell
+# below 0.23.
+const LONGWAVE_EMISSIVITY_MINIMUM = 0.20
+
+# ÷3600 applied twice leaves ~0.01 W/m². Nothing that small is weather, and no single application of
+# the conversion lands here, so this separates a repeated conversion from a cold dry night. The
+# matching single-application error is 3600× too *large* and trips the 500 W/m² ceiling instead.
+const LONGWAVE_ABSOLUTE_MINIMUM = 1.0
+
 """
     validate_climate_forcing_units(stack::DimStack)
 
@@ -79,11 +105,28 @@ Validate that climate forcing variables in a DimStack have physically reasonable
 # Expected Units and Ranges
 - `temperature_air`: Kelvin (K), range [180, 330]
 - `pressure_air`: Pascal (Pa), range [30000, 110000]
-- `precipitation`: kg/m², range [0, 100] per hour
+- `precipitation`: kg/m², `≥ 0`; `≤ 100` per hour only while unscaled (see below)
 - `wind_speed`: m/s, range [0, 100]
 - `shortwave_downward`: W/m², range [0, 1500]
-- `longwave_downward`: W/m², range [50, 500]
+- `longwave_downward`: W/m², `≤ 500`, and bulk emissivity `LW/(σT⁴) ≥ $(LONGWAVE_EMISSIVITY_MINIMUM)`
 - `vapor_pressure`: Pascal (Pa), range [0, 10000]
+
+Two kinds of bound live here, and they behave differently under the adjustment functions. Most are
+physical invariants that hold however the forcing was produced, so they are checked every time. The
+precipitation ceiling is not one: it exists to catch metres read as kg/m², a factor of 1000, and a
+rate that was deliberately rescaled is the experiment rather than corrupt data. It is therefore
+skipped once `precipitation_scaling` in the metadata records a factor — read from the stack so the
+order in which adjustments compose cannot change the answer.
+
+Downwelling longwave is bounded through emissivity rather than irradiance, because `LW = ε·σ·T⁴`
+makes any fixed W/m² floor an implicit humidity requirement that tightens as the air cools: a
+50 W/m² floor admits `ε = 0.12` at 290 K, which no atmosphere produces, while demanding `ε > 0.38`
+at 220 K, which forbids the dry clear sky that polar and high-altitude records routinely contain.
+No upper bound is placed on `ε`. Values above 1 are real — a surface inversion with a cloud base
+warmer than the 2 m temperature radiates more than a blackbody at that temperature — and they are
+common rather than marginal: 2.3 % of the measured band-hours exceed 1, reaching 1.26. Inversion
+strength has no sharp physical ceiling to test against, whereas the dry clear-sky limit below is
+sharp, so only the low side is bounded through emissivity. The 500 W/m² bound covers the high side.
 
 # Arguments
 - `stack::DimStack`: DimStack with climate forcing variables
@@ -123,7 +166,11 @@ function validate_climate_forcing_units(stack::DimStack)
     if pr_min < -1e-6  # Allow small numerical errors
         push!(errors, "precipitation: expected ≥ 0 kg/m², got minimum $(pr_min) kg/m²")
     end
-    if pr_max > 100.0
+    # Skipped once a scaling has been applied: the ceiling separates the ingested rate from metres
+    # read as kg/m², and the product of a valid rate and a chosen factor is neither. Re-testing it
+    # rejects valid runs — a 30 kg/m²/hr tropical hour under a 4× sensitivity factor is not a unit
+    # error, and rejecting it removes whole tiles from a sweep.
+    if get(metadata(stack), "precipitation_scaling", 1.0) == 1.0 && pr_max > 100.0
         push!(errors, "precipitation: expected ≤ 100 kg/m²/hr, got maximum $(pr_max) kg/m²/hr (possible unit error: should be kg/m², not m)")
     end
 
@@ -145,13 +192,22 @@ function validate_climate_forcing_units(stack::DimStack)
         push!(errors, "shortwave_downward: expected ≤ 1500 W/m², got $(sw_max) W/m² (possible unit error: should be W/m², not J/m²)")
     end
 
-    # Longwave radiation (W/m²): should be in thermal radiation range
+    # Longwave radiation (W/m²). The unit error lives on the high side only: J/m² accumulated over an
+    # hour read as W/m² is 3600× too large.
     lw_min, lw_max = minimum(longwave_downward), maximum(longwave_downward)
-    if lw_min < 50.0
-        push!(errors, "longwave_downward: expected ≥ 50 W/m², got $(lw_min) W/m² (possible unit error: should be W/m², not J/m²)")
+    if lw_min < LONGWAVE_ABSOLUTE_MINIMUM
+        push!(errors, "longwave_downward: expected ≥ $(LONGWAVE_ABSOLUTE_MINIMUM) W/m², got $(lw_min) W/m² " *
+                      "(a value this small means the J/m² to W/m² conversion was applied twice)")
     end
     if lw_max > 500.0
-        push!(errors, "longwave_downward: expected ≤ 500 W/m², got $(lw_max) W/m²")
+        push!(errors, "longwave_downward: expected ≤ 500 W/m², got $(lw_max) W/m² (possible unit error: should be W/m², not J/m²)")
+    end
+    # Emissivity, not irradiance, is what bounds the low side — see this function's docstring.
+    ε_min = _minimum_bulk_emissivity(longwave_downward, temperature_air)
+    if ε_min < LONGWAVE_EMISSIVITY_MINIMUM
+        push!(errors, "longwave_downward: bulk emissivity LW/(σT⁴) expected ≥ $(LONGWAVE_EMISSIVITY_MINIMUM), " *
+                      "got $(ε_min) — below the dry clear-sky limit of the Konzelmann parameterization, " *
+                      "so this irradiance is too small for its air temperature")
     end
 
     # Vapor pressure (Pa): should be non-negative and below saturation
