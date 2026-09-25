@@ -176,11 +176,17 @@ back correctly annotated without threading it by hand.
 Values may be `DimArray`s or plain arrays — only the underlying data is used.
 """
 function _rebuild_forcing(stack::DimStack, new_metadata; changed_layers...)
-    changed = map(parent, NamedTuple(changed_layers))
+    changed = NamedTuple(changed_layers)
     unknown = setdiff(keys(changed), keys(stack))
     isempty(unknown) ||
         throw(ArgumentError("not a layer of this forcing stack: $(join(unknown, ", "))"))
-    return rebuild(stack; data=merge(NamedTuple(stack), changed), metadata=new_metadata)
+    # Unwrapped after the merge, not before: `rebuild` wraps every layer in the stack's dimensions, and
+    # `NamedTuple(stack)` hands back the carried layers as `DimArray`s. Unwrapping only the replacements
+    # leaves those to be wrapped a second time, and a doubly wrapped layer's `parent` is a `DimArray`
+    # rather than the values a consumer asked for — which reads as an array of numbers everywhere until
+    # something dispatches on `Vector`.
+    return rebuild(stack; data=map(parent, merge(NamedTuple(stack), changed)),
+                   metadata=new_metadata)
 end
 
 """
