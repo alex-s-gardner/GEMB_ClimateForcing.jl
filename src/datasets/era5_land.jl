@@ -79,11 +79,15 @@ Validate that climate forcing variables in a DimStack have physically reasonable
 # Expected Units and Ranges
 - `temperature_air`: Kelvin (K), range [180, 330]
 - `pressure_air`: Pascal (Pa), range [30000, 110000]
-- `precipitation`: kg/m², range [0, 100] per hour
+- `precipitation`: kg/m², range [0, 400] per hour
 - `wind_speed`: m/s, range [0, 100]
 - `shortwave_downward`: W/m², range [0, 1500]
-- `longwave_downward`: W/m², range [50, 500]
+- `longwave_downward`: W/m², range [20, 500]
 - `vapor_pressure`: Pascal (Pa), range [0, 10000]
+
+Bounds bracket what the atmosphere can produce, not what is typical, because a whole tile is rejected
+when one hour falls outside. A genuine unit error is off by at least a factor of 1000, so widening a
+bound to admit a real extreme does not weaken the check.
 
 # Arguments
 - `stack::DimStack`: DimStack with climate forcing variables
@@ -118,13 +122,16 @@ function validate_climate_forcing_units(stack::DimStack)
         push!(errors, "pressure_air: expected [30000, 110000] Pa, got [$(p_min), $(p_max)] Pa")
     end
 
-    # Precipitation (kg/m² per hour): should be non-negative and not extreme
+    # Precipitation (kg/m² per hour): should be non-negative and not extreme.
+    # The ceiling sits above the ~305 kg/m² one-hour rainfall record, so a real convective hour
+    # passes. ERA5 stores total precipitation in m of water equivalent and the conversion to kg/m²
+    # multiplies by 1000, so a missed or doubled conversion is off by 1000x and still caught.
     pr_min, pr_max = minimum(precipitation), maximum(precipitation)
     if pr_min < -1e-6  # Allow small numerical errors
         push!(errors, "precipitation: expected ≥ 0 kg/m², got minimum $(pr_min) kg/m²")
     end
-    if pr_max > 100.0
-        push!(errors, "precipitation: expected ≤ 100 kg/m²/hr, got maximum $(pr_max) kg/m²/hr (possible unit error: should be kg/m², not m)")
+    if pr_max > 400.0
+        push!(errors, "precipitation: expected ≤ 400 kg/m²/hr, got maximum $(pr_max) kg/m²/hr (possible unit error: should be kg/m², not m)")
     end
 
     # Wind speed (m/s): should be non-negative
@@ -145,10 +152,14 @@ function validate_climate_forcing_units(stack::DimStack)
         push!(errors, "shortwave_downward: expected ≤ 1500 W/m², got $(sw_max) W/m² (possible unit error: should be W/m², not J/m²)")
     end
 
-    # Longwave radiation (W/m²): should be in thermal radiation range
+    # Longwave radiation (W/m²): should be in thermal radiation range.
+    # The floor is a physical-plausibility check, not a unit check: an accumulated-J/m² value is
+    # 3600x larger than the W/m² it should be, which the ceiling below catches, so no unit error can
+    # make this too small. It only has to reject zeros, negatives and fill values, and a clear-sky
+    # polar or Siberian winter hour reaches the mid-40s.
     lw_min, lw_max = minimum(longwave_downward), maximum(longwave_downward)
-    if lw_min < 50.0
-        push!(errors, "longwave_downward: expected ≥ 50 W/m², got $(lw_min) W/m² (possible unit error: should be W/m², not J/m²)")
+    if lw_min < 20.0
+        push!(errors, "longwave_downward: expected ≥ 20 W/m², got $(lw_min) W/m²")
     end
     if lw_max > 500.0
         push!(errors, "longwave_downward: expected ≤ 500 W/m², got $(lw_max) W/m²")

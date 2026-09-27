@@ -85,7 +85,7 @@ likewise left untouched.
 
 !!! note
     A large negative `ΔT` can push `temperature_air` below the 180 K validation
-    floor, or `longwave_downward` below 50 W/m². That raises an `ArgumentError`
+    floor, or `longwave_downward` below 20 W/m². That raises an `ArgumentError`
     from `validate_climate_forcing_units` by design — it means the perturbation
     has left the physically plausible range of the parameterizations.
 
@@ -191,7 +191,7 @@ with `1.1` record `1.21`.
 `scaling = 1.0` reproduces the input exactly.
 
 !!! note
-    A large `scaling` can push the hourly rate past the 100 kg/m²/hr validation
+    A large `scaling` can push the hourly rate past the 400 kg/m²/hr validation
     ceiling, raising an `ArgumentError` from `validate_climate_forcing_units`.
 
 # Example
