@@ -94,8 +94,14 @@ const LONGWAVE_EMISSIVITY_MINIMUM = 0.20
 
 # ÷3600 applied twice leaves ~0.01 W/m². Nothing that small is weather, and no single application of
 # the conversion lands here, so this separates a repeated conversion from a cold dry night. The
-# matching single-application error is 3600× too *large* and trips the 500 W/m² ceiling instead.
+# matching single-application error is 3600× too *large* and trips the longwave ceiling instead.
 const LONGWAVE_ABSOLUTE_MINIMUM = 1.0
+
+# A single accumulated-to-instantaneous conversion error lands near 500×3600 W/m², far above any real
+# irradiance, so the ceiling only has to clear the warmest clear-to-overcast columns the data actually
+# produce. A +4..+6 K sweep over the full glacierized ERA5-Land record reached 508.1 W/m² at its
+# warmest, most humid tile; this leaves headroom above that rather than sitting on it.
+const LONGWAVE_ABSOLUTE_MAXIMUM = 550.0
 
 """
     validate_climate_forcing_units(stack::DimStack)
@@ -108,7 +114,7 @@ Validate that climate forcing variables in a DimStack have physically reasonable
 - `precipitation`: kg/m², `≥ 0`; `≤ 100` per hour only while unscaled (see below)
 - `wind_speed`: m/s, range [0, 100]
 - `shortwave_downward`: W/m², range [0, 1500]
-- `longwave_downward`: W/m², `≤ 500`, and bulk emissivity `LW/(σT⁴) ≥ $(LONGWAVE_EMISSIVITY_MINIMUM)`
+- `longwave_downward`: W/m², `≤ $(LONGWAVE_ABSOLUTE_MAXIMUM)`, and bulk emissivity `LW/(σT⁴) ≥ $(LONGWAVE_EMISSIVITY_MINIMUM)`
 - `vapor_pressure`: Pascal (Pa), range [0, 10000]
 
 Two kinds of bound live here, and they behave differently under the adjustment functions. Most are
@@ -126,7 +132,8 @@ No upper bound is placed on `ε`. Values above 1 are real — a surface inversio
 warmer than the 2 m temperature radiates more than a blackbody at that temperature — and they are
 common rather than marginal: 2.3 % of the measured band-hours exceed 1, reaching 1.26. Inversion
 strength has no sharp physical ceiling to test against, whereas the dry clear-sky limit below is
-sharp, so only the low side is bounded through emissivity. The 500 W/m² bound covers the high side.
+sharp, so only the low side is bounded through emissivity. The $(LONGWAVE_ABSOLUTE_MAXIMUM) W/m² bound
+covers the high side.
 
 # Arguments
 - `stack::DimStack`: DimStack with climate forcing variables
@@ -199,8 +206,8 @@ function validate_climate_forcing_units(stack::DimStack)
         push!(errors, "longwave_downward: expected ≥ $(LONGWAVE_ABSOLUTE_MINIMUM) W/m², got $(lw_min) W/m² " *
                       "(a value this small means the J/m² to W/m² conversion was applied twice)")
     end
-    if lw_max > 500.0
-        push!(errors, "longwave_downward: expected ≤ 500 W/m², got $(lw_max) W/m² (possible unit error: should be W/m², not J/m²)")
+    if lw_max > LONGWAVE_ABSOLUTE_MAXIMUM
+        push!(errors, "longwave_downward: expected ≤ $(LONGWAVE_ABSOLUTE_MAXIMUM) W/m², got $(lw_max) W/m² (possible unit error: should be W/m², not J/m²)")
     end
     # Emissivity, not irradiance, is what bounds the low side — see this function's docstring.
     ε_min = _minimum_bulk_emissivity(longwave_downward, temperature_air)

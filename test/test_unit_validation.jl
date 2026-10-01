@@ -10,7 +10,7 @@ using Dates
 using DimensionalData
 
 # Import the validation function
-using GEMB_ClimateForcing: validate_climate_forcing_units
+using GEMB_ClimateForcing: validate_climate_forcing_units, LONGWAVE_ABSOLUTE_MAXIMUM
 
 # Helper to create DimStack for testing
 function make_test_stack(;
@@ -100,7 +100,7 @@ end
 
         # Longwave in J/m² instead of W/m² (too large)
         bad_lw2 = make_test_stack(longwave_downward=[300.0, 310.0, 320.0] .* 3600)
-        @test_throws "expected ≤ 500 W/m²" validate_climate_forcing_units(bad_lw2)
+        @test_throws "expected ≤ $(LONGWAVE_ABSOLUTE_MAXIMUM) W/m²" validate_climate_forcing_units(bad_lw2)
     end
 
     # LW = ε·σ·T⁴, so what counts as a plausible irradiance depends on the air temperature. A fixed
@@ -161,7 +161,7 @@ end
             precipitation = [0.0, 50.0, 100.0],
             wind_speed = [0.0, 10.0, 100.0],
             shortwave_downward = [0.0, 500.0, 1500.0],
-            longwave_downward = [50.0, 300.0, 500.0],
+            longwave_downward = [50.0, 300.0, LONGWAVE_ABSOLUTE_MAXIMUM],
             vapor_pressure = [0.0, 1000.0, 10000.0]
         )
         @test validate_climate_forcing_units(boundary_stack) == true
