@@ -206,7 +206,8 @@ julia --project=/tmp/rgi7parquet_env data/make_rgi7_ice_albedo_parquet.jl 2019
      `key:` line of `~/.cdsapirc`. Both the Zarr (Bearer) and Retrieve API (`PRIVATE-TOKEN`)
      paths take their token from here.
    - `dewpoint_to_vapor_pressure()`, `vapor_pressure_to_relative_humidity()`,
-     `relative_humidity_to_vapor_pressure()` — Magnus/Buck formulas
+     `relative_humidity_to_vapor_pressure()`, `saturation_vapor_pressure()` — one curve, the
+     IFS saturation vapor pressure over water (the curve ERA5 d2m is defined against)
    - Shared by **all three** forcing-adjustment functions (elevation, temperature/precip,
      glacier), which otherwise duplicate the same boilerplate four ways:
      - `_rebuild_forcing(stack, meta; changed_layers...)` — rebuild a forcing `DimStack`

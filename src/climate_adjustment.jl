@@ -32,10 +32,10 @@ using DimensionalData
 using Statistics
 
 # ----------------------------------------------------------------------------
-# Shared helpers, all reused rather than redefined: `_SIGMA_SB`,
-# `saturation_vapor_pressure` and `konzelmann_clear_sky_emissivity` from
-# elevation_adjustment.jl; `_rebuild_forcing` and `_adjust_longwave` from
-# utils.jl; `validate_climate_forcing_units` from datasets/era5_land.jl.
+# Shared helpers, all reused rather than redefined: `_SIGMA_SB` and
+# `konzelmann_clear_sky_emissivity` from elevation_adjustment.jl;
+# `_vapor_pressure_at`, `_rebuild_forcing` and `_adjust_longwave` from utils.jl;
+# `validate_climate_forcing_units` from datasets/era5_land.jl.
 # ----------------------------------------------------------------------------
 
 """
@@ -69,9 +69,10 @@ and additionally corrects surface pressure.
 # Method
 For `ΔT = delta_temperature`:
 - `T′ = T + ΔT`
-- `RH = e/eₛ(T)`; `e′ = clamp(RH, 0, 1)·eₛ(T′)` — **relative humidity is held
-  constant** (over-ice saturation curve below 0 °C), so specific humidity rises
-  with warming
+- `e′ = e·eₛ(T′)/eₛ(T)` — **relative humidity is held constant** against the
+  saturation curve over water ([`saturation_vapor_pressure`](@ref)), so specific
+  humidity rises with warming. Nothing is clamped: an input at or below
+  saturation stays at or below saturation.
 - `Δε = LW/(σ·T⁴) − ε_cs(e,T)`; `LW′ = (ε_cs(e′,T′) + Δε)·σ·T′⁴`, `σ=5.67e-8`,
   `ε_cs` from Konzelmann et al. (1994) — the cloud/aerosol emissivity increment
   `Δε` diagnosed from the input is preserved, so only the clear-sky response and
@@ -81,7 +82,8 @@ Surface pressure is *not* adjusted: it is set by elevation and synoptic mass
 distribution, not by a uniform warming. Wind speed and shortwave irradiance are
 likewise left untouched.
 
-`ΔT = 0` reproduces the input exactly.
+`ΔT = 0` reproduces every layer bit for bit, including a supersaturated or
+decoupled input.
 
 !!! note
     A large negative `ΔT` can push `temperature_air` below the 180 K validation
@@ -103,8 +105,8 @@ warmer_wetter = precipitation_adjust(warmer, 1.15)
 ```
 
 # References
-- Buck, A. L. (1981). New equations for computing vapor pressure and enhancement
-  factor. *J. Appl. Meteorol.* 20, 1527–1532. (Saturation vapor pressure.)
+- ECMWF (2018). IFS Documentation Cy45r1, Part IV, Eq. 7.5. (Saturation vapor
+  pressure over water, Buck 1981 constants.)
 - Konzelmann, T. et al. (1994). Parameterization of global and longwave incoming
   radiation for the Greenland ice sheet. *Glob. Planet. Change* 9, 143–164.
 - Glover, R. W. (1999). *J. Climate* 12, 551–563. (Same constant-RH and
@@ -123,13 +125,8 @@ function temperature_adjust(climate_forcing_original::DimStack, delta_temperatur
     # 1. Temperature: uniform offset.
     T′ = @. T + ΔT
 
-    # 2. Vapor pressure: constant relative humidity (over-ice curve below 0 °C).
-    #    Diagnosing and reconstructing RH with the same saturation formula makes
-    #    ΔT = 0 an exact identity. Clamp RH to [0, 1] to avoid supersaturation.
-    es_T  = saturation_vapor_pressure.(T)
-    es_T′ = saturation_vapor_pressure.(T′)
-    RH = @. clamp(e / es_T, 0.0, 1.0)
-    e′ = @. RH * es_T′
+    # 2. Vapor pressure: constant relative humidity, in ratio form.
+    e′ = _vapor_pressure_at.(e, T, T′)
 
     # 3. Longwave down: recompute from adjusted T, e; preserve cloud increment Δε.
     LW′ = _adjust_longwave(LW, e, T, e′, T′)

@@ -89,74 +89,69 @@ function _retry_transient(f; is_transient, context::AbstractString,
 end
 
 """
-    dewpoint_to_vapor_pressure(T_dewpoint::AbstractVector)
+    saturation_vapor_pressure(T_K::Real) -> Float64
 
-Convert dewpoint temperature (K) to vapor pressure (Pa) using the Magnus formula.
+Saturation vapor pressure (Pa) over liquid water at temperature `T_K` (Kelvin), in the form
+the ECMWF IFS uses (Tetens' formula with the Buck (1981) constants for water):
 
-# Arguments
-- `T_dewpoint`: Dewpoint temperature in Kelvin
+    eₛ(T) = 611.21 · exp(17.502 · (T − 273.16) / (T − 32.19))
 
-# Returns
-- Vapor pressure in Pascals (Pa)
-
-# Formula
-Uses the Magnus formula:
-```
-e = 611.2 * exp(17.67 * (T - 273.15) / (T - 29.65))
-```
-
-where T is in Kelvin and e is in Pascals.
+This is the only saturation curve in the package. ERA5 and ERA5-Land compute their 2 m
+dewpoint "with respect to water to be consistent with WMO reporting practice" (IFS Cy45r1
+Part IV §3.10.3), so `eₛ` over water at the dewpoint is the vapor pressure the reanalysis
+itself implies, and relative humidity is defined against the same curve. Using one curve for
+the dewpoint conversion, for relative humidity and for every adjustment is what makes the
+identity adjustments (`Δz = 0`, `ΔT = 0`) exact: a ratio `eₛ(T′)/eₛ(T)` of the same function
+is exactly 1 at `T′ = T`. Relative humidity against water stays below 1 in sub-freezing air
+even where the air is saturated with respect to ice.
 
 # References
-- Magnus, G. (1844). "Versuche über die Spannkräfte des Wasserdampfs"
-- Commonly used approximation for meteorological applications
+- ECMWF (2018). IFS Documentation Cy45r1, Part IV: Physical Processes, Eq. 7.5 and §3.10.3.
+- Buck, A. L. (1981). New equations for computing vapor pressure and enhancement factor.
+  *J. Appl. Meteorol.* 20, 1527–1532.
 """
-function dewpoint_to_vapor_pressure(T_dewpoint)
-    # Magnus formula: convert K to °C, compute vapor pressure
-    # e = 611.2 * exp(17.67 * T_celsius / (T_celsius + 243.5))
-    # Equivalent form: e = 611.2 * exp(17.67 * (T_K - 273.15) / (T_K - 29.65))
-    #
-    # Promote to Float64 inside the fused kernel so a native Float32 input can be passed
-    # directly (no throwaway Float64 copy) while keeping full double precision in exp().
-    return @. 611.2 * exp(17.67 * (Float64(T_dewpoint) - 273.15) / (Float64(T_dewpoint) - 29.65))
-end
+saturation_vapor_pressure(T_K::Real) =
+    611.21 * exp(17.502 * (Float64(T_K) - 273.16) / (Float64(T_K) - 32.19))
+
+"""
+    dewpoint_to_vapor_pressure(T_dewpoint)
+
+Vapor pressure (Pa) from dewpoint temperature (K): `e = eₛ(T_d)`, with `eₛ` the saturation
+vapor pressure over water of [`saturation_vapor_pressure`](@ref) — the curve ERA5 and
+ERA5-Land define their 2 m dewpoint against (IFS Cy45r1 Part IV §3.10.3).
+
+Accepts a scalar or an array (broadcast); `Float32` input is promoted to `Float64`.
+"""
+dewpoint_to_vapor_pressure(T_dewpoint) = saturation_vapor_pressure.(T_dewpoint)
 
 """
     vapor_pressure_to_relative_humidity(vapor_pressure, temperature_air)
 
-Calculate relative humidity [%] from vapor pressure [Pa] and air temperature [K].
-
-Uses Tetens' formula for saturation vapor pressure and clamps the result to [0, 100].
-
-Matches MATLAB's `vapor_pressure_to_relative_humidity.m`.
+Relative humidity [%] from vapor pressure [Pa] and air temperature [K], against the
+saturation vapor pressure over water of [`saturation_vapor_pressure`](@ref), clamped to
+[0, 100]. The clamp makes this a display and fitting convenience; the forcing adjustments
+never round-trip through it.
 """
 function vapor_pressure_to_relative_humidity(vapor_pressure, temperature_air)
-    Tc = temperature_air .- 273.15
-    A = 610.78
-    B = 17.27
-    C = 237.3
-    es = A .* exp.((B .* Tc) ./ (Tc .+ C))
-    relative_humidity = (vapor_pressure ./ es) .* 100.0
+    relative_humidity = (vapor_pressure ./ saturation_vapor_pressure.(temperature_air)) .* 100.0
     return clamp.(relative_humidity, 0.0, 100.0)
 end
 
 """
     relative_humidity_to_vapor_pressure(temperature_air, relative_humidity)
 
-Estimate actual vapor pressure [Pa] from air temperature [K] and relative humidity [%].
-
-Uses Tetens' formula for saturation vapor pressure.
-
-Matches MATLAB's `relative_humidity_to_vapor_pressure.m`.
+Vapor pressure [Pa] from air temperature [K] and relative humidity [%] against the
+saturation vapor pressure over water of [`saturation_vapor_pressure`](@ref).
 """
 function relative_humidity_to_vapor_pressure(temperature_air, relative_humidity)
-    Tc = temperature_air .- 273.15
-    A = 610.78   # Pa
-    B = 17.27    # dimensionless
-    C = 237.3    # degrees Celsius
-    es = A .* exp.((B .* Tc) ./ (Tc .+ C))
-    return es .* (relative_humidity ./ 100.0)
+    return saturation_vapor_pressure.(temperature_air) .* (relative_humidity ./ 100.0)
 end
+
+# Vapor pressure carried from temperature `T` to `T′` at constant relative humidity:
+# `e′ = e·eₛ(T′)/eₛ(T)`. The ratio form needs no relative humidity, so nothing is clamped: an
+# input at or below saturation stays at or below saturation at `T′`, and `T′ == T` returns `e`
+# bit for bit, since `eₛ(T)/eₛ(T)` is exactly 1.
+_vapor_pressure_at(e, T, T′) = e * (saturation_vapor_pressure(T′) / saturation_vapor_pressure(T))
 
 # ----------------------------------------------------------------------------
 # Shared helpers for the forcing-adjustment functions
@@ -197,7 +192,7 @@ pressure `e′`, preserving the cloud/aerosol emissivity increment diagnosed fro
 
 `Δε = LW/(σT⁴) − ε_cs(e, T)` is the departure of the observed irradiance from the
 Konzelmann et al. (1994) clear-sky value; holding it fixed means only the clear-sky
-response and the `σT⁴` scaling change. Exact identity when `(e′, T′) == (e, T)`.
+response and the `σT⁴` scaling change. Bit-exact identity when `(e′, T′) == (e, T)`.
 
 Δε is preserved *additively* (Glover 1999) and is deliberately left unclamped, so it carries
 through unchanged even where the bulk emissivity `LW/(σT⁴)` exceeds 1 — which reanalysis does
@@ -207,8 +202,9 @@ produce under a surface inversion with a cloud base warmer than the 2 m temperat
 function _adjust_longwave(LW, e, T, e′, T′)
     ε_cs  = konzelmann_clear_sky_emissivity.(e, T)
     ε_cs′ = konzelmann_clear_sky_emissivity.(e′, T′)
-    Δε = @. LW / (_SIGMA_SB * T^4) - ε_cs
-    return @. (ε_cs′ + Δε) * _SIGMA_SB * T′^4
+    # `(ε_cs′ + Δε)·σT′⁴` rearranged so each term vanishes, or is multiplied by exactly 1, when
+    # `(e′, T′) == (e, T)`: the identity adjustment then returns `LW` bit for bit.
+    return @. LW * ((T′ / T)^2)^2 + (ε_cs′ - ε_cs) * _SIGMA_SB * T′^4
 end
 
 # Normalize longitude to the −180…180°E convention (accepts 0–360°E, or any multiple

@@ -121,7 +121,7 @@ Downscale a forcing `DimStack` (must have a `Ti` dimension) for the elevation di
 |----------|-----------|---------------|
 | `temperature_air` | lapse `T − (Γ/1000)·Δz` | Glover 1999; Fausto 2009; Gardner 2009 |
 | `pressure_air` | hydrostatic `P·exp(−g·Δz/(R_d·T̄))` | Glover 1999; Noël 2018 |
-| `vapor_pressure` | constant relative humidity, recomputed at `T′` | Glover 1999; Curry & Webster 1999 |
+| `vapor_pressure` | constant relative humidity, `e·eₛ(T′)/eₛ(T)` with `eₛ` over water | Glover 1999; Curry & Webster 1999 |
 | `longwave_downward` | Konzelmann (1994) clear-sky emissivity, preserving cloud increment Δε | Konzelmann 1994; Fiddes & Gruber 2014 |
 | `shortwave_downward` | unchanged | — |
 | `precipitation` | unchanged, or Clausius–Clapeyron `×eₛ(T′)/eₛ(T)` if requested | Glover 1999 |
@@ -151,7 +151,7 @@ Apply a **uniform temperature offset** (K) to a forcing `DimStack` and propagate
 | Variable | Adjustment |
 |----------|-----------|
 | `temperature_air` | `T + ΔT` |
-| `vapor_pressure` | constant relative humidity, recomputed at `T′` (over-ice curve below 0 °C) |
+| `vapor_pressure` | constant relative humidity, `e·eₛ(T′)/eₛ(T)` with `eₛ` over water |
 | `longwave_downward` | Konzelmann (1994) clear-sky emissivity at `(e′, T′)`, preserving the cloud increment Δε |
 | `pressure_air`, `wind_speed`, `precipitation`, `shortwave_downward` | unchanged |
 
