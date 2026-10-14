@@ -132,12 +132,12 @@ include("climate_adjustment.jl")
 # data/shaw2025_glacier_decoupling.csv.gz lookup table.
 include("glacier_decoupling.jl")
 # Ambient → on-glacier correction, applying the decoupling factor to a forcing stack.
-# Shares _rebuild_forcing / _adjust_longwave (utils.jl) with the two siblings above.
+# Shares _rebuild_forcing (utils.jl) with the two siblings above.
 include("glacier_adjustment.jl")
 # The inverse of the two adjustments above: per-region regressions that read a decoupling factor
 # and a lapse rate back out of a region's forcing. Must follow elevation_adjustment.jl, whose
 # _LAPSE_RATE_MIN/_MAX it names as the domain a fitted slope has to be clamped into, and shares
-# _rebuild_forcing / _adjust_longwave (utils.jl) with glacier_adjustment.jl.
+# _rebuild_forcing (utils.jl) with glacier_adjustment.jl.
 include("downscaling_parameters.jl")
 
 # Synthetic forcing generation

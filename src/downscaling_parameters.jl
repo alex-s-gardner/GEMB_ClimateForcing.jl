@@ -728,26 +728,25 @@ function _cell_forcing_at_interval(fd, delta_elevation, decoupling_factor, lapse
 end
 
 # Per-timestep decoupling. `climate_adjust_for_glacier` takes a scalar `k`, but the derived factor
-# varies with the forcing's own time resolution, so apply the same increment directly:
+# varies with the forcing's own time resolution, so apply the same correction directly:
 #
-#     T′  = T + (k - 1) * max(T - T_ref, 0)
-#     LW′ = longwave re-derived at T′, vapor pressure unchanged
+#     T′ = T + (k - 1) * max(T - T_ref, 0)
+#     e′ = min(e, eₛ(T′)) where T′ < T, e elsewhere
 #
-# written as an increment so `k = 1` is bit-exact — the property that makes a sub-freezing or
+# with longwave and every other layer unchanged — the conventions of `climate_adjust_for_glacier`.
+# Written as an increment so `k = 1` is bit-exact, the property that makes a sub-freezing or
 # unmeasurable timestep a true no-op. Skips the whole pass when every `k` is 1.
 function _decouple_per_timestep(stack, decoupling_factor)
     all(==(1.0), decoupling_factor) && return stack
 
     T = stack[:temperature_air]
     e = stack[:vapor_pressure]
-    LW = stack[:longwave_downward]
 
     T′ = similar(T)
-    @inbounds for t in eachindex(T)
-        k = decoupling_factor[t]
-        T′[t] = T[t] + (k - 1) * max(T[t] - _DECOUPLING_REFERENCE_TEMPERATURE, 0.0)
+    for t in eachindex(T, decoupling_factor)
+        T′[t] = T[t] + (decoupling_factor[t] - 1) * max(T[t] - _DECOUPLING_REFERENCE_TEMPERATURE, 0.0)
     end
-    LW′ = _adjust_longwave(LW, e, T, e, T′)
+    e′ = _cap_vapor_pressure.(e, T, T′)
 
     meta = merge(copy(DimensionalData.metadata(stack)), Dict(
         "glacier_decoupling_factor_mean" => Statistics.mean(decoupling_factor),
@@ -755,6 +754,5 @@ function _decouple_per_timestep(stack, decoupling_factor)
     # The same rebuild the upstream `climate_adjust_*` functions use, so this path cannot drift from
     # them on layer metadata or on the `rebuild` convention — and it throws on a layer name that is
     # not in the stack rather than silently adding one.
-    return _rebuild_forcing(stack, meta;
-                                                temperature_air = T′, longwave_downward = LW′)
+    return _rebuild_forcing(stack, meta; temperature_air = T′, vapor_pressure = e′)
 end

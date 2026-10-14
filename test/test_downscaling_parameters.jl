@@ -18,7 +18,7 @@ using Statistics
 
 using GEMB_ClimateForcing: _MIN_AMBIENT_EXCESS, _MIN_CELLS_DEFAULT, _LAPSE_RATE_LIMITS,
     _DECOUPLING_FACTOR_LIMITS, _DECOUPLING_REFERENCE_TEMPERATURE, _solve_sym4, _r2,
-    _make_applicable
+    _make_applicable, _decouple_per_timestep, saturation_vapor_pressure
 
 const _DP_TIME = collect(DateTime(2000, 1, 1):Hour(1):DateTime(2000, 1, 1, 5))
 
@@ -290,6 +290,32 @@ end
         # An unfitted timestep stays unfitted at every elevation.
         gated = decoupling_factor_at_elevation(derive_decoupling_factor(acc; min_cells = 5), 1800.0)
         @test all(isnan, gated)
+    end
+
+    @testset "_decouple_per_timestep" begin
+        # Per-timestep k, warm and cold steps, one near-saturated warm step. Temperature follows
+        # T′ = T + (k − 1)·max(T − T_ref, 0); longwave is unchanged; vapor pressure is capped at
+        # saturation of the cooled air and untouched elsewhere.
+        T = [283.15, 290.15, 268.15, 278.15]
+        k = [0.8, 0.5, 0.3, 1.0]
+        e = [800.0, 0.99 * saturation_vapor_pressure(290.15), 300.0, 700.0]
+        ti = Ti(_DP_TIME[1:4])
+        layer(v) = DimArray(v, ti)
+        s = DimStack((temperature_air = layer(T), pressure_air = layer(fill(80000.0, 4)),
+                      vapor_pressure = layer(e), wind_speed = layer(fill(4.0, 4)),
+                      precipitation = layer(zeros(4)), shortwave_downward = layer(fill(300.0, 4)),
+                      longwave_downward = layer([310.0, 330.0, 250.0, 300.0]));
+                     metadata = Dict{String,Any}("elevation" => 1500.0))
+        d = _decouple_per_timestep(s, k)
+        T′ = @. T + (k - 1) * max(T - _DECOUPLING_REFERENCE_TEMPERATURE, 0.0)
+        @test parent(d[:temperature_air]) == T′
+        @test parent(d[:longwave_downward]) == parent(s[:longwave_downward])
+        @test parent(d[:vapor_pressure]) == [800.0, saturation_vapor_pressure(T′[2]), 300.0, 700.0]
+        for v in (:pressure_air, :wind_speed, :precipitation, :shortwave_downward)
+            @test parent(d[v]) == parent(s[v])
+        end
+        # Every k = 1 is the identity, returned as the same stack.
+        @test _decouple_per_timestep(s, ones(4)) === s
     end
 
     @testset "_make_applicable" begin
