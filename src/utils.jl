@@ -206,11 +206,11 @@ produce under a surface inversion with a cloud base warmer than the 2 m temperat
 (ε_cs over-predicting) is likewise carried as-is.
 """
 function _adjust_longwave(LW, e, T, e′, T′)
-    ε_cs  = konzelmann_clear_sky_emissivity.(e, T)
-    ε_cs′ = konzelmann_clear_sky_emissivity.(e′, T′)
     # `(ε_cs′ + Δε)·σT′⁴` rearranged so each term vanishes, or is multiplied by exactly 1, when
     # `(e′, T′) == (e, T)`: the identity adjustment then returns `LW` bit for bit.
-    return @. LW * ((T′ / T)^2)^2 + (ε_cs′ - ε_cs) * _SIGMA_SB * T′^4
+    return @. LW * ((T′ / T)^2)^2 +
+              (konzelmann_clear_sky_emissivity(e′, T′) - konzelmann_clear_sky_emissivity(e, T)) *
+              _SIGMA_SB * T′^4
 end
 
 # Normalize longitude to the −180…180°E convention (accepts 0–360°E, or any multiple
