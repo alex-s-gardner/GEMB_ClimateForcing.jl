@@ -19,7 +19,8 @@ using Statistics
 using GEMB_ClimateForcing: _MIN_AMBIENT_EXCESS, _MIN_CELLS_DEFAULT, _LAPSE_RATE_LIMITS,
     _DECOUPLING_FACTOR_LIMITS, _DECOUPLING_REFERENCE_TEMPERATURE, _solve_sym4, _r2,
     _make_applicable, _decouple_per_timestep, saturation_vapor_pressure,
-    _downscaling_sums, _accumulate_downscaling_cell!
+    _downscaling_sums, _accumulate_downscaling_cell!, _cell_forcing_at_interval,
+    _ambient_forcing
 
 const _DP_TIME = collect(DateTime(2000, 1, 1):Hour(1):DateTime(2000, 1, 1, 5))
 
@@ -30,7 +31,6 @@ const _DP_TIME = collect(DateTime(2000, 1, 1):Hour(1):DateTime(2000, 1, 1, 5))
 function _acc(cells, temperature; time = _DP_TIME)
     n = length(time)
     S = (; s1 = zeros(Int, n), z = zeros(n), zz = zeros(n), T = zeros(n), zT = zeros(n),
-         g = zeros(n), w = zeros(n), zw = zeros(n),
          s1_warm = zeros(Int, n), z_warm = zeros(n), g_warm = zeros(n), w_warm = zeros(n),
          zz_warm = zeros(n), zg_warm = zeros(n), zw_warm = zeros(n),
          gg_warm = zeros(n), gw_warm = zeros(n), ww_warm = zeros(n),
@@ -42,7 +42,6 @@ function _acc(cells, temperature; time = _DP_TIME)
             Tt = T[t]
             S.s1[t] += 1
             S.z[t] += z; S.zz[t] += z * z; S.T[t] += Tt; S.zT[t] += z * Tt
-            S.g[t] += glm; S.w[t] += gz; S.zw[t] += z * gz
             Et = Tt - _DECOUPLING_REFERENCE_TEMPERATURE
             Et > 0 || continue
             S.s1_warm[t] += 1
@@ -116,10 +115,10 @@ end
     end
 
     @testset "lapse rate" begin
-        # The ON-GLACIER lapse rate, which is not the ambient one. Above melting the decoupling maps
-        # T -> 273.15 + k(T - 273.15), so it compresses the profile and the slope the fit reports is
-        # k*Γ. Positive for cooling with height.
-        @test all(g -> isapprox(g, _DP_K_TRUE * _DP_GAMMA_TRUE, atol = 1e-6), lapse.lapse_rate)
+        # The AMBIENT lapse rate: every cell is brought to the ice-free state with the fitted
+        # decoupling before the slope is taken, so the fixture's ambient Γ comes back exactly.
+        # Positive for cooling with height.
+        @test all(g -> isapprox(g, _DP_GAMMA_TRUE, atol = 1e-6), lapse.lapse_rate)
         @test DimensionalData.metadata(lapse)["n_fitted"] == length(_DP_TIME)
         @test all(==(4), lapse.n_cells)
         @test collect(dims(lapse, Ti)) == _DP_TIME
@@ -215,9 +214,8 @@ end
         @test all(k -> k > _DECOUPLING_FACTOR_LIMITS[2], inv_k.decoupling_factor)
         @test all(isfinite, inv_k.decoupling_factor)
 
-        # That `k` is *not* applied by the lapse fit: outside `(0, 1]` it falls back to `k = 1`, the
-        # bit-exact no-op, so the slope is the ambient one rather than an arbitrary rescaling. Same
-        # fixture through the ambient temperatures gives the same answer.
+        # That `k` is *not* applied by the lapse fit: outside `(0, 1]` the slope is fitted on the
+        # observed temperatures without the ice-free correction, exactly as for an unmeasured `k`.
         inv_lapse = derive_lapse_rate(inv_acc, inv_k; min_cells = 4)
         raw = derive_lapse_rate(inv_acc, derive_decoupling_factor(_acc(_DP_CELLS, inverted);
                                                                   min_cells = 99);
@@ -331,6 +329,8 @@ end
         @test all(k -> isapprox(k, k_true; atol = 0.01), d.decoupling_factor)
         @test all(==(count(c -> E_amb(c.z) > 0, cells)), d.n_cells_above_melting)
         @test all(==(20), d.n_cells)
+        # The ambient slope, 6 K/km, from cells above and below melting together.
+        @test all(g -> isapprox(g, 6.0; atol = 0.05), derive_lapse_rate(acc53, d).lapse_rate)
         # Too few cells above melting: NaN, even with plenty of cells in the region.
         @test all(isnan, derive_decoupling_factor(acc53; min_cells = 19).decoupling_factor)
     end
@@ -356,6 +356,82 @@ end
         end
         # Continuous at the edge: approaching z* from below reaches the held value.
         @test only(unique(decoupling_factor_at_elevation(dec, z_star - 1e-6))) ≈ k_star rtol = 1e-6
+    end
+
+    @testset "end to end: any donor gives the analytic band temperature" begin
+        # Twenty cells, glacier fraction rising with elevation plus a fixed perturbation, k = 0.8,
+        # ambient excess 20 − 0.006 z. Derive k and the lapse rate from the region, then deliver each
+        # cell's forcing to a band at 3000 m: ambient, lapse, decouple. The band temperature is
+        # 273.15 + k·E_amb(3000) = 274.75 K from every donor.
+        k_true = 0.8
+        zs = range(500.0, 2500.0; length = 20)
+        cells = [(z = z, glm = clamp(clamp((z - 500) / 2000, 0, 1)^2 + 0.05 * sin(3i), 0, 1))
+                 for (i, z) in enumerate(zs)]
+        E_amb(z) = 20 - 0.006z
+        T_obs(c) = _DECOUPLING_REFERENCE_TEMPERATURE + (1 - c.glm * (1 - k_true)) * E_amb(c.z)
+        acc52 = _acc(cells, c -> fill(T_obs(c), length(_DP_TIME)))
+        d = derive_decoupling_factor(acc52)
+        Γ = collect(derive_lapse_rate(acc52, d).lapse_rate)
+        k_band = collect(decoupling_factor_at_elevation(d, 3000.0))
+        ti = Ti(_DP_TIME)
+        n = length(_DP_TIME)
+        layer(v) = DimArray(fill(v, n), ti)
+        for c in cells
+            T = T_obs(c)
+            fd = DimStack((temperature_air = layer(T), pressure_air = layer(85000.0),
+                           vapor_pressure = layer(0.6 * saturation_vapor_pressure(T)),
+                           wind_speed = layer(3.0), precipitation = layer(0.0),
+                           shortwave_downward = layer(300.0), longwave_downward = layer(320.0));
+                          metadata = Dict{String,Any}("elevation" => c.z))
+            k_donor = collect(decoupling_factor_at_elevation(d, c.z))
+            band = _cell_forcing_at_interval(fd, 3000.0 - c.z, k_band, Γ, c.glm, k_donor)
+            @test all(t -> isapprox(t, 274.75; atol = 1e-6), band[:temperature_air])
+        end
+    end
+
+    @testset "ambient conversion inverts the mixing model" begin
+        # A glm = 0.5 donor above melting, delivered at its own elevation: the decoupled excess is
+        # k·E_amb, whatever share of the damping the reanalysis had already applied.
+        k = 0.7
+        E = 6.0
+        n = length(_DP_TIME)
+        ti = Ti(_DP_TIME)
+        layer(v) = DimArray(fill(v, n), ti)
+        T = _DECOUPLING_REFERENCE_TEMPERATURE + (1 - 0.5 * (1 - k)) * E
+        fd = DimStack((temperature_air = layer(T), pressure_air = layer(80000.0),
+                       vapor_pressure = layer(500.0), wind_speed = layer(3.0),
+                       precipitation = layer(0.0), shortwave_downward = layer(200.0),
+                       longwave_downward = layer(300.0));
+                      metadata = Dict{String,Any}("elevation" => 2000.0))
+        ks = fill(k, n)
+        out = _cell_forcing_at_interval(fd, 0.0, ks, 6.5, 0.5, ks)
+        @test all(t -> isapprox(t - _DECOUPLING_REFERENCE_TEMPERATURE, k * E; atol = 1e-9),
+                  out[:temperature_air])
+        @test all(t -> isapprox(t - _DECOUPLING_REFERENCE_TEMPERATURE, E; atol = 1e-9),
+                  _ambient_forcing(fd, 0.5, ks)[:temperature_air])
+        # Longwave is never touched by either decoupling step, and a Δz = 0 lapse is the identity.
+        @test parent(out[:longwave_downward]) == parent(fd[:longwave_downward])
+        # An ice-free donor, or k = 1, is already ambient.
+        @test _ambient_forcing(fd, 0.0, ks) === fd
+        @test _ambient_forcing(fd, 0.5, ones(n)) === fd
+
+        # Saturated cold input with k = 1: vapor pressure and longwave come back bit for bit.
+        Tc = 253.15
+        cold = DimStack((temperature_air = layer(Tc), pressure_air = layer(70000.0),
+                         vapor_pressure = layer(dewpoint_to_vapor_pressure(Tc)),
+                         wind_speed = layer(5.0), precipitation = layer(0.1),
+                         shortwave_downward = layer(0.0), longwave_downward = layer(200.0));
+                        metadata = Dict{String,Any}("elevation" => 2000.0))
+        same = _cell_forcing_at_interval(cold, 0.0, ones(n), 6.5, 0.5, ones(n))
+        for v in keys(cold)
+            @test parent(same[v]) == parent(cold[v])
+        end
+
+        # Factors outside (0, 1], non-finite, or of the wrong length are refused.
+        @test_throws ArgumentError _cell_forcing_at_interval(fd, 0.0, fill(1.2, n), 6.5, 0.5, ks)
+        @test_throws ArgumentError _cell_forcing_at_interval(fd, 0.0, ks, 6.5, 0.5, fill(NaN, n))
+        @test_throws ArgumentError _cell_forcing_at_interval(fd, 0.0, ks, 6.5, 1.5, ks)
+        @test_throws DimensionMismatch _cell_forcing_at_interval(fd, 0.0, ks[1:2], 6.5, 0.5, ks)
     end
 
     @testset "_decouple_per_timestep" begin
