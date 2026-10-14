@@ -35,7 +35,8 @@ function _solar_position(t::DateTime)
     L₀ = mod(280.46646 + T * (36000.76983 + 0.0003032T), 360)      # geometric mean longitude
     M = 357.52911 + T * (35999.05029 - 0.0001537T)                 # mean anomaly
     e = 0.016708634 - T * (0.000042037 + 0.0000001267T)            # orbital eccentricity
-    C = sind(M) * (1.914602 - T * (0.004817 + 0.000014T)) +
+    sin_M = sind(M)
+    C = sin_M * (1.914602 - T * (0.004817 + 0.000014T)) +
         sind(2M) * (0.019993 - 0.000101T) + sind(3M) * 0.000289    # equation of center
     Ω = 125.04 - 1934.136T
     λ = L₀ + C - 0.00569 - 0.00478sind(Ω)                          # apparent longitude
@@ -43,7 +44,7 @@ function _solar_position(t::DateTime)
         0.00256cosd(Ω)                                             # corrected obliquity
     δ = asind(sind(ε) * sind(λ))
     y = tand(ε / 2)^2
-    E = 4rad2deg(y * sind(2L₀) - 2e * sind(M) + 4e * y * sind(M) * cosd(2L₀) -
+    E = 4rad2deg(y * sind(2L₀) - 2e * sin_M + 4e * y * sin_M * cosd(2L₀) -
                  0.5y^2 * sind(4L₀) - 1.25e^2 * sind(2M))
     R = 1.000001018 * (1 - e^2) / (1 + e * cosd(M + C))
     return (; δ, E, R)
@@ -138,13 +139,14 @@ function solar_geometry(latitude::Real, longitude::Real, times::AbstractVector{D
     Δt = Dates.value(Millisecond(step)) / 3_600_000           # hours
     0 < Δt <= 24 || throw(ArgumentError("step must be positive and at most a day (got $(step))"))
     φ = deg2rad(Float64(latitude))
+    sin_φ, cos_φ = sin(φ), cos(φ)
     Δω = deg2rad(15Δt)
     half = Millisecond(round(Int, Dates.value(Millisecond(step)) / 2))
     sza = similar(times, Float64)
     toa = similar(times, Float64)
     for i in eachindex(times)
         sun = _solar_position(times[i] - half)
-        a, b = sin(φ) * sind(sun.δ), cos(φ) * cosd(sun.δ)
+        a, b = sin_φ * sind(sun.δ), cos_φ * cosd(sun.δ)
         ω₂ = _hour_angle(times[i], longitude, sun.E)
         I₁, I₂ = _sunlit_moments(a, b, ω₂ - Δω, ω₂)
         if I₁ > 0
