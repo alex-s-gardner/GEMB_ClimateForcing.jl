@@ -371,10 +371,12 @@ function climate_adjust_for_elevation(
             "precip_scaling_method must be nothing or :clausius_clapeyron (got $(precip_scaling_method))"))
     end
 
-    # Per-timestep month index from the time dimension.
-    times = collect(dims(climate_forcing_original, Ti))
-    months = month.(times)
+    # Per-timestep month index, needed only for a monthly lapse rate. Skipped otherwise: `month` on
+    # a long hourly record costs more than the temperature adjustment it would index.
+    times = dims(climate_forcing_original, Ti)
     n = length(times)
+    monthly = lapse_rate isa AbstractVector && length(lapse_rate) == 12
+    months = monthly ? month.(times) : Int[]
 
     # Resolve lapse rate to a per-timestep vector (K/km, positive = cooling up).
     Γ = _resolve_lapse_rate(lapse_rate, months, n)
