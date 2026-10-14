@@ -214,8 +214,8 @@ function _adjust_longwave(LW, e, T, e′, T′)
 end
 
 # Normalize longitude to the −180…180°E convention (accepts 0–360°E, or any multiple
-# wrap: 540 → 180, −190 → 170). Used by the geoid grid and the glacier lookup table,
-# both of which are −180…180 while the ERA5-Land grids are 0–360.
+# wrap: 540 → −180, −190 → 170). Used by the geoid grid, the glacier lookup table and the
+# seam-aware nearest-longitude search.
 _wrap_longitude(lon::Real) = mod(lon + 180.0, 360.0) - 180.0
 
 """

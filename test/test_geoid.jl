@@ -25,6 +25,23 @@ end
         @test ref_gravity(0.0) < ref_gravity(45.0) < ref_gravity(90.0)
     end
 
+    @testset "Geometric height where List gravity equals g₀" begin
+        # At the latitude where g(ϕ) = g₀ the conversion reduces to Z = R·H/(R − H): for
+        # H = 10 km that is 10015.8 m, the radius term alone. The latitude is found by bisection.
+        lo, hi = 40.0, 50.0
+        for _ in 1:200
+            mid = (lo + hi) / 2
+            ref_gravity(mid) < REF_G0 ? (lo = mid) : (hi = mid)
+        end
+        ϕ₀ = (lo + hi) / 2
+        @test 45.0 < ϕ₀ < 46.0
+        Z = geopotential2height(1e4 * REF_G0, ϕ₀, 0.0; height_reference = :orthometric)
+        R = ref_radius(ϕ₀)
+        @test Z ≈ R * 1e4 / (R - 1e4) rtol = 1e-9
+        @test Z ≈ 10015.8 atol = 0.5
+        @test geopotential2height(0.0, ϕ₀, 0.0; height_reference = :orthometric) == 0.0
+    end
+
     @testset "Geometric height (no geoid) matches independent reference" begin
         # Use the package's internal geometric-height step (steps 1-4, before adding N).
         gh = GEMB_ClimateForcing._geopotential_to_geometric
@@ -127,6 +144,9 @@ end
             @test h ≈ ref_geometric(Φ, 72.58) + N_summit atol=1.0
             # ... and differs from the naive Φ/g₀ elevation by roughly N (tens of metres).
             @test abs(h - Φ / REF_G0) > 5.0
+
+            # EGM96 at (0°N, 0°E): 17.16 m.
+            @test geoid_undulation(0.0, 0.0; geoid=:egm96) ≈ 17.16 atol=0.3
         end
     else
         println("\n⚠️  Skipping geoid streaming tests (set GEMB_TEST_GEOID=1 to enable)")
