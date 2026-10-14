@@ -24,6 +24,8 @@ Load climate forcing data from specified dataset and return a DimStack with clim
 - `DimStack`: Stack with climate forcing variables as DimArrays
   - `temperature_air`, `pressure_air`, `vapor_pressure`, `wind_speed`,
     `precipitation`, `shortwave_downward`, `longwave_downward`
+  - `solar_zenith_angle` (degrees), `shortwave_downward_diffuse` (W/m²) and
+    `cloud_optical_thickness`, derived from the shortwave by [`shortwave_forcing_layers`](@ref)
   - Metadata includes location, dataset info, and observation heights
 
 # Examples

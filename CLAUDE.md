@@ -254,7 +254,9 @@ julia --project=/tmp/rgi7parquet_env data/make_rgi7_ice_albedo_parquet.jl 2019
      - `climate_adjust_for_glacier(stack, k)` / `(stack; rgi_id)` applies
        `T′ = T + (k−1)·max(T − T_ref, 0)` — increment form so `k=1` is bit-exact, **gated at
        the melting point** by default because a bare `k` multiplier *warms* sub-freezing air.
-       Recomputes `longwave_downward` only. **Leaves `vapor_pressure` untouched on purpose** —
+       Leaves `longwave_downward` unchanged (the decoupled layer is shallow and ERA5-Land
+       longwave does not depend on the glacier mask). **Leaves `vapor_pressure` untouched on
+       purpose**, apart from capping it at saturation of the cooled air —
        do *not* "fix" this by reusing `temperature_adjust`'s constant-RH propagation: SM10
        Eq. 4 pivots `e` about 6.11 hPa, the opposite sign. Wind is likewise untouched.
      - **Order matters**: `climate_adjust_for_elevation` first, then this. **RGI regions 05 and
@@ -1033,7 +1035,9 @@ step 3 as returning a `GEMB.ClimateForcing` struct — that is stale; loaders re
 ERA5-Land variables require conversion for GEMB compatibility:
 - `tp` (m) → `precipitation` (kg/m²): multiply by 1000
 - `ssrd`, `strd` (J/m²) → `shortwave/longwave_downward` (W/m²): divide by 3600
-- `d2m` (K) → `vapor_pressure` (Pa): via dewpoint formula
+- `d2m` (K) → `vapor_pressure` (Pa): saturation over water at the dewpoint (IFS curve)
+- `solar_zenith_angle`, `shortwave_downward_diffuse`, `cloud_optical_thickness`: from the
+  shortwave and the solar geometry over each step's accumulation hour (`src/solar.jl`)
 - `u10`, `v10` (m/s) → `wind_speed` (m/s): magnitude √(u² + v²)
 
 ### Performance Characteristics

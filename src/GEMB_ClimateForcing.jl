@@ -51,6 +51,12 @@ export simulate_climate_forcing, simulation_parameter_sets,
     fit_seasonal_daily_noise, varname2longname, simulate_coeffs_disp,
     geopotential2height, geoid_undulation, GEOID_MODELS, surface_elevation
 
+# Export solar geometry and the shortwave layers derived from it (zenith angle, diffuse part,
+# cloud optical thickness)
+export solar_geometry, shortwave_forcing_layers, solar_declination, equation_of_time,
+    earth_sun_distance_factor, cos_solar_zenith, erbs_diffuse_fraction, cloud_transmissivity,
+    cloud_optical_thickness, SOLAR_CONSTANT
+
 # Export satellite observations (ordered from the CDS Retrieve API, not a lazy store)
 export satellite_albedo, satellite_albedo_layers, SATELLITE_ALBEDO_VARIABLES
 
@@ -85,6 +91,7 @@ export derive_decoupling_factor, derive_lapse_rate, decoupling_factor_at_elevati
 
 # Include submodules
 include("utils.jl")
+include("solar.jl")
 include("authenticated_http_store.jl")
 # CDS Retrieve (job-based) client — needs get_cds_api_key from utils.jl.
 include("cds_retrieve.jl")

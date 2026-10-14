@@ -181,6 +181,8 @@ Validate that climate forcing variables in a DimStack have physically reasonable
 - `shortwave_downward`: W/m², range [0, 1500]
 - `longwave_downward`: W/m², `≤ $(LONGWAVE_ABSOLUTE_MAXIMUM)`, and bulk emissivity `LW/(σT⁴) ≥ $(LONGWAVE_EMISSIVITY_MINIMUM)`
 - `vapor_pressure`: Pascal (Pa), range [0, 10000]
+- where present: `solar_zenith_angle` in [0, 90] degrees, `shortwave_downward_diffuse` in
+  [0, `shortwave_downward`] W/m², `cloud_optical_thickness` in [0, $(CLOUD_OPTICAL_THICKNESS_MAX)]
 
 Two kinds of bound live here, and they behave differently under the adjustment functions. Most are
 physical invariants that hold however the forcing was produced, so they are checked every time. The
@@ -292,6 +294,26 @@ function validate_climate_forcing_units(stack::DimStack)
                       "so this irradiance is too small for its air temperature")
     end
 
+    # The shortwave layers derived from solar geometry, where present.
+    if haskey(stack, :solar_zenith_angle)
+        sza_min, sza_max = minimum(stack[:solar_zenith_angle]), maximum(stack[:solar_zenith_angle])
+        (sza_min < 0 || sza_max > 90) &&
+            push!(errors, "solar_zenith_angle: expected [0, 90] degrees, got [$(sza_min), $(sza_max)]")
+    end
+    if haskey(stack, :shortwave_downward_diffuse)
+        diffuse = parent(stack[:shortwave_downward_diffuse])
+        minimum(diffuse) < 0 &&
+            push!(errors, "shortwave_downward_diffuse: expected ≥ 0 W/m², got minimum $(minimum(diffuse)) W/m²")
+        n_over = count(i -> diffuse[i] > shortwave_downward[i], eachindex(diffuse, shortwave_downward))
+        n_over == 0 ||
+            push!(errors, "shortwave_downward_diffuse: exceeds shortwave_downward at $(n_over) steps")
+    end
+    if haskey(stack, :cloud_optical_thickness)
+        τ_min, τ_max = minimum(stack[:cloud_optical_thickness]), maximum(stack[:cloud_optical_thickness])
+        (τ_min < 0 || τ_max > CLOUD_OPTICAL_THICKNESS_MAX) &&
+            push!(errors, "cloud_optical_thickness: expected [0, $(CLOUD_OPTICAL_THICKNESS_MAX)], got [$(τ_min), $(τ_max)]")
+    end
+
     # Vapor pressure (Pa): should be non-negative and below saturation
     vp_min, vp_max = minimum(vapor_pressure), maximum(vapor_pressure)
     if vp_min < -1e-6
@@ -330,6 +352,12 @@ Load ERA5-Land reanalysis data using pure Julia (Zarr.jl) and return a DimStack 
   - `precipitation`: Precipitation rate (kg/m²/hr)
   - `shortwave_downward`: Downward shortwave radiation (W/m²)
   - `longwave_downward`: Downward longwave radiation (W/m²)
+  - `solar_zenith_angle`: Solar zenith angle (degrees), irradiance-weighted over each hour
+  - `shortwave_downward_diffuse`: Diffuse part of the downward shortwave (W/m²)
+  - `cloud_optical_thickness`: Cloud optical thickness (dimensionless)
+
+  The last three are derived from the shortwave and the solar geometry by
+  [`shortwave_forcing_layers`](@ref), each flux being the mean over the hour before its stamp.
 
   Metadata includes `latitude`, `longitude`, `dataset`, `chunk_strategy`, and
   `outside_land_mask`.
@@ -465,6 +493,9 @@ function load_era5_land(
         time_slice = _record_slice(time_values_raw, epoch, time_range)
         # Build DateTime values only for the selected slice.
         selected_times = [epoch + Hour(round(Int, time_values_raw[i])) for i in time_slice]
+        # Every flux is the mean over the hour before its stamp, which the solar geometry assumes.
+        all(==(Hour(1)), diff(selected_times)) ||
+            error("ERA5-Land time axis is not hourly between $(first(selected_times)) and $(last(selected_times))")
 
         @info "Extracting $(length(selected_times)) time steps in parallel..."
 
@@ -498,6 +529,9 @@ function load_era5_land(
            shortwave_downward, longwave_downward) =
             _era5_land_conversions(t2m_raw, d2m_raw, sp_raw, precipitation_raw, u10, v10,
                                    shortwave_raw, longwave_raw)
+        (; solar_zenith_angle, shortwave_downward_diffuse, cloud_optical_thickness) =
+            shortwave_forcing_layers(shortwave_downward, selected_lat, selected_lon,
+                                     selected_times, selected_elevation; step = Hour(1))
 
         @info "Data loaded successfully!" n_time_steps=length(selected_times)
 
@@ -519,7 +553,13 @@ function load_era5_land(
             shortwave_downward = DimArray(shortwave_downward, (time_dim,);
                                          metadata=Dict("units" => "W/m²", "long_name" => "surface solar radiation downward")),
             longwave_downward = DimArray(longwave_downward, (time_dim,);
-                                        metadata=Dict("units" => "W/m²", "long_name" => "surface thermal radiation downward"))
+                                        metadata=Dict("units" => "W/m²", "long_name" => "surface thermal radiation downward")),
+            solar_zenith_angle = DimArray(solar_zenith_angle, (time_dim,);
+                                          metadata=Dict("units" => "degrees", "long_name" => "solar zenith angle, irradiance-weighted over the hour")),
+            shortwave_downward_diffuse = DimArray(shortwave_downward_diffuse, (time_dim,);
+                                                  metadata=Dict("units" => "W/m²", "long_name" => "diffuse surface solar radiation downward")),
+            cloud_optical_thickness = DimArray(cloud_optical_thickness, (time_dim,);
+                                               metadata=Dict("units" => "1", "long_name" => "cloud optical thickness"))
         ); metadata = Dict(
             "latitude" => selected_lat,
             "longitude" => selected_lon,

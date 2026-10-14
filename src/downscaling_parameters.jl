@@ -93,10 +93,14 @@ const _LAPSE_RATE_LIMITS = (_LAPSE_RATE_MIN, _LAPSE_RATE_MAX)
 # into it.
 const _DECOUPLING_FACTOR_LIMITS = (0.0, 1.0)
 
-# The seven forcing layers `climate_forcing` returns. Named here rather than derived from a stack so
-# a caller accumulating layer-wise can allocate before it has seen one.
+# The ten forcing layers `climate_forcing` returns. Named here rather than derived from a stack so
+# a caller accumulating layer-wise can allocate before it has seen one. The last three are not
+# area-averaged like the rest: an average of `solar_zenith_angle` weights `cos θ` by shortwave
+# (see `shortwave_forcing_layers`).
 const _FORCING_VARIABLES = (:temperature_air, :pressure_air, :vapor_pressure, :wind_speed,
-                            :precipitation, :shortwave_downward, :longwave_downward)
+                            :precipitation, :shortwave_downward, :longwave_downward,
+                            :solar_zenith_angle, :shortwave_downward_diffuse,
+                            :cloud_optical_thickness)
 
 # Zeroed cross-cell sums for `n` timesteps, in the layout the `acc` contract above describes.
 function _downscaling_sums(n::Integer)
