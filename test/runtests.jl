@@ -46,6 +46,10 @@ println("="^70)
     # Include unit validation tests
     include("test_unit_validation.jl")
 
+    # Include ERA5-Land ingest tests (offline conversions and guards; live reads opt-in via
+    # CDS_API_KEY)
+    include("test_era5_land_ingest.jl")
+
     # Include elevation adjustment tests (offline, analytic)
     include("test_elevation_adjustment.jl")
 
