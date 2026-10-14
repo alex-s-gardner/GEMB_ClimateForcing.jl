@@ -158,13 +158,17 @@ function _era5_land_conversions(t2m, d2m, sp, tp, u10, v10, ssrd, strd)
 end
 
 function _floor_noise!(x, tolerance, name, units)
-    lo = minimum(v -> isnan(v) ? Inf : v, x; init = Inf)
+    lo = Inf
+    for i in eachindex(x)
+        v = x[i]
+        if v < 0              # false for NaN, which passes through
+            lo = min(lo, v)
+            x[i] = 0.0
+        end
+    end
     lo < -tolerance && throw(ArgumentError(
         "$(name): minimum $(lo) $(units) is more negative than the $(tolerance) $(units) of " *
         "de-accumulation noise this loader floors at zero"))
-    for i in eachindex(x)
-        x[i] < 0 && (x[i] = 0.0)
-    end
     return x
 end
 
@@ -296,7 +300,8 @@ function validate_climate_forcing_units(stack::DimStack)
 
     # The shortwave layers derived from solar geometry, where present.
     if haskey(stack, :solar_zenith_angle)
-        sza_min, sza_max = minimum(stack[:solar_zenith_angle]), maximum(stack[:solar_zenith_angle])
+        sza = parent(stack[:solar_zenith_angle])
+        sza_min, sza_max = minimum(sza), maximum(sza)
         (sza_min < 0 || sza_max > 90) &&
             push!(errors, "solar_zenith_angle: expected [0, 90] degrees, got [$(sza_min), $(sza_max)]")
     end
@@ -309,7 +314,8 @@ function validate_climate_forcing_units(stack::DimStack)
             push!(errors, "shortwave_downward_diffuse: exceeds shortwave_downward at $(n_over) steps")
     end
     if haskey(stack, :cloud_optical_thickness)
-        τ_min, τ_max = minimum(stack[:cloud_optical_thickness]), maximum(stack[:cloud_optical_thickness])
+        τ = parent(stack[:cloud_optical_thickness])
+        τ_min, τ_max = minimum(τ), maximum(τ)
         (τ_min < 0 || τ_max > CLOUD_OPTICAL_THICKNESS_MAX) &&
             push!(errors, "cloud_optical_thickness: expected [0, $(CLOUD_OPTICAL_THICKNESS_MAX)], got [$(τ_min), $(τ_max)]")
     end

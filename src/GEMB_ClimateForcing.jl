@@ -52,10 +52,10 @@ export simulate_climate_forcing, simulation_parameter_sets,
     geopotential2height, geoid_undulation, GEOID_MODELS, surface_elevation
 
 # Export solar geometry and the shortwave layers derived from it (zenith angle, diffuse part,
-# cloud optical thickness)
-export solar_geometry, shortwave_forcing_layers, solar_declination, equation_of_time,
-    earth_sun_distance_factor, cos_solar_zenith, erbs_diffuse_fraction, cloud_transmissivity,
-    cloud_optical_thickness, SOLAR_CONSTANT
+# cloud optical thickness). The component relations are public but unexported.
+export solar_geometry, shortwave_forcing_layers, SOLAR_CONSTANT
+public solar_declination, equation_of_time, earth_sun_distance_factor, cos_solar_zenith,
+    erbs_diffuse_fraction, cloud_transmissivity, cloud_optical_thickness
 
 # Export satellite observations (ordered from the CDS Retrieve API, not a lazy store)
 export satellite_albedo, satellite_albedo_layers, SATELLITE_ALBEDO_VARIABLES

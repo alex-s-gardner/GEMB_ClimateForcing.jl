@@ -12,7 +12,9 @@ using Dates
 using DimensionalData
 using Statistics
 
-using GEMB_ClimateForcing: _partition_shortwave, CLOUD_OPTICAL_THICKNESS_MAX,
+using GEMB_ClimateForcing: solar_declination, equation_of_time, earth_sun_distance_factor,
+    cos_solar_zenith, erbs_diffuse_fraction, cloud_transmissivity, cloud_optical_thickness,
+    _partition_shortwave, CLOUD_OPTICAL_THICKNESS_MAX,
     validate_climate_forcing_units, _cell_forcing_at_interval
 
 @testset "Solar geometry" begin

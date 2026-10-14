@@ -397,15 +397,18 @@ function climate_adjust_for_elevation(
     P′ = @. P * exp(-_G0 * Δz / (_R_DRY * 0.5 * (T + T′)))
 
     # 3. Vapor pressure: constant relative humidity, in ratio form.
-    e′ = _vapor_pressure_at.(e, T, T′)
+    # With Clausius–Clapeyron scaling the same saturation ratio scales precipitation, so it is
+    # formed once for both.
+    cc = precip_scaling_method === :clausius_clapeyron
+    ratio = cc ? (@. saturation_vapor_pressure(T′) / saturation_vapor_pressure(T)) : nothing
+    e′ = cc ? (@. e * ratio) : _vapor_pressure_at.(e, T, T′)
 
     # 4. Longwave down: recompute from adjusted T, e; preserve cloud increment Δε.
     LW′ = _adjust_longwave(LW, e, T, e′, T′)
 
     # 5. Precipitation: unchanged by default; Clausius–Clapeyron scaling if asked
     #    (Glover 1999, Eq. 19). eₛ ratio proxies q_sat(T′)/q_sat(T); exact at Δz=0.
-    precip′ = precip_scaling_method === :clausius_clapeyron ?
-              (@. precip * (saturation_vapor_pressure(T′) / saturation_vapor_pressure(T))) : precip
+    precip′ = cc ? (@. precip * ratio) : precip
 
     src_meta = metadata(climate_forcing_original)
     z_reanalysis = get(src_meta, "elevation", nothing)
