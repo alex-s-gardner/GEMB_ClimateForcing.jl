@@ -187,12 +187,12 @@ Applies the Shaw et al. (2025) decoupling factor `k` from the published **per-gl
 | Variable | Adjustment |
 |----------|-----------|
 | `temperature_air` | `T + (k−1)·max(T − T_ref, 0)`, i.e. cooling proportional to how far ambient sits above melting |
-| `longwave_downward` | Konzelmann (1994) clear-sky emissivity at the cooled `T′`, unchanged `e`, preserving the cloud increment Δε |
-| `vapor_pressure`, `pressure_air`, `wind_speed`, `precipitation`, `shortwave_downward` | unchanged |
+| `vapor_pressure` | unchanged, except capped at saturation of the cooled air: `min(e, eₛ(T′))` where `T′ < T` |
+| `longwave_downward`, `pressure_air`, `wind_speed`, `precipitation`, `shortwave_downward` | unchanged |
 
 **Run `climate_adjust_for_elevation` first.** `k` multiplies an ambient temperature *at the glacier's elevation*; the reverse order is wrong.
 
-`k` must be in `(0, 1]`; `1.0` reproduces the input exactly. Metadata records a **cumulative, multiplicative** `glacier_decoupling_factor` plus the lookup provenance (`glacier_decoupling_rgi_id`, `k_lower`, match distance).
+`k` must be in `(0, 1]`; `1.0` reproduces the input exactly. Downwelling longwave is left unchanged: the decoupling is a shallow surface layer, and ERA5-Land's longwave does not depend on the glacier mask the decoupling is measured from. Metadata records a **cumulative, multiplicative** `glacier_decoupling_factor` plus the lookup provenance (`glacier_decoupling_rgi_id`, `k_lower`, match distance).
 
 ```julia
 stack = climate_forcing(:era5land, 45.97, 7.53;
@@ -212,7 +212,7 @@ row = glacier_decoupling("RGI60-11.02810")   # (; k, k_lower, lat, lon, ele, …
 
 Two limits to know:
 
-- **`vapor_pressure` is left untouched by design.** This is *not* `temperature_adjust`'s constant-RH propagation. Shea & Moore (2010, Eq. 4) show `e_gla` pivots about 6.11 hPa (saturation over ice at 0 °C), so the boundary layer *adds* moisture when ambient air is drier than that — the opposite sign to constant-RH scaling. The correct scheme needs a flowpath-length raster.
+- **`vapor_pressure` is left untouched by design**, apart from the saturation cap. This is *not* `temperature_adjust`'s constant-RH propagation. Shea & Moore (2010, Eq. 4) show `e_gla` pivots about 6.11 hPa (saturation over ice at 0 °C), so the boundary layer *adds* moisture when ambient air is drier than that — the opposite sign to constant-RH scaling. The correct scheme needs a flowpath-length raster.
 - **RGI regions 05 (Greenland periphery) and 19 (Antarctic) are absent** from the Shaw table, so the lookup forms fail there; pass `k` explicitly. Cooling is gated to steps above melting by default (`apply_below_freezing=false`), since a bare `k` multiplier would *warm* sub-freezing air, and the regression is ablation-season only.
 
 ### `climate_model_invariant(; model, parameter, ...)`

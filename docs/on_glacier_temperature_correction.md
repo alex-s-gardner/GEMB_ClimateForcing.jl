@@ -356,10 +356,9 @@ sub-freezing branch is near-identity anyway, so the cleanest defensible choice i
 **leave `vapor_pressure` untouched** by the glacier correction rather than propagate ΔT
 through it, and document that a full SM10 `e` scheme needs an FPL raster.
 
-- **Longwave.** Cooling the air lowers incoming longwave. `temperature_adjust` already
-  handles this via the Konzelmann clear-sky emissivity with the cloud increment preserved.
-- **Longwave.** Cooling the air lowers incoming longwave. `temperature_adjust` already
-  handles this via the Konzelmann clear-sky emissivity with the cloud increment preserved.
+- **Longwave.** Left unchanged by the glacier correction. The decoupled layer is shallow, so
+  cooling it changes little of the column that emits downwelling longwave, and ERA5-Land's
+  longwave does not depend on the glacier mask that `k` is measured from.
 - **Wind speed.** Genuinely problematic. A katabatic layer produces a low-level jet at
   1–5 m above the surface that reanalysis cannot represent, and Shaw et al. (2024) show
   glacier winds can *enhance* turbulent heat transfer even while the air is cooler —

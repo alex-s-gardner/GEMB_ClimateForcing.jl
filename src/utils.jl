@@ -153,6 +153,12 @@ end
 # bit for bit, since `eₛ(T)/eₛ(T)` is exactly 1.
 _vapor_pressure_at(e, T, T′) = e * (saturation_vapor_pressure(T′) / saturation_vapor_pressure(T))
 
+# Vapor pressure after the glacier decoupling cools the air from `T` to `T′` at fixed moisture:
+# unchanged, except that cooled air holds at most saturation at its new temperature. Applied only
+# where the air was cooled, so an unchanged step returns `e` bit for bit even when its input is
+# supersaturated.
+_cap_vapor_pressure(e, T, T′) = T′ < T ? min(e, saturation_vapor_pressure(T′)) : e
+
 # ----------------------------------------------------------------------------
 # Shared helpers for the forcing-adjustment functions
 # (elevation_adjustment.jl, climate_adjustment.jl, glacier_adjustment.jl).
