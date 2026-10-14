@@ -18,41 +18,45 @@ using Statistics
 
 using GEMB_ClimateForcing: _MIN_AMBIENT_EXCESS, _MIN_CELLS_DEFAULT, _LAPSE_RATE_LIMITS,
     _DECOUPLING_FACTOR_LIMITS, _DECOUPLING_REFERENCE_TEMPERATURE, _solve_sym4, _r2,
-    _make_applicable, _decouple_per_timestep, saturation_vapor_pressure
+    _make_applicable, _decouple_per_timestep, saturation_vapor_pressure,
+    _downscaling_sums, _accumulate_downscaling_cell!
 
 const _DP_TIME = collect(DateTime(2000, 1, 1):Hour(1):DateTime(2000, 1, 1, 5))
 
 # The cross-cell sums the two fits read, accumulated exactly as a streaming producer does: the
-# design vector is `x = [1, z, glm, glm*z]` and the responses are the warm excess `E` and the
-# temperature `T`. `cells` is a vector of `(; z, glm)`; `temperature(cell)` returns that cell's
-# temperature vector over `_DP_TIME`.
-function _acc(cells, temperature)
-    n = length(_DP_TIME)
-    S = (; s1 = zeros(Int, n),
-         z = zeros(n), g = zeros(n), w = zeros(n),
-         zz = zeros(n), zg = zeros(n), zw = zeros(n),
-         gg = zeros(n), gw = zeros(n), ww = zeros(n),
-         E = zeros(n), zE = zeros(n), gE = zeros(n), wE = zeros(n),
-         T = zeros(n), zT = zeros(n), EE = zeros(n))
+# design vector is `x = [1, z, glm, glm*z]`, the responses are the warm excess `E` and the
+# temperature `T`, and the decoupling fit's sums run over the cells above melting only. `cells` is
+# a vector of `(; z, glm)`; `temperature(cell)` returns that cell's temperature vector over `time`.
+function _acc(cells, temperature; time = _DP_TIME)
+    n = length(time)
+    S = (; s1 = zeros(Int, n), z = zeros(n), zz = zeros(n), T = zeros(n), zT = zeros(n),
+         g = zeros(n), w = zeros(n), zw = zeros(n),
+         s1_warm = zeros(Int, n), z_warm = zeros(n), g_warm = zeros(n), w_warm = zeros(n),
+         zz_warm = zeros(n), zg_warm = zeros(n), zw_warm = zeros(n),
+         gg_warm = zeros(n), gw_warm = zeros(n), ww_warm = zeros(n),
+         E = zeros(n), zE = zeros(n), gE = zeros(n), wE = zeros(n), EE = zeros(n))
     for c in cells
         z, glm, gz = Float64(c.z), Float64(c.glm), Float64(c.glm) * Float64(c.z)
         T = temperature(c)
         for t in 1:n
             Tt = T[t]
-            Et = max(Tt - _DECOUPLING_REFERENCE_TEMPERATURE, 0.0)
             S.s1[t] += 1
-            S.z[t]  += z;         S.g[t]  += glm;        S.w[t]  += gz
-            S.zz[t] += z * z;     S.zg[t] += z * glm;    S.zw[t] += z * gz
-            S.gg[t] += glm * glm; S.gw[t] += glm * gz;   S.ww[t] += gz * gz
+            S.z[t] += z; S.zz[t] += z * z; S.T[t] += Tt; S.zT[t] += z * Tt
+            S.g[t] += glm; S.w[t] += gz; S.zw[t] += z * gz
+            Et = Tt - _DECOUPLING_REFERENCE_TEMPERATURE
+            Et > 0 || continue
+            S.s1_warm[t] += 1
+            S.z_warm[t]  += z;         S.g_warm[t]  += glm;        S.w_warm[t]  += gz
+            S.zz_warm[t] += z * z;     S.zg_warm[t] += z * glm;    S.zw_warm[t] += z * gz
+            S.gg_warm[t] += glm * glm; S.gw_warm[t] += glm * gz;   S.ww_warm[t] += gz * gz
             S.E[t]  += Et;        S.zE[t] += z * Et
             S.gE[t] += glm * Et;  S.wE[t] += gz * Et
-            S.T[t]  += Tt;        S.zT[t] += z * Tt
             S.EE[t] += Et * Et
         end
     end
     # Unweighted mean elevation: these fixtures give every cell the same glacier area, so the
     # area-weighted reference a real producer computes reduces to this.
-    return (; time = _DP_TIME, n, sums = S,
+    return (; time, n, sums = S,
             mean_elevation = Statistics.mean(Float64(c.z) for c in cells))
 end
 
@@ -230,7 +234,7 @@ end
         function scatter(c)
             v = _dp_observed(c)
             for t in eachindex(v)
-                v[t] += c.glm * 8.0 * (isodd(t) ? 1 : -1)
+                v[t] += c.glm * 4.0 * (isodd(t) ? 1 : -1)
             end
             return v
         end
@@ -290,6 +294,68 @@ end
         # An unfitted timestep stays unfitted at every elevation.
         gated = decoupling_factor_at_elevation(derive_decoupling_factor(acc; min_cells = 5), 1800.0)
         @test all(isnan, gated)
+    end
+
+    @testset "the reference accumulator matches the contract" begin
+        S = _downscaling_sums(length(_DP_TIME))
+        T(c) = [_dp_ambient(c) + (isodd(t) ? 0.0 : -30.0) for t in eachindex(_DP_TIME)]
+        for c in _DP_CELLS
+            _accumulate_downscaling_cell!(S, T(c), c.z, c.glm)
+        end
+        ref = _acc(_DP_CELLS, T).sums
+        @test keys(S) == keys(ref)
+        for f in keys(ref)
+            @test getfield(S, f) == getfield(ref, f)
+        end
+        # Cold steps contribute to the all-cell sums only.
+        @test S.s1 == fill(4, length(_DP_TIME))
+        @test S.s1_warm == [isodd(t) ? 4 : 0 for t in eachindex(_DP_TIME)]
+        @test_throws DimensionMismatch _accumulate_downscaling_cell!(S, zeros(3), 1000.0, 0.5)
+    end
+
+    @testset "truncated excess: the top of the region is below melting" begin
+        # Twenty cells from 500 to 2500 m, glacier fraction rising with elevation plus a fixed
+        # perturbation, ambient excess 14 − 0.006 z, so every cell above 2333 m is below melting.
+        # Fitting only the cells above melting recovers k exactly; fitting the truncated excess as
+        # if it were linear would give 0.74.
+        k_true = 0.8
+        zs = range(500.0, 2500.0; length = 20)
+        cells = [(z = z, glm = clamp(clamp((z - 500) / 2000, 0, 1)^2 + 0.05 * sin(3i), 0, 1))
+                 for (i, z) in enumerate(zs)]
+        E_amb(z) = 14 - 0.006z
+        observed(c) = fill(_DECOUPLING_REFERENCE_TEMPERATURE +
+                           (E_amb(c.z) > 0 ? (1 - c.glm * (1 - k_true)) * E_amb(c.z) : E_amb(c.z)),
+                           length(_DP_TIME))
+        acc53 = _acc(cells, observed)
+        d = derive_decoupling_factor(acc53)
+        @test all(k -> isapprox(k, k_true; atol = 0.01), d.decoupling_factor)
+        @test all(==(count(c -> E_amb(c.z) > 0, cells)), d.n_cells_above_melting)
+        @test all(==(20), d.n_cells)
+        # Too few cells above melting: NaN, even with plenty of cells in the region.
+        @test all(isnan, derive_decoupling_factor(acc53; min_cells = 19).decoupling_factor)
+    end
+
+    @testset "k is held at the edge of the ambient excess" begin
+        # A fit whose k varies with elevation: k(z) = 1 + (γ + δz)/(α + βz), ambient excess
+        # α + βz = 10 − 0.004z reaching the 0.5 K threshold at z* = 2375 m.
+        n = length(_DP_TIME)
+        ti = Ti(_DP_TIME)
+        col(v) = DimArray(fill(v, n), ti)
+        α, β, γ, δ = 10.0, -0.004, -1.0, -0.0005
+        dec = DimStack((decoupling_factor = col(NaN), coef_alpha = col(α), coef_beta = col(β),
+                        coef_gamma = col(γ), coef_delta = col(δ)))
+        z_star = (_MIN_AMBIENT_EXCESS - α) / β
+        k_star = (_MIN_AMBIENT_EXCESS + γ + δ * z_star) / _MIN_AMBIENT_EXCESS
+        below = decoupling_factor_at_elevation(dec, 2000.0)
+        @test all(k -> k ≈ 1 + (γ + δ * 2000.0) / (α + β * 2000.0), below)
+        @test DimensionalData.metadata(below)["n_held"] == 0
+        for z in (2400.0, 3000.0, 6000.0)
+            above = decoupling_factor_at_elevation(dec, z)
+            @test all(==(k_star), above)
+            @test DimensionalData.metadata(above)["n_held"] == n
+        end
+        # Continuous at the edge: approaching z* from below reaches the held value.
+        @test only(unique(decoupling_factor_at_elevation(dec, z_star - 1e-6))) ≈ k_star rtol = 1e-6
     end
 
     @testset "_decouple_per_timestep" begin

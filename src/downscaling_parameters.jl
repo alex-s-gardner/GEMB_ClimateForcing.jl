@@ -28,8 +28,8 @@
 # Both fits take an accumulator of per-timestep cross-cell regression sums rather than a stack of
 # forcing, so a region of hundreds of cells over decades of hourly steps never has to be held in
 # memory at once. Its producer lives in the caller (GEMB_GlacierSims builds one by streaming a
-# glacier elevation-class table), so the contract is documented here rather than being visible in
-# one file:
+# glacier elevation-class table); `_downscaling_sums` and `_accumulate_downscaling_cell!` below are
+# the reference producer, and the contract is:
 #
 #   acc.n              — number of timesteps
 #   acc.time           — the `Ti` axis values, `length(acc.time) == acc.n`
@@ -38,18 +38,23 @@
 #   acc.sums           — the sums below, or `nothing` if no cell had usable forcing
 #
 # `acc.sums` holds one length-`n` vector per field. With the design vector `x = [1, z, glm, glm*z]`
-# per cell — `z` its reanalysis elevation (m), `glm` its glacier-mask fraction — and `w = glm*z`:
+# per cell — `z` its reanalysis elevation (m), `glm` its glacier-mask fraction — `w = glm*z`, and
+# the warm excess `E = max(T - T_ref, 0)`:
 #
-#   s1                       — count of contributing cells (Int)
-#   z, g, w                  — Σz, Σglm, Σw
-#   zz, zg, zw, gg, gw, ww   — the upper triangle of XᵀX
-#   E, zE, gE, wE            — Xᵀ against the warm excess `E = max(T - T_ref, 0)`
+#   s1, z, zz, T, zT         — over every contributing cell: count (Int), Σz, Σz², ΣT, ΣzT
+#   g, w, zw                 — Σglm, Σw, Σzw over every contributing cell, for the lapse fit
+#   s1_warm                  — count of cells above melting (`E > 0`) at that timestep (Int)
+#   z_warm, g_warm, w_warm   — Σz, Σglm, Σw over those cells
+#   zz_warm, zg_warm, zw_warm, gg_warm, gw_warm, ww_warm
+#                            — the upper triangle of XᵀX over those cells
+#   E, zE, gE, wE            — Xᵀ against `E` (cells at or below melting add zero)
 #   EE                       — ΣE², for the decoupling fit's `r2`
-#   T, zT                    — ΣT and ΣzT, for the lapse fit
 #
-# Duck-typed on purpose: a NamedTuple of `Vector{Float64}` (plus `Vector{Int}` for `s1`) is all
-# either fit reads, and pinning a struct here would make the accumulator's own layout this
-# package's business.
+# The `_warm` sums restrict the decoupling fit to cells above melting, where the warm excess is the
+# product the fit models; see `derive_decoupling_factor`.
+#
+# Duck-typed on purpose: a NamedTuple of `Vector{Float64}` (plus `Vector{Int}` for the counts) is
+# all either fit reads, and a producer may carry further fields of its own.
 
 # Melting point (K). The decoupling correction damps only the excess above it, matching
 # `climate_adjust_for_glacier`'s `reference_temperature` default.
@@ -92,6 +97,41 @@ const _DECOUPLING_FACTOR_LIMITS = (0.0, 1.0)
 const _FORCING_VARIABLES = (:temperature_air, :pressure_air, :vapor_pressure, :wind_speed,
                             :precipitation, :shortwave_downward, :longwave_downward)
 
+# Zeroed cross-cell sums for `n` timesteps, in the layout the `acc` contract above describes.
+function _downscaling_sums(n::Integer)
+    counts() = zeros(Int, n)
+    v() = zeros(n)
+    return (; s1 = counts(), z = v(), zz = v(), T = v(), zT = v(), g = v(), w = v(), zw = v(),
+            s1_warm = counts(), z_warm = v(), g_warm = v(), w_warm = v(),
+            zz_warm = v(), zg_warm = v(), zw_warm = v(), gg_warm = v(), gw_warm = v(),
+            ww_warm = v(),
+            E = v(), zE = v(), gE = v(), wE = v(), EE = v())
+end
+
+# Add one cell — temperature series `T` (K), reanalysis elevation `z` (m), glacier-mask fraction
+# `glm` — into the sums `S`. Every vector of `S` must share `T`'s indices.
+function _accumulate_downscaling_cell!(S, T, z::Real, glm::Real)
+    z, glm = Float64(z), Float64(glm)
+    gz = glm * z
+    for t in eachindex(T, S.s1)
+        Tt = T[t]
+        S.s1[t] += 1
+        S.z[t] += z;  S.zz[t] += z * z
+        S.T[t] += Tt; S.zT[t] += z * Tt
+        S.g[t] += glm; S.w[t] += gz; S.zw[t] += z * gz
+        Et = Tt - _DECOUPLING_REFERENCE_TEMPERATURE
+        Et > 0 || continue
+        S.s1_warm[t] += 1
+        S.z_warm[t]  += z;         S.g_warm[t]  += glm;        S.w_warm[t]  += gz
+        S.zz_warm[t] += z * z;     S.zg_warm[t] += z * glm;    S.zw_warm[t] += z * gz
+        S.gg_warm[t] += glm * glm; S.gw_warm[t] += glm * gz;   S.ww_warm[t] += gz * gz
+        S.E[t]  += Et;        S.zE[t] += z * Et
+        S.gE[t] += glm * Et;  S.wE[t] += gz * Et
+        S.EE[t] += Et * Et
+    end
+    return S
+end
+
 """
     derive_decoupling_factor(acc; min_cells = $(_MIN_CELLS_DEFAULT)) -> DimStack
 
@@ -132,21 +172,31 @@ i.e. the fitted excess of a fully-glaciated cell over that of an ice-free one at
 Elevation is a control, not a nuisance: `glm` and elevation covary strongly (high cells are more
 glaciated), so without it the `glm` slope is partly a topographic signal.
 
+**Only cells above melting are fitted.** The model is a product of the damping factor and the
+ambient excess, and the excess is truncated at zero: a cell at or below melting reports `E = 0`
+whatever its ambient temperature, so it lies off the linear surface rather than on it. Where the
+melting level falls inside the region, including those cells bends the fitted surface toward zero
+at the cold end and biases `k` low (0.74 against a true 0.80 on a synthetic region whose top
+cells are below melting). Under the model a cell is above melting exactly when its ambient
+temperature is, since the damping factor is positive, so restricting the fit to cells with
+`E > 0` loses nothing and the four-term surface is exact on what remains.
+
 Returns a `DimStack` on the accumulated `Ti` axis:
 
 | layer | meaning |
 |:--|:--|
 | `decoupling_factor` | `k` at the reference elevation, raw. `NaN` where the region supported no fit |
 | `n_cells` | grid cells contributing to that timestep |
-| `r2` | coefficient of determination of the four-term fit |
+| `n_cells_above_melting` | of those, the cells above melting — the ones the fit uses |
+| `r2` | coefficient of determination of the four-term fit, over the cells above melting |
 | `ambient_excess` | the fitted ice-free excess `α + β·z̄` (K) — what the fit's precision hinges on |
 | `coef_alpha`, `coef_beta`, `coef_gamma`, `coef_delta` | all four coefficients, so `k` is re-evaluable at any elevation — see [`decoupling_factor_at_elevation`](@ref) |
 
 `metadata` carries `reference_elevation` (`z̄`), `min_cells`, `n_fitted`, and `n_timesteps`.
 
 **`NaN` means "the forcing carried no information here", and nothing more.** A timestep reports `NaN`
-when it has fewer than `max(min_cells, 4)` cells (four parameters need four cells), no spread in `glm`
-or elevation, collinear regressors, or an ambient excess below `$(_MIN_AMBIENT_EXCESS)` K. That last
+when it has fewer than `max(min_cells, 4)` cells above melting (four parameters need four cells), no
+spread in `glm` or elevation among them, collinear regressors, or an ambient excess below `$(_MIN_AMBIENT_EXCESS)` K. That last
 case is most of a glacier record and is a real identifiability limit rather than a divide-by-zero
 guard: `k` is a *ratio* of fitted excesses, so a region sitting near melting fits one out of noise —
 on real Alpine forcing that produced a confident-looking winter `k` of 0.2 from a 0.1 K excess.
@@ -214,8 +264,10 @@ the coefficients — the diagnostic to screen on.
 
 Four cells make the four-term fit *determinate*, which is not the same as identified. Because forcing
 completeness is screened per cell, the contributing count is constant across time — so `min_cells`
-gates whole regions, and the cost of raising it is measured in regions dropped rather than timesteps
-pruned.
+gates whole regions, and the cost of raising it is measured mostly in regions dropped. The count above
+melting, which is what the gate is applied to, also varies with time: a timestep whose melting level
+leaves fewer than `min_cells` cells above it reports `NaN`. The subsampling and coverage figures below
+were measured with every cell counted.
 
 Subsampling Wrangell's 38 cells to `m`, spread through the elevation ordering, and scoring each
 subsample's `k` against the all-38-cell fit:
@@ -267,6 +319,7 @@ function derive_decoupling_factor(acc; min_cells::Int = _MIN_CELLS_DEFAULT)
     decoupling_factor = fill(NaN, n)
     r2 = fill(NaN, n)
     n_cells = zeros(Int, n)
+    n_cells_above_melting = zeros(Int, n)
     # The fitted ice-free excess at `z̄`, per timestep. `NaN` where nothing was fitted.
     ambient_excess = fill(NaN, n)
     # All four fitted coefficients per timestep, so `k` can be re-evaluated at an elevation other
@@ -276,16 +329,19 @@ function derive_decoupling_factor(acc; min_cells::Int = _MIN_CELLS_DEFAULT)
 
     S = acc.sums
     if S !== nothing
-        @inbounds for t in 1:n
+        for t in 1:n
             n_cells[t] = S.s1[t]
-            # Four parameters need four cells before the system is even determined.
-            S.s1[t] >= max(min_cells, 4) || continue
+            m = S.s1_warm[t]
+            n_cells_above_melting[t] = m
+            # Only cells above melting are fitted, and four parameters need four of them before the
+            # system is even determined.
+            m >= max(min_cells, 4) || continue
 
-            # XᵀX for x = [1, z, glm, glm*z], upper triangle, and Xᵀy for y = E.
-            A = (Float64(S.s1[t]), S.z[t], S.g[t],  S.w[t],
-                                   S.zz[t], S.zg[t], S.zw[t],
-                                            S.gg[t], S.gw[t],
-                                                     S.ww[t])
+            # XᵀX for x = [1, z, glm, glm*z] over the warm cells, upper triangle, and Xᵀy for y = E.
+            A = (Float64(m), S.z_warm[t],  S.g_warm[t],  S.w_warm[t],
+                             S.zz_warm[t], S.zg_warm[t], S.zw_warm[t],
+                                           S.gg_warm[t], S.gw_warm[t],
+                                                         S.ww_warm[t])
             coef = _solve_sym4(A, (S.E[t], S.zE[t], S.gE[t], S.wE[t]))
             coef === nothing && continue
             α, β, γ, δ = coef
@@ -304,7 +360,7 @@ function derive_decoupling_factor(acc; min_cells::Int = _MIN_CELLS_DEFAULT)
             # here would hide precisely the timesteps a caller needs to see before trusting a
             # summary. `elevation_interval_forcing` clamps, because it applies.
             decoupling_factor[t] = decoupled / ambient
-            r2[t] = _r2(S.s1[t], S.E[t], S.EE[t],
+            r2[t] = _r2(m, S.E[t], S.EE[t],
                         α * S.E[t] + β * S.zE[t] + γ * S.gE[t] + δ * S.wE[t])
             ambient_excess[t] = ambient
             cα[t] = α; cβ[t] = β; cγ[t] = γ; cδ[t] = δ
@@ -318,6 +374,7 @@ function derive_decoupling_factor(acc; min_cells::Int = _MIN_CELLS_DEFAULT)
 
     return DimStack((decoupling_factor = DimArray(decoupling_factor, ti),
                      n_cells = DimArray(n_cells, ti),
+                     n_cells_above_melting = DimArray(n_cells_above_melting, ti),
                      r2 = DimArray(r2, ti),
                      ambient_excess = DimArray(ambient_excess, ti),
                      coef_alpha = DimArray(cα, ti),
@@ -387,23 +444,24 @@ function decoupling_factor_at_elevation(decoupling, elevation::Real; elevation_r
 
     k = fill(NaN, n)
     n_held = 0
-    @inbounds for t in 1:n
+    for t in 1:n
         isfinite(α[t]) || continue
         a, b = α[t], β[t]
         # Evaluate at `z` if the ambient excess still clears the threshold there, and otherwise at
-        # the nearest elevation where it does. `E_ambient = a + b·z` is linear, so its valid set is a
-        # half-line whose edge is `z* = (threshold - a) / b`; a fitted timestep puts `z̄` inside it,
-        # so the edge is always on the far side of `z̄` from `z` and clamping toward it cannot
-        # overshoot.
-        z_eval = z
-        if a + b * z < _MIN_AMBIENT_EXCESS
+        # the edge of the half-line where it does: `E_ambient = a + b·z` is linear, so that edge is
+        # `z* = (threshold - a) / b`, and a fitted timestep has `z̄` inside it. At the edge the
+        # ambient excess is the threshold itself by construction, so it is used directly rather
+        # than re-evaluated — rounding in `a + b·z*` could otherwise land a hair below the
+        # threshold and drop a held timestep.
+        if a + b * z >= _MIN_AMBIENT_EXCESS
+            ambient = a + b * z
+            z_eval = z
+        else
             b == 0 && continue                     # constant and already below: nothing to hold onto
-            z_star = (_MIN_AMBIENT_EXCESS - a) / b
-            z_eval = b < 0 ? min(z, z_star) : max(z, z_star)
+            ambient = _MIN_AMBIENT_EXCESS
+            z_eval = (_MIN_AMBIENT_EXCESS - a) / b
             n_held += 1
         end
-        ambient = a + b * z_eval
-        ambient >= _MIN_AMBIENT_EXCESS || continue
         k[t] = (ambient + (γ[t] + δ[t] * z_eval)) / ambient
     end
 
