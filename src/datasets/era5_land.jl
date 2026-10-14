@@ -340,7 +340,9 @@ Load ERA5-Land reanalysis data using pure Julia (Zarr.jl) and return a DimStack 
 - Uses nearest-neighbor selection for lat/lon. `lon` may be in either the −180…180 or the
   0–360°E convention; the nearest cell is found around the circle, across the ±180° seam.
 - `time_range` must lie within the record; a range that starts before it or ends after it
-  throws rather than returning a shorter series.
+  throws rather than returning a shorter series. With `cache_path`, the record is the one in
+  the cached metadata, which never grows: a request past its end throws with instructions for
+  refreshing the cache.
 - A cell outside the ERA5-Land land mask (all values `NaN`) is returned as is, with
   `outside_land_mask = true` and no validation. Any other non-finite value throws.
 - Hourly temporal resolution
@@ -454,6 +456,12 @@ function load_era5_land(
         # forcing download.
         selected_elevation = surface_elevation(:era5land, selected_lat, selected_lon)
 
+        # A cached store keeps the consolidated metadata it was first opened with, so its record
+        # never grows: check it before trusting it.
+        isnothing(cache_path) ||
+            _check_cached_record(cache_path, time_values_raw, epoch, time_range,
+                                 (t2m_zarr, d2m_zarr, sp_zarr, tp_zarr, u10_zarr, v10_zarr,
+                                  ssrd_zarr, strd_zarr))
         time_slice = _record_slice(time_values_raw, epoch, time_range)
         # Build DateTime values only for the selected slice.
         selected_times = [epoch + Hour(round(Int, time_values_raw[i])) for i in time_slice]
@@ -566,6 +574,34 @@ function _record_slice(time_values::AbstractVector, epoch::DateTime, time_range)
     start_hours = Dates.value(start_time - epoch) / 3_600_000
     end_hours = Dates.value(end_time - epoch) / 3_600_000
     return findfirst(>=(start_hours), time_values):findlast(<=(end_hours), time_values)
+end
+
+"""
+    _check_cached_record(cache_path, time_values, epoch, time_range, arrays)
+
+Refuse a request the disk cache cannot answer correctly. `Zarr.CachingStore` serves each group's
+consolidated metadata (`.zmetadata`) from the copy cached on first open, so the record a cache
+reports ends where the live store ended then. Throws an `ArgumentError` with refresh instructions
+when `time_range` ends after that cached end, or when the cached groups disagree on the record
+length (caches opened at different times). Nothing is deleted.
+"""
+function _check_cached_record(cache_path, time_values, epoch, time_range, arrays)
+    record_end = epoch + Hour(round(Int, last(time_values)))
+    lengths = map(a -> size(a, 3), arrays)
+    consistent = all(==(length(time_values)), lengths)
+    (consistent && last(time_range) <= record_end) && return nothing
+    problem = consistent ?
+        "time_range ends at $(last(time_range)), after the record end in the cached metadata " *
+        "under $(cache_path) ($(record_end))." :
+        "the cached groups under $(cache_path) record different record lengths " *
+        "($(join(unique(lengths), ", ")) steps), so they were cached at different times."
+    throw(ArgumentError(problem * " A disk cache keeps each store's .zmetadata as it was " *
+        "first read, so the cached record never grows, and the chunk files covering the end of " *
+        "the old record were cached before the later steps were written. To refresh, delete " *
+        "the cached group directories (" * join(keys(ERA5_LAND_STORES), ", ") * ") under " *
+        "$(cache_path) — the .zmetadata files and every chunk file in them — and rerun; the " *
+        "next load re-reads the live metadata. Deleting only .zmetadata would leave stale " *
+        "chunks behind. Nothing is deleted automatically."))
 end
 
 """

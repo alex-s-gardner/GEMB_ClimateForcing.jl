@@ -14,8 +14,8 @@ using DimensionalData
 using Statistics
 
 using GEMB_ClimateForcing: _era5_land_conversions, _nearest_longitude_index, find_nearest_index,
-    _record_slice, validate_climate_forcing_units, SHORTWAVE_NEGATIVE_TOLERANCE,
-    PRECIPITATION_NEGATIVE_TOLERANCE
+    _record_slice, _check_cached_record, validate_climate_forcing_units,
+    SHORTWAVE_NEGATIVE_TOLERANCE, PRECIPITATION_NEGATIVE_TOLERANCE
 
 @testset "ERA5-Land ingest" begin
     @testset "unit conversions" begin
@@ -74,6 +74,23 @@ using GEMB_ClimateForcing: _era5_land_conversions, _nearest_longitude_index, fin
         @test_throws ArgumentError _record_slice(hours, epoch, (epoch - Hour(1), epoch + Hour(3)))
     end
 
+    @testset "a cached record that cannot answer the request" begin
+        epoch = DateTime(1970)
+        hours = collect(0.0:23.0)
+        arrays = ntuple(_ -> zeros(1, 1, 24), 8)
+        within = (epoch, DateTime(1970, 1, 1, 23))
+        @test _check_cached_record("/cache", hours, epoch, within, arrays) === nothing
+        # Past the cached end: the error says how to refresh, and that chunks must go too.
+        past = (epoch, DateTime(1970, 1, 2, 3))
+        @test_throws "after the record end in the cached metadata" _check_cached_record(
+            "/cache", hours, epoch, past, arrays)
+        @test_throws "every chunk file" _check_cached_record("/cache", hours, epoch, past, arrays)
+        # Groups cached at different times disagree on the record length.
+        mixed = (ntuple(_ -> zeros(1, 1, 24), 7)..., zeros(1, 1, 20))
+        @test_throws "different record lengths" _check_cached_record(
+            "/cache", hours, epoch, within, mixed)
+    end
+
     @testset "non-finite values fail validation" begin
         ti = Ti(DateTime(2020, 1, 1) .+ Hour.(0:2))
         good = (temperature_air = [270.0, 271.0, 272.0], pressure_air = fill(9e4, 3),
@@ -103,6 +120,16 @@ using GEMB_ClimateForcing: _era5_land_conversions, _nearest_longitude_index, fin
             @test all(==(Hour(1)), diff(t))
             @test_throws ArgumentError climate_forcing(:era5land, 46.5, 8.0; token,
                 cache_path = cache, time_range = (DateTime(1900, 1, 1), DateTime(1900, 1, 2)))
+            # Past the end of the cached record: refused with refresh instructions.
+            @test_throws "cached metadata" climate_forcing(:era5land, 46.5, 8.0; token,
+                cache_path = cache, time_range = (DateTime(2020, 1, 1), now(UTC) + Day(30)))
+        end
+
+        @testset "live: a cell outside the land mask" begin
+            s = climate_forcing(:era5land, 0.0, -25.0; token, cache_path = cache,
+                                time_range = (DateTime(2020, 1, 1), DateTime(2020, 1, 2)))
+            @test DimensionalData.metadata(s)["outside_land_mask"]
+            @test all(isnan, s[:temperature_air])
         end
     end
 end
