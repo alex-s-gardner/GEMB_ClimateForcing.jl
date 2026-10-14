@@ -82,7 +82,7 @@ atmosphere and cloud base above it; cooling that layer changes little of the emi
 What `k` measures is the 2 m temperature response to the reanalysis glacier mask, and ERA5-Land's
 downwelling longwave does not depend on that mask, so the data carry no signal for adjusting it.
 
-**Vapour pressure is left untouched except for one physical cap**, and this is *not* the
+**Vapor pressure is left untouched except for one physical cap**, and this is *not* the
 constant-relative-humidity propagation used by [`temperature_adjust`](@ref):
 
 ```
