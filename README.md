@@ -107,7 +107,7 @@ Keyword arguments:
 - `chunk_strategy::Symbol=:geo` — `:geo` for point time-series (recommended), `:time` for spatial maps
 - `cache_path::Union{String,Nothing}=nothing` — persistent disk cache (`Zarr.CachingStore`)
 
-Returns a `DimStack` with `temperature_air`, `pressure_air`, `vapor_pressure`, `wind_speed`, `precipitation`, `shortwave_downward`, and `longwave_downward`, plus location and observation-height metadata.
+Returns a `DimStack` with `temperature_air`, `pressure_air`, `vapor_pressure`, `wind_speed`, `precipitation`, `shortwave_downward`, and `longwave_downward`, plus three layers derived from the shortwave and the solar geometry (`shortwave_forcing_layers`): `solar_zenith_angle` (degrees, irradiance-weighted over the hour each flux averages), `shortwave_downward_diffuse` (W/m², Erbs et al. 1982 diffuse fraction of the clearness index) and `cloud_optical_thickness` (Lacis & Hansen 1974 transmissivity inverted against the FAO-56 clear-sky clearness). Location and observation-height metadata are attached.
 
 ### `climate_adjust_for_elevation(stack, delta_elevation; kwargs...)`
 
@@ -574,7 +574,7 @@ Data is read from ECMWF's ARCO Zarr stores at `arco.datastores.ecmwf.int`. Varia
 | `sfc-2m-temperature` | `t2m`, `d2m` | `temperature_air` (K), `vapor_pressure` (Pa via dewpoint) |
 | `sfc-pressure-precipitation` | `sp`, `tp` | `pressure_air` (Pa), `precipitation` (kg/m² = `tp`×1000) |
 | `sfc-wind` | `u10`, `v10` | `wind_speed` (m/s magnitude) |
-| `sfc-radiation-heat` | `ssrd`, `strd` | `shortwave_downward`, `longwave_downward` (W/m² = J/m² ÷ 3600) |
+| `sfc-radiation-heat` | `ssrd`, `strd` | `shortwave_downward`, `longwave_downward` (W/m² = J/m² ÷ 3600); `solar_zenith_angle`, `shortwave_downward_diffuse`, `cloud_optical_thickness` from the shortwave and solar geometry |
 
 Grid: 0.1° (~9 km), 1801 × 3600 (lat × lon), hourly, 1950–present.
 

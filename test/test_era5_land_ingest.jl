@@ -125,6 +125,33 @@ using GEMB_ClimateForcing: _era5_land_conversions, _nearest_longitude_index, fin
                 cache_path = cache, time_range = (DateTime(2020, 1, 1), now(UTC) + Day(30)))
         end
 
+        @testset "live: accumulation convention and interval assignment" begin
+            # 46.5° N, 8° E through 2023: the hourly fluxes are de-accumulated means over the hour
+            # before each stamp.
+            s = climate_forcing(:era5land, 46.5, 8.0; token, cache_path = cache,
+                                time_range = (DateTime(2023, 1, 1), DateTime(2023, 12, 31, 23)))
+            t = collect(dims(s, Ti))
+            sw = parent(s[:shortwave_downward])
+            λ = DimensionalData.metadata(s)["longitude"]
+            # No January shortwave between 20 and 04 UTC beyond a few J/m² of de-accumulation
+            # noise (2 J/m² at most in 2023).
+            night = [month(x) == 1 && (hour(x) >= 20 || hour(x) <= 4) for x in t]
+            @test all(3600 .* sw[night] .<= 5.0)
+            # Annual precipitation of an Alpine cell: 0.5–4 m.
+            @test 0.5 <= sum(s[:precipitation]) / 1000 <= 4
+            # The shortwave-weighted mean stamp falls half an hour after local solar noon.
+            centroid = sum(sw .* (hour.(t) .+ minute.(t) ./ 60)) / sum(sw)
+            @test centroid - (12 - λ / 15) ≈ 0.5 atol = 0.25
+            # The derived layers are present and consistent with the geometry they assume: with the
+            # interval convention right, shortwave rarely exceeds the top-of-atmosphere value.
+            toa = solar_geometry(DimensionalData.metadata(s)["latitude"], λ, t).shortwave_toa
+            day = toa .> 50
+            @test count(sw[day] .> toa[day]) / count(day) < 0.01
+            @test all(parent(s[:solar_zenith_angle])[.!(toa .> 0)] .== 90.0)
+            @test all(0 .<= parent(s[:shortwave_downward_diffuse]) .<= sw)
+            @test 0 < median(parent(s[:cloud_optical_thickness])[day]) < 100
+        end
+
         @testset "live: a cell outside the land mask" begin
             s = climate_forcing(:era5land, 0.0, -25.0; token, cache_path = cache,
                                 time_range = (DateTime(2020, 1, 1), DateTime(2020, 1, 2)))
