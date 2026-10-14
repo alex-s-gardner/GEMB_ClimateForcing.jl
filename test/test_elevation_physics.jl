@@ -95,6 +95,15 @@ val(stack, var) = parent(stack[var])[1]
         @test val(adj, :pressure_air) ≈ (P0 - G_REF * ρ * Δz) rtol = 5e-3
     end
 
+    @testset "Pressure barometric (descending)" begin
+        # Down 800 m at 5 K/km: T′ = T + 4 and P′ = P·exp(g·800/(R_d·(T + T′)/2)).
+        T0 = 265.0; P0 = 70000.0
+        adj = climate_adjust_for_elevation(stack_at(T=T0, P=P0), -800.0; lapse_rate=5.0)
+        @test val(adj, :temperature_air) ≈ T0 + 4 rtol = 1e-12
+        @test val(adj, :pressure_air) ≈ P0 * exp(G_REF * 800 / (RD_REF * (T0 + T0 + 4) / 2)) rtol = 1e-12
+        @test val(adj, :pressure_air) > P0
+    end
+
     # -----------------------------------------------------------------------
     # 3. SATURATION VAPOR PRESSURE — IFS curve over water, literal reference points.
     # -----------------------------------------------------------------------

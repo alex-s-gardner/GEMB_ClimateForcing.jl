@@ -92,6 +92,12 @@ For each cell, the mean of the darkest `percentile` of *all* valid retrievals in
 not a per-year value and not a reduction of per-year values. Returns a `DimStack` over
 `Dim{:point}(1:length(cells))`, in the order `cells` was given.
 
+This is a dark-tail statistic, not a typical albedo. Most retrievals of a glacier cell see snow,
+or ice under a snow cover, so a mean or median over the record would describe snow; the darkest
+few percent are the retrievals in which the cell's ice was most exposed, which is the surface a
+bare-ice albedo stands for. The same selection keeps any residual dark contamination that passed
+QC — debris, meltwater, shadow above the floor — so the value leans low rather than high.
+
 # Keywords
 - `cache_path = _default_modis_cache()`: the granule/sample cache root — the same default the
   per-year MODIS path uses, so the two cannot disagree about where samples live. Set
