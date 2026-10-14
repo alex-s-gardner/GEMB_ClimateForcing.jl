@@ -10,7 +10,7 @@ source is caught rather than mirrored. No network access required.
 
 References cross-checked:
 - Glover (1999), J. Climate 12, 551–563 (Eqs. 15–20): adjustment scheme.
-- Buck (1981), J. Appl. Meteorol. 20, 1527–1532: saturation vapor pressure.
+- IFS Cy45r1 Part IV Eq. 7.5 (Buck 1981 constants): saturation vapor pressure over water.
 - Konzelmann et al. (1994), Glob. Planet. Change 9, 143–164: clear-sky emissivity.
 - Standard atmosphere / hydrostatic equation: barometric pressure.
 """
@@ -31,9 +31,8 @@ const G_REF = 9.80665       # m/s²  (standard gravity)
 const RD_REF = 287.05       # J/(kg·K)
 const SIGMA_REF = 5.67e-8   # W/m²/K⁴
 
-# Buck (1981) saturation vapor pressure, Pa (Tc in °C).
-ref_esw(Tc) = 611.21 * exp(17.502 * Tc / (240.97 + Tc))   # over water
-ref_esi(Tc) = 611.15 * exp(22.452 * Tc / (272.55 + Tc))   # over ice
+# IFS saturation vapor pressure over water, Pa (T in K).
+ref_es(T) = 611.21 * exp(17.502 * (T - 273.16) / (T - 32.19))
 
 # Konzelmann et al. (1994) clear-sky emissivity (e in Pa, T in K).
 ref_konz(e, T) = 0.23 + 0.484 * (e / T)^(1 / 8)
@@ -97,52 +96,37 @@ val(stack, var) = parent(stack[var])[1]
     end
 
     # -----------------------------------------------------------------------
-    # 3. SATURATION VAPOR PRESSURE — Buck (1981) exact reference points.
+    # 3. SATURATION VAPOR PRESSURE — IFS curve over water, literal reference points.
     # -----------------------------------------------------------------------
-    @testset "Saturation vapor pressure (Buck 1981)" begin
-        # Literal reference values (Pa) computed from Buck coefficients.
-        @test saturation_vapor_pressure(273.15; over_ice=false) ≈ 611.21 atol = 1e-2
-        @test saturation_vapor_pressure(293.15; over_ice=false) ≈ 2337.28 atol = 1e-2
-        @test saturation_vapor_pressure(303.15; over_ice=false) ≈ 4243.51 atol = 1e-1
-        @test saturation_vapor_pressure(263.15; over_ice=true) ≈ 259.872 atol = 1e-2
-        @test saturation_vapor_pressure(253.15; over_ice=true) ≈ 103.267 atol = 1e-2
-        # Matches the independent reference formulas across a range.
-        for Tc in -40.0:5.0:40.0
-            @test saturation_vapor_pressure(273.15 + Tc; over_ice=false) ≈ ref_esw(Tc)
+    @testset "Saturation vapor pressure (IFS, over water)" begin
+        @test saturation_vapor_pressure(273.16) == 611.21
+        @test saturation_vapor_pressure(293.15) ≈ 2335.84 atol = 1e-1
+        @test saturation_vapor_pressure(253.15) ≈ 125.27 atol = 1e-2
+        for T in 223.15:5.0:313.15
+            @test saturation_vapor_pressure(T) ≈ ref_es(T)
         end
-        for Tc in -50.0:5.0:-1.0
-            @test saturation_vapor_pressure(273.15 + Tc; over_ice=true) ≈ ref_esi(Tc)
-        end
-        # Clausius–Clapeyron sanity: water es rises ~7.5%/K near 0 °C.
-        @test saturation_vapor_pressure(274.15; over_ice=false) /
-              saturation_vapor_pressure(273.15; over_ice=false) ≈ 1.075 atol = 2e-3
-        # Ice curve below water curve below freezing.
-        @test saturation_vapor_pressure(253.15; over_ice=true) <
-              saturation_vapor_pressure(253.15; over_ice=false)
+        # Clausius–Clapeyron sanity: es rises ~7.5%/K near 0 °C.
+        @test saturation_vapor_pressure(274.15) / saturation_vapor_pressure(273.15) ≈ 1.075 atol = 2e-3
     end
 
     # -----------------------------------------------------------------------
-    # 4. CONSTANT RELATIVE HUMIDITY — RH preserved; e′/e = es(T′)/es(T).
+    # 4. CONSTANT RELATIVE HUMIDITY — e′/e = es(T′)/es(T).
     # -----------------------------------------------------------------------
     @testset "Constant-RH humidity (Glover Eq. 20)" begin
         T0 = 260.0; e0 = 150.0; Δz = 400.0; Γ = 6.5
         adj = climate_adjust_for_elevation(stack_at(T=T0, e=e0), Δz; lapse_rate=Γ)
         T′ = T0 - (Γ / 1000.0) * Δz
-        # RH preserved exactly (both use over-ice curve here, T<0 °C).
-        RH0 = e0 / ref_esi(T0 - 273.15)
         e′ = val(adj, :vapor_pressure)
-        RH′ = e′ / ref_esi(T′ - 273.15)
-        @test RH′ ≈ RH0
-        # e′ equals RH·es(T′) with the published ice coefficients.
-        @test e′ ≈ RH0 * ref_esi(T′ - 273.15)
-        # Ratio form matches Glover Eq. 20 (q ∝ es proxy).
-        @test e′ / e0 ≈ ref_esi(T′ - 273.15) / ref_esi(T0 - 273.15)
-        # Supersaturation guard: a supersaturated input (e > es(T), RH>1) is
-        # clamped to RH=1 so the adjusted vapor pressure never exceeds es(T′).
-        e_super = 1.2 * ref_esi(260.0 - 273.15)         # RH ≈ 1.2 at the source
-        wet = climate_adjust_for_elevation(stack_at(T=260.0, e=e_super), 200.0; lapse_rate=6.5)
-        T′w = 260.0 - 6.5 / 1000.0 * 200.0
-        @test val(wet, :vapor_pressure) ≈ saturation_vapor_pressure(T′w)  # clamped to RH=1
+        @test e′ / ref_es(T′) ≈ e0 / ref_es(T0)
+        @test e′ / e0 ≈ ref_es(T′) / ref_es(T0)
+        # Nothing is clamped: an input above water saturation keeps its relative humidity, and an
+        # input at or below saturation therefore stays at or below it.
+        e_super = 1.2 * ref_es(T0)
+        wet = climate_adjust_for_elevation(stack_at(T=T0, e=e_super), 200.0; lapse_rate=6.5)
+        T′w = T0 - 6.5 / 1000.0 * 200.0
+        @test val(wet, :vapor_pressure) ≈ 1.2 * ref_es(T′w)
+        sat = climate_adjust_for_elevation(stack_at(T=T0, e=ref_es(T0)), 800.0; lapse_rate=6.5)
+        @test val(sat, :vapor_pressure) <= saturation_vapor_pressure(val(sat, :temperature_air)) * (1 + 1e-14)
     end
 
     # -----------------------------------------------------------------------
@@ -165,8 +149,7 @@ val(stack, var) = parent(stack[var])[1]
         Δz = 500.0; Γ = 6.5
         adj = climate_adjust_for_elevation(stack_at(T=T0, e=e0, lw=LW_clear), Δz; lapse_rate=Γ)
         T′ = T0 - (Γ / 1000.0) * Δz
-        RH0 = e0 / ref_esi(T0 - 273.15)
-        e′ = RH0 * ref_esi(T′ - 273.15)
+        e′ = e0 * ref_es(T′) / ref_es(T0)
         LW_expected = ref_konz(e′, T′) * SIGMA_REF * T′^4
         @test val(adj, :longwave_downward) ≈ LW_expected
         # Cooling aloft reduces clear-sky LW.
@@ -183,8 +166,7 @@ val(stack, var) = parent(stack[var])[1]
         Δz = 500.0; Γ = 6.5
         adj = climate_adjust_for_elevation(stack_at(T=T0, e=e0, lw=LW_all), Δz; lapse_rate=Γ)
         T′ = T0 - (Γ / 1000.0) * Δz
-        RH0 = e0 / ref_esi(T0 - 273.15)
-        e′ = RH0 * ref_esi(T′ - 273.15)
+        e′ = e0 * ref_es(T′) / ref_es(T0)
         LW_expected = (ref_konz(e′, T′) + Δε) * SIGMA_REF * T′^4
         @test val(adj, :longwave_downward) ≈ LW_expected
         # Recovered increment matches at the new level.
@@ -194,7 +176,7 @@ val(stack, var) = parent(stack[var])[1]
 
     @testset "Longwave identity at Δz=0" begin
         adj = climate_adjust_for_elevation(stack_at(lw=245.0), 0.0)
-        @test val(adj, :longwave_downward) ≈ 245.0
+        @test val(adj, :longwave_downward) == 245.0
     end
 
     # -----------------------------------------------------------------------
@@ -205,8 +187,8 @@ val(stack, var) = parent(stack[var])[1]
         adj = climate_adjust_for_elevation(stack_at(T=T0, pr=pr0), Δz;
                                            lapse_rate=Γ, precip_scaling_method=:clausius_clapeyron)
         T′ = T0 - (Γ / 1000.0) * Δz
-        # P′/P = es(T′)/es(T) with published ice coefficients.
-        @test val(adj, :precipitation) ≈ pr0 * ref_esi(T′ - 273.15) / ref_esi(T0 - 273.15)
+        # P′/P = es(T′)/es(T).
+        @test val(adj, :precipitation) ≈ pr0 * ref_es(T′) / ref_es(T0)
         @test val(adj, :precipitation) < pr0            # cooler aloft ⇒ less precip
         # Default (nothing) leaves precip untouched.
         adj0 = climate_adjust_for_elevation(stack_at(T=T0, pr=pr0), Δz; lapse_rate=Γ)

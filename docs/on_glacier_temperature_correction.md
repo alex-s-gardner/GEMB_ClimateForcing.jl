@@ -346,7 +346,7 @@ specifies its saturation formula explicitly — Tetens/Bolton (1980) with a phas
 e_s = 6.108 · 10^(9.5·T/(T+265.5))    T >  0 °C   (over ice)
 e_s = 6.108 · 10^(7.5·T/(T+237.3))    T ≤  0 °C
 ```
-which is worth comparing against the Magnus/Buck form already in `src/utils.jl`.
+which is worth comparing against the IFS curve over water in `src/utils.jl`.
 
 **Implication for us: constant RH is the wrong interim assumption.** `temperature_adjust`'s
 constant-RH propagation would scale `e` down with `T`, but SM10 shows the KBL *adds* moisture

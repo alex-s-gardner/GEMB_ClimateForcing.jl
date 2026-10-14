@@ -416,7 +416,8 @@ function load_era5_land(
         temperature_air = Float64.(t2m_raw)
         pressure_air = Float64.(sp_raw)
 
-        # Dewpoint -> vapor pressure (Magnus formula; promotes internally, one output array).
+        # Dewpoint -> vapor pressure: saturation over water at the dewpoint, the curve ERA5-Land
+        # defines d2m against.
         vapor_pressure = dewpoint_to_vapor_pressure(d2m_raw)
 
         # Precipitation: m -> kg/m², clamp numerical noise (single fused pass, no BitArray mask).
