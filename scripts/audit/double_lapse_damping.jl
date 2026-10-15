@@ -30,8 +30,8 @@ println("fitted k(z̄) = ", round(d.decoupling_factor[1]; digits = 4), ", lapse 
 for i in (1, 5, 10, 15, 20)
     fd = forcing_stack(; T = [T[i]], e = 0.6 * G.saturation_vapor_pressure(T[i]), elevation = z[i])
     band = if AMBIENT_FIRST
-        k_donor = G.decoupling_factor_at_elevation(d, z[i])[1]
-        G._cell_forcing_at_interval(fd, z_band - z[i], [k_band], [Γ], glm[i], [k_donor])
+        g_donor = G._glacier_offset_at_elevation(d, z[i])[1]
+        G._cell_forcing_at_interval(fd, z_band - z[i], [k_band], [Γ], glm[i], [g_donor])
     else
         k_eff = 1 - (1 - k_band) * (1 - glm[i])   # GEMB_GlacierSims' per-cell weighting
         G._cell_forcing_at_interval(fd, z_band - z[i], [k_eff], [Γ])
