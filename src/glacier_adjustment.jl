@@ -89,7 +89,8 @@ constant-relative-humidity propagation used by [`temperature_adjust`](@ref):
 e′ = min(e, eₛ(T′))   where T′ < T;   e′ = e elsewhere
 ```
 
-with `eₛ` the saturation vapor pressure over water ([`saturation_vapor_pressure`](@ref)). Cooled air
+with `eₛ` the saturation vapor pressure over ice below 273.16 K and over water above
+([`saturation_vapor_pressure_reference`](@ref)). Cooled air
 cannot hold more vapor than saturation at its new temperature; the excess is taken to condense.
 The cap is the only clamp, and it applies only where the correction cooled the air, so `k = 1`
 and every sub-freezing step under the default gating return the input bit for bit.

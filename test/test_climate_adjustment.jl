@@ -97,6 +97,30 @@ const _FORCING_VARS = (:temperature_air, :pressure_air, :vapor_pressure, :wind_s
         end
     end
 
+    @testset "Decoupling caps vapor at saturation of the cooled air" begin
+        # Decoupling cools air toward 273.15 K: T′ = 273.15 + k·(T − 273.15). Water-saturated input
+        # cooled to T′ is capped at the carry curve's saturation, over ice below 273.16 K and over
+        # water above. IFS eq. 7.5 constants written out independently.
+        es_w(T) = 611.21 * exp(17.502 * (T - 273.16) / (T - 32.19))
+        es_i(T) = 611.21 * exp(22.587 * (T - 273.16) / (T + 0.7))
+        ti = Ti([DateTime(2020, 7, 1, 12)])
+        layer(v) = DimArray([v], (ti,))
+        stack_at(T) = DimStack((temperature_air = layer(T), pressure_air = layer(85000.0),
+                                vapor_pressure = layer(es_w(T)), wind_speed = layer(3.0),
+                                precipitation = layer(0.0), shortwave_downward = layer(400.0),
+                                longwave_downward = layer(330.0)); metadata = Dict("elevation" => 1500.0))
+        # T = 274.15 K, k = 0.005 ⇒ T′ = 273.155 K, below 273.16 K: capped at ice saturation.
+        cold = climate_adjust_for_glacier(stack_at(274.15), 0.005)
+        T′ = parent(cold[:temperature_air])[1]
+        @test T′ ≈ 273.155 rtol = 1e-12
+        @test parent(cold[:vapor_pressure])[1] ≈ es_i(T′) rtol = 1e-12
+        # T = 283.15 K, k = 0.6 ⇒ T′ = 279.15 K: capped at water saturation.
+        warm = climate_adjust_for_glacier(stack_at(283.15), 0.6)
+        T′w = parent(warm[:temperature_air])[1]
+        @test T′w ≈ 279.15 rtol = 1e-12
+        @test parent(warm[:vapor_pressure])[1] ≈ es_w(T′w) rtol = 1e-12
+    end
+
     @testset "Temperature offset is exact" begin
         stack = make_perturb_stack()
         for ΔT in (-5.0, 0.5, 2.0, 8.0)
@@ -120,13 +144,15 @@ const _FORCING_VARS = (:temperature_air, :pressure_air, :vapor_pressure, :wind_s
         stack = make_perturb_stack()
         T = parent(stack[:temperature_air])
         e = parent(stack[:vapor_pressure])
-        RH = e ./ saturation_vapor_pressure.(T)
+        # Relative humidity with respect to ice below 273.16 K and water above.
+        es_ref = GEMB_ClimateForcing.saturation_vapor_pressure_reference
+        RH = e ./ es_ref.(T)
 
         for ΔT in (-4.0, 2.0, 6.0)
             adj = temperature_adjust(stack, ΔT)
             T′ = parent(adj[:temperature_air])
             e′ = parent(adj[:vapor_pressure])
-            RH′ = e′ ./ saturation_vapor_pressure.(T′)
+            RH′ = e′ ./ es_ref.(T′)
             @test all(RH′ .≈ RH)
         end
     end

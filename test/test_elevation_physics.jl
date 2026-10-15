@@ -10,7 +10,8 @@ source is caught rather than mirrored. No network access required.
 
 References cross-checked:
 - Glover (1999), J. Climate 12, 551–563 (Eqs. 15–20): adjustment scheme.
-- IFS Cy45r1 Part IV Eq. 7.5 (Buck 1981 constants): saturation vapor pressure over water.
+- IFS Cy45r1 Part IV Eq. 7.5 (Buck 1981 constants over water, AERKi constants over ice):
+  saturation vapor pressure; relative humidity is carried against ice below 273.16 K.
 - Konzelmann et al. (1994), Glob. Planet. Change 9, 143–164: clear-sky emissivity.
 - Standard atmosphere / hydrostatic equation: barometric pressure.
 """
@@ -33,6 +34,12 @@ const SIGMA_REF = 5.67e-8   # W/m²/K⁴
 
 # IFS saturation vapor pressure over water, Pa (T in K).
 ref_es(T) = 611.21 * exp(17.502 * (T - 273.16) / (T - 32.19))
+
+# IFS saturation vapor pressure over ice (AERKi constants), Pa (T in K).
+ref_es_ice(T) = 611.21 * exp(22.587 * (T - 273.16) / (T + 0.7))
+
+# The curve relative humidity is carried against: ice below 273.16 K, water at and above.
+ref_es_carry(T) = T < 273.16 ? ref_es_ice(T) : ref_es(T)
 
 # Konzelmann et al. (1994) clear-sky emissivity (e in Pa, T in K).
 ref_konz(e, T) = 0.23 + 0.484 * (e / T)^(1 / 8)
@@ -119,23 +126,67 @@ val(stack, var) = parent(stack[var])[1]
     end
 
     # -----------------------------------------------------------------------
-    # 4. CONSTANT RELATIVE HUMIDITY — e′/e = es(T′)/es(T).
+    @testset "Saturation vapor pressure over ice (IFS AERKi)" begin
+        # Values of IFS eq. 7.5 with the ice constants, evaluated in 256-bit arithmetic.
+        @test GEMB_ClimateForcing.saturation_vapor_pressure_ice(273.16) == 611.21
+        for (T, es) in ((233.15, 12.819564), (253.15, 103.0275), (263.15, 259.44117))
+            @test GEMB_ClimateForcing.saturation_vapor_pressure_ice(T) ≈ es rtol = 1e-6
+        end
+        for T in 213.15:5.0:273.15
+            @test GEMB_ClimateForcing.saturation_vapor_pressure_ice(T) ≈ ref_es_ice(T) rtol = 1e-12
+        end
+        # Below the melting point ice saturation lies below water saturation (e_s,w/e_s,i = 1.216 at −20 °C).
+        @test ref_es(253.15) / ref_es_ice(253.15) ≈ 1.21589 rtol = 1e-5
+        # The carry curve is ice below 273.16 K and water at and above, continuous at 273.16 K.
+        ref_curve = GEMB_ClimateForcing.saturation_vapor_pressure_reference
+        @test ref_curve(263.15) == GEMB_ClimateForcing.saturation_vapor_pressure_ice(263.15)
+        @test ref_curve(283.15) == saturation_vapor_pressure(283.15)
+        @test ref_curve(273.16) == 611.21
+        @test ref_curve(prevfloat(273.16)) ≈ 611.21 rtol = 1e-12
+    end
+
+    # -----------------------------------------------------------------------
+    # 4. CONSTANT RELATIVE HUMIDITY — e′/e = es(T′)/es(T), es over ice below 273.16 K.
     # -----------------------------------------------------------------------
     @testset "Constant-RH humidity (Glover Eq. 20)" begin
         T0 = 260.0; e0 = 150.0; Δz = 400.0; Γ = 6.5
         adj = climate_adjust_for_elevation(stack_at(T=T0, e=e0), Δz; lapse_rate=Γ)
         T′ = T0 - (Γ / 1000.0) * Δz
         e′ = val(adj, :vapor_pressure)
-        @test e′ / ref_es(T′) ≈ e0 / ref_es(T0)
-        @test e′ / e0 ≈ ref_es(T′) / ref_es(T0)
-        # Nothing is clamped: an input above water saturation keeps its relative humidity, and an
+        @test e′ / ref_es_ice(T′) ≈ e0 / ref_es_ice(T0)
+        @test e′ / e0 ≈ ref_es_ice(T′) / ref_es_ice(T0)
+        # Nothing is clamped: an input above ice saturation keeps its relative humidity, and an
         # input at or below saturation therefore stays at or below it.
-        e_super = 1.2 * ref_es(T0)
+        e_super = 1.2 * ref_es_ice(T0)
         wet = climate_adjust_for_elevation(stack_at(T=T0, e=e_super), 200.0; lapse_rate=6.5)
         T′w = T0 - 6.5 / 1000.0 * 200.0
-        @test val(wet, :vapor_pressure) ≈ 1.2 * ref_es(T′w)
-        sat = climate_adjust_for_elevation(stack_at(T=T0, e=ref_es(T0)), 800.0; lapse_rate=6.5)
-        @test val(sat, :vapor_pressure) <= saturation_vapor_pressure(val(sat, :temperature_air)) * (1 + 1e-14)
+        @test val(wet, :vapor_pressure) ≈ 1.2 * ref_es_ice(T′w)
+        sat = climate_adjust_for_elevation(stack_at(T=T0, e=ref_es_ice(T0)), 800.0; lapse_rate=6.5)
+        @test val(sat, :vapor_pressure) <= ref_es_ice(val(sat, :temperature_air)) * (1 + 1e-14)
+    end
+
+    @testset "Ice-saturated air stays ice-saturated when lifted" begin
+        # e = e_s,i(253.15 K), Δz = +1000 m at Γ = 6.5 K km⁻¹ ⇒ T′ = 246.65 K and e′ = e_s,i(T′).
+        T0 = 253.15
+        adj = climate_adjust_for_elevation(stack_at(T=T0, e=ref_es_ice(T0)), 1000.0; lapse_rate=6.5)
+        @test val(adj, :temperature_air) ≈ 246.65 rtol = 1e-12
+        @test val(adj, :vapor_pressure) ≈ ref_es_ice(246.65) rtol = 1e-12
+        # The water-referenced carry would have left the air 6.4 % supersaturated over ice.
+        @test (ref_es_ice(T0) * ref_es(246.65) / ref_es(T0)) / ref_es_ice(246.65) ≈ 1.06379 rtol = 1e-5
+    end
+
+    @testset "Constant-RH carry across the melting point" begin
+        # Saturated air at 280 K lapsed to 268 K: e′ = e·e_s,i(268)/e_s,w(280), with no jump at 273.16 K.
+        T0 = 280.0; Δz = 12.0 / 6.5 * 1000.0
+        e0 = ref_es(T0)
+        adj = climate_adjust_for_elevation(stack_at(T=T0, e=e0), Δz; lapse_rate=6.5)
+        T′ = val(adj, :temperature_air)
+        @test T′ ≈ 268.0 rtol = 1e-12
+        @test val(adj, :vapor_pressure) ≈ e0 * ref_es_ice(T′) / ref_es(T0) rtol = 1e-12
+        @test val(adj, :vapor_pressure) ≈ ref_es_ice(268.0) rtol = 1e-12   # saturated stays saturated
+        # Either side of 273.16 K the carry curve agrees to rounding: the carry is continuous there.
+        @test ref_es_carry(273.16) == 611.21
+        @test ref_es_ice(273.16 - 1e-9) ≈ ref_es(273.16 + 1e-9) rtol = 1e-9
     end
 
     # -----------------------------------------------------------------------
@@ -158,7 +209,7 @@ val(stack, var) = parent(stack[var])[1]
         Δz = 500.0; Γ = 6.5
         adj = climate_adjust_for_elevation(stack_at(T=T0, e=e0, lw=LW_clear), Δz; lapse_rate=Γ)
         T′ = T0 - (Γ / 1000.0) * Δz
-        e′ = e0 * ref_es(T′) / ref_es(T0)
+        e′ = e0 * ref_es_carry(T′) / ref_es_carry(T0)
         LW_expected = ref_konz(e′, T′) * SIGMA_REF * T′^4
         @test val(adj, :longwave_downward) ≈ LW_expected
         # Cooling aloft reduces clear-sky LW.
@@ -175,7 +226,7 @@ val(stack, var) = parent(stack[var])[1]
         Δz = 500.0; Γ = 6.5
         adj = climate_adjust_for_elevation(stack_at(T=T0, e=e0, lw=LW_all), Δz; lapse_rate=Γ)
         T′ = T0 - (Γ / 1000.0) * Δz
-        e′ = e0 * ref_es(T′) / ref_es(T0)
+        e′ = e0 * ref_es_carry(T′) / ref_es_carry(T0)
         LW_expected = (ref_konz(e′, T′) + Δε) * SIGMA_REF * T′^4
         @test val(adj, :longwave_downward) ≈ LW_expected
         # Recovered increment matches at the new level.
@@ -196,8 +247,8 @@ val(stack, var) = parent(stack[var])[1]
         adj = climate_adjust_for_elevation(stack_at(T=T0, pr=pr0), Δz;
                                            lapse_rate=Γ, precip_scaling_method=:clausius_clapeyron)
         T′ = T0 - (Γ / 1000.0) * Δz
-        # P′/P = es(T′)/es(T).
-        @test val(adj, :precipitation) ≈ pr0 * ref_es(T′) / ref_es(T0)
+        # P′/P = es(T′)/es(T), es over ice below 273.16 K (the curve vapor is carried against).
+        @test val(adj, :precipitation) ≈ pr0 * ref_es_carry(T′) / ref_es_carry(T0)
         @test val(adj, :precipitation) < pr0            # cooler aloft ⇒ less precip
         # Default (nothing) leaves precip untouched.
         adj0 = climate_adjust_for_elevation(stack_at(T=T0, pr=pr0), Δz; lapse_rate=Γ)

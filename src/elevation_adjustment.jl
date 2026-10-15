@@ -41,8 +41,8 @@ the reanalysis surface).
    Eq. 16 uses the equivalent first-order linear form.)
 
 3. **Vapor pressure** — *constant relative humidity*, in ratio form:
-   `e′ = e·eₛ(T′)/eₛ(T)`, with `eₛ` the saturation vapor pressure over water that
-   ERA5-Land defines its dewpoint against ([`saturation_vapor_pressure`](@ref)).
+   `e′ = e·eₛ(T′)/eₛ(T)`, with `eₛ` the saturation vapor pressure over ice below
+   273.16 K and over water above ([`saturation_vapor_pressure_reference`](@ref)).
    This matches Glover (1999, Eq. 20: `q′ = q·q_sat(T′)/q_sat(T)`) and the way
    RACMO2 diagnoses 2 m specific humidity from T, P and RH (Curry & Webster 1999,
    per Noël et al. 2018).
@@ -315,8 +315,8 @@ reanalysis grid cell and the desired target elevation (downscaling).
 For `Δz = delta_elevation` and lapse rate `Γ` (K/km):
 - `T′ = T − (Γ/1000)·Δz`
 - `P′ = P·exp(−g·Δz/(R_d·T̄))`, `T̄ = ½(T+T′)`, `g=9.80665`, `R_d=287.05`
-- `e′ = e·eₛ(T′)/eₛ(T)` (constant relative humidity; `eₛ` over water, see
-  [`saturation_vapor_pressure`](@ref))
+- `e′ = e·eₛ(T′)/eₛ(T)` (constant relative humidity; `eₛ` over ice below 273.16 K and over
+  water above, see [`saturation_vapor_pressure_reference`](@ref))
 - `Δε = LW/(σ·T⁴) − ε_cs(e,T)`; `LW′ = (ε_cs(e′,T′) + Δε)·σ·T′⁴`, `σ=5.67e-8`,
   `ε_cs` from Konzelmann et al. (1994)
 - `precip′ = precip·eₛ(T′)/eₛ(T)` if `precip_scaling_method=:clausius_clapeyron`,
@@ -400,7 +400,8 @@ function climate_adjust_for_elevation(
     # With Clausius–Clapeyron scaling the same saturation ratio scales precipitation, so it is
     # formed once for both.
     cc = precip_scaling_method === :clausius_clapeyron
-    ratio = cc ? (@. saturation_vapor_pressure(T′) / saturation_vapor_pressure(T)) : nothing
+    ratio = cc ? (@. saturation_vapor_pressure_reference(T′) / saturation_vapor_pressure_reference(T)) :
+            nothing
     e′ = cc ? (@. e * ratio) : _vapor_pressure_at.(e, T, T′)
 
     # 4. Longwave down: recompute from adjusted T, e; preserve cloud increment Δε.

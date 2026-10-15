@@ -96,14 +96,12 @@ the ECMWF IFS uses (Tetens' formula with the Buck (1981) constants for water):
 
     eₛ(T) = 611.21 · exp(17.502 · (T − 273.16) / (T − 32.19))
 
-This is the only saturation curve in the package. ERA5 and ERA5-Land compute their 2 m
-dewpoint "with respect to water to be consistent with WMO reporting practice" (IFS Cy45r1
-Part IV §3.10.3), so `eₛ` over water at the dewpoint is the vapor pressure the reanalysis
-itself implies, and relative humidity is defined against the same curve. Using one curve for
-the dewpoint conversion, for relative humidity and for every adjustment is what makes the
-identity adjustments (`Δz = 0`, `ΔT = 0`) exact: a ratio `eₛ(T′)/eₛ(T)` of the same function
-is exactly 1 at `T′ = T`. Relative humidity against water stays below 1 in sub-freezing air
-even where the air is saturated with respect to ice.
+ERA5 and ERA5-Land compute their 2 m dewpoint "with respect to water to be consistent with
+WMO reporting practice" (IFS Cy45r1 Part IV §3.10.3), so `eₛ` over water at the dewpoint is
+the vapor pressure the reanalysis itself implies. The dewpoint conversion and the
+relative-humidity helpers use this curve. The forcing adjustments carry vapor pressure against
+[`saturation_vapor_pressure_reference`](@ref), which is this curve at and above 273.16 K and
+the curve over ice below it.
 
 # References
 - ECMWF (2018). IFS Documentation Cy45r1, Part IV: Physical Processes, Eq. 7.5 and §3.10.3.
@@ -112,6 +110,41 @@ even where the air is saturated with respect to ice.
 """
 saturation_vapor_pressure(T_K::Real) =
     611.21 * exp(17.502 * (Float64(T_K) - 273.16) / (Float64(T_K) - 32.19))
+
+"""
+    saturation_vapor_pressure_ice(T_K::Real) -> Float64
+
+Saturation vapor pressure (Pa) over ice at temperature `T_K` (Kelvin), in the form the ECMWF
+IFS uses (the AERKi constants of Alduchov and Eskridge 1996):
+
+    eₛ,ᵢ(T) = 611.21 · exp(22.587 · (T − 273.16) / (T + 0.7))
+
+It shares `a₁ = 611.21 Pa` and `T₀ = 273.16 K` with [`saturation_vapor_pressure`](@ref), so the
+two curves meet at `T₀`.
+
+# References
+- ECMWF (2018). IFS Documentation Cy45r1, Part IV: Physical Processes, Eq. 7.5.
+- Alduchov, O. A. and Eskridge, R. E. (1996). Improved Magnus form approximation of saturation
+  vapor pressure. *J. Appl. Meteorol.* 35, 601–609.
+"""
+saturation_vapor_pressure_ice(T_K::Real) =
+    611.21 * exp(22.587 * (Float64(T_K) - 273.16) / (Float64(T_K) + 0.7))
+
+"""
+    saturation_vapor_pressure_reference(T_K::Real) -> Float64
+
+Saturation vapor pressure (Pa) that the forcing adjustments hold relative humidity against:
+over ice below 273.16 K ([`saturation_vapor_pressure_ice`](@ref)) and over water at and above it
+([`saturation_vapor_pressure`](@ref)).
+
+Sub-freezing air over a glacier is in contact with an ice surface, which bounds it at ice
+saturation, so lapsing or perturbing such air at constant relative humidity with respect to
+water would make it supersaturated over ice (about 6 % per km of ascent). The two branches meet
+at 273.16 K, so a carry across the melting point has no jump. A ratio of this one function is
+exactly 1 at `T′ = T`, so the identity adjustments (`Δz = 0`, `ΔT = 0`) stay exact.
+"""
+saturation_vapor_pressure_reference(T_K::Real) =
+    Float64(T_K) < 273.16 ? saturation_vapor_pressure_ice(T_K) : saturation_vapor_pressure(T_K)
 
 """
     dewpoint_to_vapor_pressure(T_dewpoint)
@@ -147,17 +180,19 @@ function relative_humidity_to_vapor_pressure(temperature_air, relative_humidity)
     return saturation_vapor_pressure.(temperature_air) .* (relative_humidity ./ 100.0)
 end
 
-# Vapor pressure carried from temperature `T` to `T′` at constant relative humidity:
+# Vapor pressure carried from temperature `T` to `T′` at constant relative humidity with respect
+# to `saturation_vapor_pressure_reference` (ice below 273.16 K, water above):
 # `e′ = e·eₛ(T′)/eₛ(T)`. The ratio form needs no relative humidity, so nothing is clamped: an
 # input at or below saturation stays at or below saturation at `T′`, and `T′ == T` returns `e`
 # bit for bit, since `eₛ(T)/eₛ(T)` is exactly 1.
-_vapor_pressure_at(e, T, T′) = e * (saturation_vapor_pressure(T′) / saturation_vapor_pressure(T))
+_vapor_pressure_at(e, T, T′) =
+    e * (saturation_vapor_pressure_reference(T′) / saturation_vapor_pressure_reference(T))
 
 # Vapor pressure after the glacier decoupling cools the air from `T` to `T′` at fixed moisture:
-# unchanged, except that cooled air holds at most saturation at its new temperature. Applied only
-# where the air was cooled, so an unchanged step returns `e` bit for bit even when its input is
-# supersaturated.
-_cap_vapor_pressure(e, T, T′) = T′ < T ? min(e, saturation_vapor_pressure(T′)) : e
+# unchanged, except that cooled air holds at most saturation at its new temperature (over ice
+# below 273.16 K). Applied only where the air was cooled, so an unchanged step returns `e` bit for
+# bit even when its input is supersaturated.
+_cap_vapor_pressure(e, T, T′) = T′ < T ? min(e, saturation_vapor_pressure_reference(T′)) : e
 
 # ----------------------------------------------------------------------------
 # Shared helpers for the forcing-adjustment functions

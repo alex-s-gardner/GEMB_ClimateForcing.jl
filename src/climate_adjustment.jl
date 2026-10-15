@@ -70,8 +70,9 @@ and additionally corrects surface pressure.
 For `ΔT = delta_temperature`:
 - `T′ = T + ΔT`
 - `e′ = e·eₛ(T′)/eₛ(T)` — **relative humidity is held constant** against the
-  saturation curve over water ([`saturation_vapor_pressure`](@ref)), so specific
-  humidity rises with warming. Nothing is clamped: an input at or below
+  saturation curve over ice below 273.16 K and over water above
+  ([`saturation_vapor_pressure_reference`](@ref)), so specific humidity rises with
+  warming. Nothing is clamped: an input at or below
   saturation stays at or below saturation.
 - `Δε = LW/(σ·T⁴) − ε_cs(e,T)`; `LW′ = (ε_cs(e′,T′) + Δε)·σ·T′⁴`, `σ=5.67e-8`,
   `ε_cs` from Konzelmann et al. (1994) — the cloud/aerosol emissivity increment

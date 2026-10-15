@@ -171,8 +171,10 @@ end
         adj = climate_adjust_for_elevation(stack, 400.0; lapse_rate=GREENLAND_LAPSE_RATE)
         T  = parent(stack[:temperature_air]); e  = parent(stack[:vapor_pressure])
         T′ = parent(adj[:temperature_air]);   e′ = parent(adj[:vapor_pressure])
-        RH  = e ./ saturation_vapor_pressure.(T)
-        RH′ = e′ ./ saturation_vapor_pressure.(T′)
+        # Relative humidity with respect to ice below 273.16 K and water above.
+        es_ref = GEMB_ClimateForcing.saturation_vapor_pressure_reference
+        RH  = e ./ es_ref.(T)
+        RH′ = e′ ./ es_ref.(T′)
         @test RH′ ≈ RH
         @test all(e′ .< e)                     # cooling aloft ⇒ lower vapor pressure
     end
