@@ -193,6 +193,17 @@ cells are below melting). Under the model a cell is above melting exactly when i
 temperature is, since the damping factor is positive, so restricting the fit to cells with
 `E > 0` loses nothing and the four-term surface is exact on what remains.
 
+**Noise biases `k` low.** The four coefficients are an ordinary least-squares fit over the cells
+above melting, and that selection is made on the response itself. Without noise it is exact, as
+above. With cell-level noise it is not: near the melting level the cells kept are
+disproportionately those whose noise is positive, so their residuals no longer average to zero. On
+a synthetic region of 20 cells (500–2500 m, `k = 0.8`, ambient excess `14 − 0.006 z`, so the
+melting level is at 2333 m) with independent 0.5 K noise per cell and timestep, the median `k` is
+0.755 over 20,000 timesteps against the true 0.80 (over 400 timesteps the median scatters between
+0.70 and 0.80 with the draw); it is 0.784 at 0.25 K and 0.71 at 1 K of noise. With every cell
+above melting the median stays at 0.80. These are synthetic estimates; the bias of a real region
+depends on its noise and on how often its melting level lies among its cells.
+
 Returns a `DimStack` on the accumulated `Ti` axis:
 
 | layer | meaning |
