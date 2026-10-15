@@ -20,7 +20,7 @@ using GEMB_ClimateForcing: _MIN_AMBIENT_EXCESS, _MIN_CELLS_DEFAULT, _LAPSE_RATE_
     _DECOUPLING_FACTOR_LIMITS, _DECOUPLING_REFERENCE_TEMPERATURE, _solve_sym4, _r2,
     _make_applicable, _decouple_per_timestep, saturation_vapor_pressure,
     _downscaling_sums, _accumulate_downscaling_cell!, _cell_forcing_at_interval,
-    _ambient_forcing, _glacier_offset_at_elevation
+    _ambient_forcing, _DONOR_DECOUPLING_FACTOR_LIMITS
 
 const _DP_TIME = collect(DateTime(2000, 1, 1):Hour(1):DateTime(2000, 1, 1, 5))
 
@@ -383,19 +383,19 @@ end
                            wind_speed = layer(3.0), precipitation = layer(0.0),
                            shortwave_downward = layer(300.0), longwave_downward = layer(320.0));
                           metadata = Dict{String,Any}("elevation" => c.z))
-            g_donor = _glacier_offset_at_elevation(d, c.z)
-            # The fitted glacier term at the donor is (k - 1)·E_amb(z) under this region's model.
-            @test all(g -> isapprox(g, (k_true - 1) * E_amb(c.z); atol = 1e-9), g_donor)
-            band = _cell_forcing_at_interval(fd, 3000.0 - c.z, k_band, Γ, c.glm, g_donor)
+            k_donor = collect(decoupling_factor_at_elevation(d, c.z))
+            # The fitted k at the donor is the region's k under this region's model.
+            @test all(k -> isapprox(k, k_true; atol = 1e-9), k_donor)
+            band = _cell_forcing_at_interval(fd, 3000.0 - c.z, k_band, Γ, c.glm, k_donor)
             @test all(t -> isapprox(t, 274.75; atol = 1e-6), band[:temperature_air])
         end
     end
 
-    @testset "ambient conversion removes the fit's glacier term" begin
+    @testset "ambient conversion inverts the reanalysis damping" begin
         # A glm = 0.5 donor above melting, k = 0.7, ambient excess 6 K, delivered at its own
-        # elevation. Its observed excess is (1 - 0.5·0.3)·6 = 5.1 K and the fit's glacier term
-        # g = (k - 1)·6 = -1.8 K, so E_amb = 5.1 + 0.5·1.8 = 6 K, and the decoupled excess is
-        # k·6 = 4.2 K whatever share of the damping the reanalysis had already applied.
+        # elevation. Its observed excess is (1 - 0.5·0.3)·6 = 5.1 K, so E_amb = 5.1/0.85 = 6 K, and the
+        # decoupled excess is k·6 = 4.2 K whatever share of the damping the reanalysis had already
+        # applied.
         k = 0.7
         E = 6.0
         n = length(_DP_TIME)
@@ -409,24 +409,28 @@ end
         T = _DECOUPLING_REFERENCE_TEMPERATURE + (1 - 0.5 * (1 - k)) * E
         fd = stack(T)
         ks = fill(k, n)
-        g = fill((k - 1) * E, n)
-        out = _cell_forcing_at_interval(fd, 0.0, ks, 6.5, 0.5, g)
+        out = _cell_forcing_at_interval(fd, 0.0, ks, 6.5, 0.5, ks)
         @test all(t -> isapprox(t - _DECOUPLING_REFERENCE_TEMPERATURE, 4.2; atol = 1e-9),
                   out[:temperature_air])
         @test all(t -> isapprox(t - _DECOUPLING_REFERENCE_TEMPERATURE, 6.0; atol = 1e-9),
-                  _ambient_forcing(fd, 0.5, g)[:temperature_air])
+                  _ambient_forcing(fd, 0.5, ks)[:temperature_air])
         # Longwave is never touched by either decoupling step, and a Δz = 0 lapse is the identity.
         @test parent(out[:longwave_downward]) == parent(fd[:longwave_downward])
 
-        # Identities. An ice-free donor (glm = 0) or a fit with no glacier term (g = 0, i.e. k ≡ 1)
-        # is already ambient, and the input stack itself comes back. A g that is zero at some steps
-        # only leaves those steps bit for bit.
-        @test _ambient_forcing(fd, 0.0, g) === fd
-        @test _ambient_forcing(fd, 0.5, zeros(n)) === fd
-        mixed = [isodd(t) ? 0.0 : -1.8 for t in 1:n]
+        # Identities. An ice-free donor (glm = 0) or a donor the reanalysis did not damp (k ≡ 1) is
+        # already ambient, and the input stack itself comes back. A k of 1 at some steps only leaves
+        # those steps bit for bit; the others gain E_amb − E_obs = 0.9 K.
+        @test _ambient_forcing(fd, 0.0, ks) === fd
+        @test _ambient_forcing(fd, 0.5, ones(n)) === fd
+        mixed = [isodd(t) ? 1.0 : k for t in 1:n]
         Tm = parent(_ambient_forcing(fd, 0.5, mixed)[:temperature_air])
         @test all(Tm[t] == T for t in 1:2:n)
         @test all(Tm[t] ≈ T + 0.9 for t in 2:2:n)
+        # Δz = 0 with k = 1 at the band and at the donor: every layer comes back bit for bit.
+        warm_same = _cell_forcing_at_interval(fd, 0.0, ones(n), 6.5, 0.5, ones(n))
+        for v in keys(fd)
+            @test parent(warm_same[v]) == parent(fd[v])
+        end
 
         # Saturated cold input with k = 1: vapor pressure and longwave come back bit for bit.
         Tc = 253.15
@@ -435,28 +439,38 @@ end
                          wind_speed = layer(5.0), precipitation = layer(0.1),
                          shortwave_downward = layer(0.0), longwave_downward = layer(200.0));
                         metadata = Dict{String,Any}("elevation" => 2000.0))
-        same = _cell_forcing_at_interval(cold, 0.0, ones(n), 6.5, 0.5, zeros(n))
+        same = _cell_forcing_at_interval(cold, 0.0, ones(n), 6.5, 0.5, ones(n))
         for v in keys(cold)
             @test parent(same[v]) == parent(cold[v])
         end
-        # A step at or below melting is never moved, whatever the glacier term.
-        @test parent(_ambient_forcing(cold, 1.0, fill(-50.0, n))[:temperature_air]) == fill(Tc, n)
+        # A step at or below melting is never moved, whatever k: the fit uses only cells above
+        # melting, and under its model a cell is above melting exactly when its ambient air is.
+        k_min = _DONOR_DECOUPLING_FACTOR_LIMITS[1]
+        @test parent(_ambient_forcing(cold, 1.0, fill(k_min, n))[:temperature_air]) == fill(Tc, n)
 
-        # Out-of-domain inputs are refused: k outside (0, 1], a non-finite glacier term, glm
-        # outside [0, 1], or a series of the wrong length.
-        @test_throws ArgumentError _cell_forcing_at_interval(fd, 0.0, fill(1.2, n), 6.5, 0.5, g)
-        @test_throws "glacier_offset must be finite" _cell_forcing_at_interval(
-            fd, 0.0, ks, 6.5, 0.5, fill(NaN, n))
+        # Out-of-domain inputs are refused: a band k outside (0, 1], a donor k outside the donor
+        # limits or not finite, glm outside [0, 1], or a series of the wrong length. A glacier term
+        # in kelvin (here (k − 1)·E_amb = −1.8 K) or a zero offset passed where k is expected is
+        # refused rather than read as a factor.
+        @test_throws ArgumentError _cell_forcing_at_interval(fd, 0.0, fill(1.2, n), 6.5, 0.5, ks)
+        msg = "donor_decoupling_factor must be finite and in"
+        @test_throws msg _cell_forcing_at_interval(fd, 0.0, ks, 6.5, 0.5, fill(NaN, n))
+        @test_throws msg _ambient_forcing(fd, 0.5, fill(-1.8, n))
+        @test_throws msg _ambient_forcing(fd, 0.5, zeros(n))
+        @test_throws msg _ambient_forcing(fd, 0.5, fill(prevfloat(k_min), n))
+        @test_throws msg _ambient_forcing(fd, 0.5, fill(1.2, n))
+        # Refused even where glm = 0 makes the conversion the identity, so a wrong series is caught
+        # on every cell rather than only on glaciated ones.
+        @test_throws msg _ambient_forcing(fd, 0.0, zeros(n))
         @test_throws "glacier_fraction must be in [0, 1]" _cell_forcing_at_interval(
-            fd, 0.0, ks, 6.5, 1.5, g)
-        @test_throws DimensionMismatch _cell_forcing_at_interval(fd, 0.0, ks[1:2], 6.5, 0.5, g)
-        @test_throws DimensionMismatch _ambient_forcing(fd, 0.5, g[1:2])
+            fd, 0.0, ks, 6.5, 1.5, ks)
+        @test_throws DimensionMismatch _cell_forcing_at_interval(fd, 0.0, ks[1:2], 6.5, 0.5, ks)
+        @test_throws DimensionMismatch _ambient_forcing(fd, 0.5, ks[1:2])
     end
 
-    @testset "ambient conversion is bounded by the glacier term" begin
-        # |T_amb - T| <= |glm·g| at every step, for any temperature, glacier fraction and glacier
-        # term, including terms far outside anything a fit should produce; and T_amb equals
-        # T_ref + max(E_obs - glm·g, 0) on warm steps.
+    @testset "ambient conversion is bounded by the donor limit" begin
+        # On a warm step E_amb = E_obs / (1 - glm·(1 - k)), which is at most E_obs / k_min over the
+        # whole admissible range of k and glm; a step at or below melting comes back bit for bit.
         n = length(_DP_TIME)
         ti = Ti(_DP_TIME)
         layer(v) = DimArray(v, ti)
@@ -466,15 +480,15 @@ end
                        precipitation = layer(zeros(n)), shortwave_downward = layer(fill(200.0, n)),
                        longwave_downward = layer(fill(300.0, n)));
                       metadata = Dict{String,Any}("elevation" => 1000.0))
-        for glm in (0.0, 0.1, 0.5, 0.905, 1.0), g0 in (-1e7, -40.0, -4.0, -1e-3, 0.0, 2.5, 30.0, 1e7)
-            g = [g0 * (1 + 0.1 * t) for t in 1:n]
-            Ta = parent(_ambient_forcing(fd, glm, g)[:temperature_air])
+        k_min = _DONOR_DECOUPLING_FACTOR_LIMITS[1]
+        for glm in (0.0, 0.1, 0.5, 0.905, 1.0),
+            k in (k_min, nextfloat(k_min), 0.3, 0.55, 0.8, prevfloat(1.0), 1.0)
+            Ta = parent(_ambient_forcing(fd, glm, fill(k, n))[:temperature_air])
             for t in 1:n
                 E = Ts[t] - _DECOUPLING_REFERENCE_TEMPERATURE
-                @test abs(Ta[t] - Ts[t]) <= abs(glm * g[t]) * (1 + 1e-12) + 1e-12
                 if E > 0
-                    @test Ta[t] ≈ _DECOUPLING_REFERENCE_TEMPERATURE + max(E - glm * g[t], 0.0) atol = 1e-6
-                    @test Ta[t] >= _DECOUPLING_REFERENCE_TEMPERATURE
+                    @test Ta[t] - _DECOUPLING_REFERENCE_TEMPERATURE ≈ E / (1 - glm * (1 - k)) atol = 1e-12
+                    @test Ta[t] - _DECOUPLING_REFERENCE_TEMPERATURE <= E / k_min + 1e-12
                 else
                     @test Ta[t] == Ts[t]
                 end
@@ -482,18 +496,17 @@ end
         end
     end
 
-    @testset "a donor where k(z) is near zero is not amplified" begin
-        # A fully glaciated donor (glm = 1) at an elevation where the fit puts k at 1e-7: the
-        # fitted ambient excess there is 4 K and the fitted glacier term -4·(1 - 1e-7) K, so the fit
-        # predicts an observed excess of 4e-7 K. The donor observes 2 K, a +2 K residual. The
-        # ambient excess is the fitted 4 K plus that residual, 6 K. Dividing the observed excess by
-        # k instead would return 2e7 K.
+    @testset "a donor k near the lower limit stays finite and bounded" begin
+        # A fully glaciated donor (glm = 1) where the fit puts k at 1e-7: the fitted ambient excess
+        # there is 4 K and the fitted glacier term −4·(1 − 1e-7) K, so the fit predicts an observed
+        # excess of 4e-7 K. The donor observes 2 K. Dividing by that k would return 2e7 K; it lies
+        # below the donor limit, so it is refused.
         n = length(_DP_TIME)
         ti = Ti(_DP_TIME)
         col(v) = DimArray(fill(v, n), ti)
         z_d, z̄ = 1800.0, 1000.0
         # k(z) = 1 + (γ + δz)/(α + βz), with α + βz = 4 K at z_d and k(z_d) = 1e-7; at z̄ the fit
-        # gives α + βz̄ = 8 K and k(z̄) = 0.5, inside (0, 1], so the timestep is used.
+        # gives α + βz̄ = 8 K and k(z̄) = 0.5.
         β = (4.0 - 8.0) / (z_d - z̄)
         α = 8.0 - β * z̄
         g_d, g_ref = (1e-7 - 1) * 4.0, (0.5 - 1) * 8.0
@@ -501,34 +514,25 @@ end
         γ = g_ref - δ * z̄
         dec = DimStack((decoupling_factor = col(0.5), coef_alpha = col(α), coef_beta = col(β),
                         coef_gamma = col(γ), coef_delta = col(δ)))
-        @test all(k -> isapprox(k, 1e-7; atol = 1e-12), decoupling_factor_at_elevation(dec, z_d))
-        g = _glacier_offset_at_elevation(dec, z_d)
-        @test all(x -> isapprox(x, g_d; atol = 1e-12), g)
+        k_d = collect(decoupling_factor_at_elevation(dec, z_d))
+        @test all(k -> isapprox(k, 1e-7; atol = 1e-12), k_d)
         T = _DECOUPLING_REFERENCE_TEMPERATURE + 2.0
         fd = DimStack((temperature_air = col(T), pressure_air = col(80000.0),
                        vapor_pressure = col(500.0), wind_speed = col(3.0),
                        precipitation = col(0.0), shortwave_downward = col(200.0),
                        longwave_downward = col(300.0));
                       metadata = Dict{String,Any}("elevation" => z_d))
-        Ta = parent(_ambient_forcing(fd, 1.0, g)[:temperature_air])
-        @test all(t -> isapprox(t - _DECOUPLING_REFERENCE_TEMPERATURE, 6.0; atol = 1e-6), Ta)
-        # The bound holds to the rounding of one subtraction at T ≈ 275 K.
-        @test all(t -> abs(t - T) <= abs(g_d) + 4 * eps(T), Ta)
-    end
+        @test_throws "donor_decoupling_factor must be finite and in" _ambient_forcing(fd, 1.0, k_d)
 
-    @testset "_glacier_offset_at_elevation" begin
-        # γ + δz where the timestep's fit is used, NaN where k(z̄) is unmeasured or outside (0, 1]
-        # or a coefficient is not finite — the timesteps `derive_lapse_rate` leaves uncorrected.
-        ti = Ti(_DP_TIME[1:5])
-        dec = DimStack((decoupling_factor = DimArray([0.6, NaN, 1.3, 0.0, 0.9], ti),
-                        coef_alpha = DimArray(fill(5.0, 5), ti),
-                        coef_beta = DimArray(fill(-0.001, 5), ti),
-                        coef_gamma = DimArray([-1.0, -1.0, -1.0, -1.0, NaN], ti),
-                        coef_delta = DimArray(fill(-0.0005, 5), ti)))
-        g = _glacier_offset_at_elevation(dec, 2000.0)
-        @test eltype(g) == Float64 && dims(g, Ti) == ti
-        @test g[1] == -1.0 - 0.0005 * 2000.0
-        @test all(isnan, g[2:5])
+        # At the limit itself the conversion is the largest it can be, E_obs/k_min = 2/0.25 = 8 K,
+        # and the whole chain stays finite: decoupled at the donor's elevation with k = 0.8 the band
+        # excess is 0.8·8 = 6.4 K.
+        k_min = _DONOR_DECOUPLING_FACTOR_LIMITS[1]
+        Ta = parent(_ambient_forcing(fd, 1.0, fill(k_min, n))[:temperature_air])
+        @test all(t -> isapprox(t - _DECOUPLING_REFERENCE_TEMPERATURE, 2.0 / k_min; atol = 1e-12), Ta)
+        band = parent(_cell_forcing_at_interval(fd, 0.0, fill(0.8, n), 6.5, 1.0,
+                                                fill(k_min, n))[:temperature_air])
+        @test all(t -> isapprox(t - _DECOUPLING_REFERENCE_TEMPERATURE, 6.4; atol = 1e-12), band)
     end
 
     @testset "_decouple_per_timestep" begin
