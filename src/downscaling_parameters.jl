@@ -6,8 +6,10 @@
 #
 #   1. the local on-glacier temperature decoupling factor `k`, from how the warm excess varies with
 #      the reanalysis glacier mask fraction at matched elevation ([`derive_decoupling_factor`](@ref));
-#   2. the local on-glacier temperature lapse rate, from how decoupled temperature varies with
-#      elevation ([`derive_lapse_rate`](@ref)).
+#   2. the local ambient (ice-free) temperature lapse rate, from how temperature brought to the
+#      ice-free state varies with elevation ([`derive_lapse_rate`](@ref)).
+#
+# `_cell_forcing_at_interval` applies both to one donor cell: ambient, lapse, then decouple.
 #
 # Both *measure*: they report what the region's forcing supports at the forcing's own time
 # resolution, and `NaN` where it supports nothing. They substitute nothing and clamp nothing,
@@ -19,7 +21,7 @@
 #
 # These invert the corrections in `glacier_adjustment.jl` and `elevation_adjustment.jl`: `k` is read
 # back out of a forcing record that has already had the reanalysis's own decoupling baked into it,
-# and the lapse rate out of temperatures brought to a common on-glacier state. That is why they live
+# and the lapse rate out of temperatures brought to a common ice-free state. That is why they live
 # here rather than with whatever assembles a region — the arithmetic is entirely about this
 # package's own adjustment conventions.
 #
@@ -28,8 +30,8 @@
 # Both fits take an accumulator of per-timestep cross-cell regression sums rather than a stack of
 # forcing, so a region of hundreds of cells over decades of hourly steps never has to be held in
 # memory at once. Its producer lives in the caller (GEMB_GlacierSims builds one by streaming a
-# glacier elevation-class table), so the contract is documented here rather than being visible in
-# one file:
+# glacier elevation-class table); `_downscaling_sums` and `_accumulate_downscaling_cell!` below are
+# the reference producer, and the contract is:
 #
 #   acc.n              — number of timesteps
 #   acc.time           — the `Ti` axis values, `length(acc.time) == acc.n`
@@ -38,18 +40,22 @@
 #   acc.sums           — the sums below, or `nothing` if no cell had usable forcing
 #
 # `acc.sums` holds one length-`n` vector per field. With the design vector `x = [1, z, glm, glm*z]`
-# per cell — `z` its reanalysis elevation (m), `glm` its glacier-mask fraction — and `w = glm*z`:
+# per cell — `z` its reanalysis elevation (m), `glm` its glacier-mask fraction — `w = glm*z`, and
+# the warm excess `E = max(T - T_ref, 0)`:
 #
-#   s1                       — count of contributing cells (Int)
-#   z, g, w                  — Σz, Σglm, Σw
-#   zz, zg, zw, gg, gw, ww   — the upper triangle of XᵀX
-#   E, zE, gE, wE            — Xᵀ against the warm excess `E = max(T - T_ref, 0)`
+#   s1, z, zz, T, zT         — over every contributing cell: count (Int), Σz, Σz², ΣT, ΣzT
+#   s1_warm                  — count of cells above melting (`E > 0`) at that timestep (Int)
+#   z_warm, g_warm, w_warm   — Σz, Σglm, Σw over those cells
+#   zz_warm, zg_warm, zw_warm, gg_warm, gw_warm, ww_warm
+#                            — the upper triangle of XᵀX over those cells
+#   E, zE, gE, wE            — Xᵀ against `E` (cells at or below melting add zero)
 #   EE                       — ΣE², for the decoupling fit's `r2`
-#   T, zT                    — ΣT and ΣzT, for the lapse fit
 #
-# Duck-typed on purpose: a NamedTuple of `Vector{Float64}` (plus `Vector{Int}` for `s1`) is all
-# either fit reads, and pinning a struct here would make the accumulator's own layout this
-# package's business.
+# The `_warm` sums restrict the decoupling fit to cells above melting, where the warm excess is the
+# product the fit models; see `derive_decoupling_factor`.
+#
+# Duck-typed on purpose: a NamedTuple of `Vector{Float64}` (plus `Vector{Int}` for the counts) is
+# all either fit reads, and a producer may carry further fields of its own.
 
 # Melting point (K). The decoupling correction damps only the excess above it, matching
 # `climate_adjust_for_glacier`'s `reference_temperature` default.
@@ -87,10 +93,48 @@ const _LAPSE_RATE_LIMITS = (_LAPSE_RATE_MIN, _LAPSE_RATE_MAX)
 # into it.
 const _DECOUPLING_FACTOR_LIMITS = (0.0, 1.0)
 
-# The seven forcing layers `climate_forcing` returns. Named here rather than derived from a stack so
-# a caller accumulating layer-wise can allocate before it has seen one.
+# The ten forcing layers `climate_forcing` returns. Named here rather than derived from a stack so
+# a caller accumulating layer-wise can allocate before it has seen one. The last three are not
+# area-averaged like the rest: an average of `solar_zenith_angle` weights `cos θ` by shortwave
+# (see `shortwave_forcing_layers`).
 const _FORCING_VARIABLES = (:temperature_air, :pressure_air, :vapor_pressure, :wind_speed,
-                            :precipitation, :shortwave_downward, :longwave_downward)
+                            :precipitation, :shortwave_downward, :longwave_downward,
+                            :solar_zenith_angle, :shortwave_downward_diffuse,
+                            :cloud_optical_thickness)
+
+# Zeroed cross-cell sums for `n` timesteps, in the layout the `acc` contract above describes.
+function _downscaling_sums(n::Integer)
+    counts() = zeros(Int, n)
+    v() = zeros(n)
+    return (; s1 = counts(), z = v(), zz = v(), T = v(), zT = v(),
+            s1_warm = counts(), z_warm = v(), g_warm = v(), w_warm = v(),
+            zz_warm = v(), zg_warm = v(), zw_warm = v(), gg_warm = v(), gw_warm = v(),
+            ww_warm = v(),
+            E = v(), zE = v(), gE = v(), wE = v(), EE = v())
+end
+
+# Add one cell — temperature series `T` (K), reanalysis elevation `z` (m), glacier-mask fraction
+# `glm` — into the sums `S`. Every vector of `S` must share `T`'s indices.
+function _accumulate_downscaling_cell!(S, T, z::Real, glm::Real)
+    z, glm = Float64(z), Float64(glm)
+    gz = glm * z
+    for t in eachindex(T, S.s1)
+        Tt = T[t]
+        S.s1[t] += 1
+        S.z[t] += z;  S.zz[t] += z * z
+        S.T[t] += Tt; S.zT[t] += z * Tt
+        Et = Tt - _DECOUPLING_REFERENCE_TEMPERATURE
+        Et > 0 || continue
+        S.s1_warm[t] += 1
+        S.z_warm[t]  += z;         S.g_warm[t]  += glm;        S.w_warm[t]  += gz
+        S.zz_warm[t] += z * z;     S.zg_warm[t] += z * glm;    S.zw_warm[t] += z * gz
+        S.gg_warm[t] += glm * glm; S.gw_warm[t] += glm * gz;   S.ww_warm[t] += gz * gz
+        S.E[t]  += Et;        S.zE[t] += z * Et
+        S.gE[t] += glm * Et;  S.wE[t] += gz * Et
+        S.EE[t] += Et * Et
+    end
+    return S
+end
 
 """
     derive_decoupling_factor(acc; min_cells = $(_MIN_CELLS_DEFAULT)) -> DimStack
@@ -103,10 +147,9 @@ so `E′ = k·E`. The estimator inverts that using the one place the reanalysis 
 degree of decoupling: `glm`, the fraction of each cell its land-surface scheme treats as ice.
 
 **Which end of `glm` is decoupled matters, and it is the high end.** A cell with `glm = 1` is one
-ERA5-Land already runs as ice, so its near-surface temperature is *already* damped and needs no
-correction — which is precisely why `GEMB_GlacierSims.cell_decoupling_factor` weights the correction it
-applies by `1 - glm`. A cell with `glm = 0` is run as ice-free ground and its temperature is
-ambient, so it needs the full correction. Mixing the two, a cell's observed excess is
+ERA5-Land already runs as ice, so its near-surface temperature is *already* damped. A cell with
+`glm = 0` is run as ice-free ground and its temperature is ambient. Mixing the two, a cell's
+observed excess is
 
     E_i = [1 - glm_i·(1 - k)] · E_ambient(z_i)
 
@@ -132,21 +175,31 @@ i.e. the fitted excess of a fully-glaciated cell over that of an ice-free one at
 Elevation is a control, not a nuisance: `glm` and elevation covary strongly (high cells are more
 glaciated), so without it the `glm` slope is partly a topographic signal.
 
+**Only cells above melting are fitted.** The model is a product of the damping factor and the
+ambient excess, and the excess is truncated at zero: a cell at or below melting reports `E = 0`
+whatever its ambient temperature, so it lies off the linear surface rather than on it. Where the
+melting level falls inside the region, including those cells bends the fitted surface toward zero
+at the cold end and biases `k` low (0.74 against a true 0.80 on a synthetic region whose top
+cells are below melting). Under the model a cell is above melting exactly when its ambient
+temperature is, since the damping factor is positive, so restricting the fit to cells with
+`E > 0` loses nothing and the four-term surface is exact on what remains.
+
 Returns a `DimStack` on the accumulated `Ti` axis:
 
 | layer | meaning |
 |:--|:--|
 | `decoupling_factor` | `k` at the reference elevation, raw. `NaN` where the region supported no fit |
 | `n_cells` | grid cells contributing to that timestep |
-| `r2` | coefficient of determination of the four-term fit |
+| `n_cells_above_melting` | of those, the cells above melting — the ones the fit uses |
+| `r2` | coefficient of determination of the four-term fit, over the cells above melting |
 | `ambient_excess` | the fitted ice-free excess `α + β·z̄` (K) — what the fit's precision hinges on |
 | `coef_alpha`, `coef_beta`, `coef_gamma`, `coef_delta` | all four coefficients, so `k` is re-evaluable at any elevation — see [`decoupling_factor_at_elevation`](@ref) |
 
 `metadata` carries `reference_elevation` (`z̄`), `min_cells`, `n_fitted`, and `n_timesteps`.
 
 **`NaN` means "the forcing carried no information here", and nothing more.** A timestep reports `NaN`
-when it has fewer than `max(min_cells, 4)` cells (four parameters need four cells), no spread in `glm`
-or elevation, collinear regressors, or an ambient excess below `$(_MIN_AMBIENT_EXCESS)` K. That last
+when it has fewer than `max(min_cells, 4)` cells above melting (four parameters need four cells), no
+spread in `glm` or elevation among them, collinear regressors, or an ambient excess below `$(_MIN_AMBIENT_EXCESS)` K. That last
 case is most of a glacier record and is a real identifiability limit rather than a divide-by-zero
 guard: `k` is a *ratio* of fitted excesses, so a region sitting near melting fits one out of noise —
 on real Alpine forcing that produced a confident-looking winter `k` of 0.2 from a 0.1 K excess.
@@ -171,10 +224,9 @@ median(filter(isfinite, k.decoupling_factor))                                   
 map(g -> median(filter(isfinite, g.decoupling_factor)), groupby(k, Ti => month)) # by month
 ```
 
-`ambient_excess` is the `α + β·z̄` profile [`derive_lapse_rate`](@ref) needs in order to undo the
-reanalysis's own partial decoupling cell by cell, and it is the honest measure of how well determined
-a given timestep's `k` is: the closer it sits to `$(_MIN_AMBIENT_EXCESS)` K, the more of the ratio is
-noise.
+`ambient_excess` is the honest measure of how well determined a given timestep's `k` is: the closer
+it sits to `$(_MIN_AMBIENT_EXCESS)` K, the more of the ratio is noise. The coefficients are what
+[`derive_lapse_rate`](@ref) uses to bring each cell to the ice-free state.
 
 ## Screening `k` downstream, and why it also screens the lapse rate
 
@@ -184,7 +236,9 @@ make it meaningful, so an out-of-domain `k` is the expected outcome near the thr
 sign of a broken fit — `r2` is a median 0.97 for those timesteps, statistically indistinguishable from
 the well-behaved ones. `r2` cannot be used to screen them; `ambient_excess` can.
 
-Two years of ERA5-Land at Wrangell-St Elias (38 cells, 3427 timesteps with a measurable `k`):
+Two years of ERA5-Land at Wrangell-St Elias (38 cells, 3427 timesteps with a measurable `k`), with
+every cell in the fit, including those at or below melting, so the figures indicate scale rather
+than the current fit's exact behavior:
 
 | `_MIN_AMBIENT_EXCESS` | timesteps kept | with `k` outside `(0,1]` | max `k` |
 |--:|--:|--:|--:|
@@ -196,10 +250,8 @@ Two years of ERA5-Land at Wrangell-St Elias (38 cells, 3427 timesteps with a mea
 Raising the threshold trades coverage for tail control and never eliminates the tail, which is why it
 stays at $(_MIN_AMBIENT_EXCESS) K here — the measurement guard — and the rest is a post-processing
 decision. **Screen on `k ∈ (0, 1]` directly**, which is what
-`climate_adjust_for_glacier` requires anyway, and drop or down-weight `lapse_rate` at the same
-timesteps: those `k` values corrupt the lapse fit that consumes them, and the corrupted slopes are not
-detectable from the slope series alone. See the warning in [`derive_lapse_rate`](@ref) for the
-measurements.
+`climate_adjust_for_glacier` requires anyway. [`derive_lapse_rate`](@ref) applies the same screen:
+at those timesteps it fits the observed temperatures without the ice-free correction.
 
 Neither the narrowness nor the spread of the glacier-mask fraction is the cause. `glm` is **static per
 cell**, so it is identical at every timestep and cannot explain why 788 of 17521 blow up while the
@@ -214,8 +266,10 @@ the coefficients — the diagnostic to screen on.
 
 Four cells make the four-term fit *determinate*, which is not the same as identified. Because forcing
 completeness is screened per cell, the contributing count is constant across time — so `min_cells`
-gates whole regions, and the cost of raising it is measured in regions dropped rather than timesteps
-pruned.
+gates whole regions, and the cost of raising it is measured mostly in regions dropped. The count above
+melting, which is what the gate is applied to, also varies with time: a timestep whose melting level
+leaves fewer than `min_cells` cells above it reports `NaN`. The subsampling and coverage figures below
+were measured with every cell counted.
 
 Subsampling Wrangell's 38 cells to `m`, spread through the elevation ordering, and scoring each
 subsample's `k` against the all-38-cell fit:
@@ -267,6 +321,7 @@ function derive_decoupling_factor(acc; min_cells::Int = _MIN_CELLS_DEFAULT)
     decoupling_factor = fill(NaN, n)
     r2 = fill(NaN, n)
     n_cells = zeros(Int, n)
+    n_cells_above_melting = zeros(Int, n)
     # The fitted ice-free excess at `z̄`, per timestep. `NaN` where nothing was fitted.
     ambient_excess = fill(NaN, n)
     # All four fitted coefficients per timestep, so `k` can be re-evaluated at an elevation other
@@ -276,16 +331,19 @@ function derive_decoupling_factor(acc; min_cells::Int = _MIN_CELLS_DEFAULT)
 
     S = acc.sums
     if S !== nothing
-        @inbounds for t in 1:n
+        for t in 1:n
             n_cells[t] = S.s1[t]
-            # Four parameters need four cells before the system is even determined.
-            S.s1[t] >= max(min_cells, 4) || continue
+            m = S.s1_warm[t]
+            n_cells_above_melting[t] = m
+            # Only cells above melting are fitted, and four parameters need four of them before the
+            # system is even determined.
+            m >= max(min_cells, 4) || continue
 
-            # XᵀX for x = [1, z, glm, glm*z], upper triangle, and Xᵀy for y = E.
-            A = (Float64(S.s1[t]), S.z[t], S.g[t],  S.w[t],
-                                   S.zz[t], S.zg[t], S.zw[t],
-                                            S.gg[t], S.gw[t],
-                                                     S.ww[t])
+            # XᵀX for x = [1, z, glm, glm*z] over the warm cells, upper triangle, and Xᵀy for y = E.
+            A = (Float64(m), S.z_warm[t],  S.g_warm[t],  S.w_warm[t],
+                             S.zz_warm[t], S.zg_warm[t], S.zw_warm[t],
+                                           S.gg_warm[t], S.gw_warm[t],
+                                                         S.ww_warm[t])
             coef = _solve_sym4(A, (S.E[t], S.zE[t], S.gE[t], S.wE[t]))
             coef === nothing && continue
             α, β, γ, δ = coef
@@ -304,7 +362,7 @@ function derive_decoupling_factor(acc; min_cells::Int = _MIN_CELLS_DEFAULT)
             # here would hide precisely the timesteps a caller needs to see before trusting a
             # summary. `elevation_interval_forcing` clamps, because it applies.
             decoupling_factor[t] = decoupled / ambient
-            r2[t] = _r2(S.s1[t], S.E[t], S.EE[t],
+            r2[t] = _r2(m, S.E[t], S.EE[t],
                         α * S.E[t] + β * S.zE[t] + γ * S.gE[t] + δ * S.wE[t])
             ambient_excess[t] = ambient
             cα[t] = α; cβ[t] = β; cγ[t] = γ; cδ[t] = δ
@@ -318,6 +376,7 @@ function derive_decoupling_factor(acc; min_cells::Int = _MIN_CELLS_DEFAULT)
 
     return DimStack((decoupling_factor = DimArray(decoupling_factor, ti),
                      n_cells = DimArray(n_cells, ti),
+                     n_cells_above_melting = DimArray(n_cells_above_melting, ti),
                      r2 = DimArray(r2, ti),
                      ambient_excess = DimArray(ambient_excess, ti),
                      coef_alpha = DimArray(cα, ti),
@@ -387,23 +446,24 @@ function decoupling_factor_at_elevation(decoupling, elevation::Real; elevation_r
 
     k = fill(NaN, n)
     n_held = 0
-    @inbounds for t in 1:n
+    for t in 1:n
         isfinite(α[t]) || continue
         a, b = α[t], β[t]
         # Evaluate at `z` if the ambient excess still clears the threshold there, and otherwise at
-        # the nearest elevation where it does. `E_ambient = a + b·z` is linear, so its valid set is a
-        # half-line whose edge is `z* = (threshold - a) / b`; a fitted timestep puts `z̄` inside it,
-        # so the edge is always on the far side of `z̄` from `z` and clamping toward it cannot
-        # overshoot.
-        z_eval = z
-        if a + b * z < _MIN_AMBIENT_EXCESS
+        # the edge of the half-line where it does: `E_ambient = a + b·z` is linear, so that edge is
+        # `z* = (threshold - a) / b`, and a fitted timestep has `z̄` inside it. At the edge the
+        # ambient excess is the threshold itself by construction, so it is used directly rather
+        # than re-evaluated — rounding in `a + b·z*` could otherwise land a hair below the
+        # threshold and drop a held timestep.
+        if a + b * z >= _MIN_AMBIENT_EXCESS
+            ambient = a + b * z
+            z_eval = z
+        else
             b == 0 && continue                     # constant and already below: nothing to hold onto
-            z_star = (_MIN_AMBIENT_EXCESS - a) / b
-            z_eval = b < 0 ? min(z, z_star) : max(z, z_star)
+            ambient = _MIN_AMBIENT_EXCESS
+            z_eval = (_MIN_AMBIENT_EXCESS - a) / b
             n_held += 1
         end
-        ambient = a + b * z_eval
-        ambient >= _MIN_AMBIENT_EXCESS || continue
         k[t] = (ambient + (γ[t] + δ[t] * z_eval)) / ambient
     end
 
@@ -416,73 +476,39 @@ end
 """
     derive_lapse_rate(acc, decoupling; min_cells = $(_MIN_CELLS_DEFAULT)) -> DimStack
 
-Fit the **on-glacier** temperature lapse rate (K/km, positive for cooling with height) per timestep
-from cross-cell sums, after decoupling each cell's temperature with `decoupling_factor`.
+Fit the **ambient** (ice-free) near-surface temperature lapse rate (K/km, positive for cooling with
+height) per timestep from cross-cell sums, after bringing every cell to the ice-free state with the
+decoupling fit.
 
-Decoupling comes first because the lapse rate wanted here is the on-glacier one and not the ambient
-one: `k` damps the warm excess, which compresses the near-surface temperature range over melting ice
-and so flattens the slope against elevation. Fitting the raw reanalysis temperature would give the
-ambient lapse rate, which is not what a glacier surface sees.
+The slope wanted is the ambient one because the forcing is applied ambient-first: a donor cell's
+temperature is taken to the ice-free state, lapsed to the band elevation with this slope, and only
+then decoupled with the band's own `k` ([`_cell_forcing_at_interval`](@ref)). Decoupling the lapsed
+temperature once is then the whole of the on-glacier correction; a slope fitted to decoupled
+temperatures would apply the damping to the vertical term twice.
 
-The correction applied to each cell is the *effective* factor, weighted by that cell's non-glacier
-fraction exactly as `GEMB_GlacierSims.cell_decoupling_factor` weights it:
+Each cell's temperature is brought to the ice-free state with the four-term model
+[`derive_decoupling_factor`](@ref) fits, `E_i = α + β·z_i + glm_i·(γ + δ·z_i)`, whose ice-free part
+is `α + β·z_i`. Removing the glacier term leaves the cell's ambient excess plus its own residual from
+the fit:
 
-    T′_i = T_i + (k_eff_i - 1)·E_i,   k_eff_i = 1 - (1 - k)(1 - glm_i)
-         = T_i + (k - 1)(1 - glm_i)·E_i
+    T_ambient_i = T_i - glm_i·(γ + δ·z_i)
 
-A cell ERA5-Land already treats as fully glaciated (`glm = 1`) therefore gets no correction, and an
-ice-free one gets the full correction, so every cell is brought to a common on-glacier state before
-the slope is taken. Applying one uniform `k` to all of them instead would over-damp the glaciated
-cells — which are systematically the high ones — and so tilt the fitted slope.
-
-`E_i` here is the **ambient** excess at cell `i`'s elevation — what an ice-free cell there would see
-— not the cell's observed excess, which is already damped by its own `glm`. That is exactly the
-ice-free end of the decoupling fit, `α + β·z`, so the `(α, β)` per-timestep coefficients from
-`decoupling` are reused rather than re-derived. The whole correction is then linear in the sums
-already accumulated: no second pass over the forcing.
+for a cell above melting, and `T_ambient_i = T_i` for a cell at or below it, where the reanalysis
+applies no damping. An ice-free cell (`glm = 0`) is unchanged and a fully glaciated one gets the
+whole correction. The correction is linear in the warm-cell sums already accumulated, so the fit
+needs no second pass over the forcing. [`_ambient_forcing`](@ref) applies the same correction to a
+donor cell, with the ambient temperature held at or above melting; the two differ only at a cell
+whose correction would cool it past melting, which a sum cannot resolve per cell.
 
 `decoupling` is the `DimStack` [`derive_decoupling_factor`](@ref) returns, read **raw**. A timestep
-whose `k` is `NaN` *or* outside `(0, 1]` is corrected with `k = 1` *locally* — the bit-exact no-op,
-which is the right treatment because a timestep with no measurable decoupling is one where the
-reanalysis warm excess is too small to matter to the slope anyway. Nothing substituted is written back
-into either output.
-
-!!! warning "A corrupt `k` corrupts this slope, and the slope alone does not show it"
-    The correction above is proportional to `k - 1`, so an out-of-domain `k` scales every cell's
-    temperature by an arbitrary amount before the slope is taken — and because the correction carries
-    the `(1 - glm_i)` weight, and `glm` rises with elevation in most regions, the damage is *not*
-    scattered noise a robust estimator could reject. It is a smooth, near-collinear false gradient
-    that any slope estimator fits confidently.
-
-    Measured on two years of ERA5-Land at Wrangell-St Elias (38 cells, 17521 timesteps):
-
-    | `k` at that timestep | fitted lapse rate, median | max |
-    |:--|--:|--:|
-    | `NaN` (no correction applied) | 5.2 | 8.95 |
-    | inside `(0, 1]` | 3.7 | 8.09 |
-    | outside `(0, 1]` | 6.88 | **46.09** |
-
-    Every timestep exceeding $(_LAPSE_RATE_LIMITS[2]) K/km came from a `k` outside `(0, 1]`; none
-    came from a `k` inside it. `corr(|k - 1|, |Γ - median Γ|) = 0.81`. At the worst timestep
-    `k = 7.35` inflated the lowest cell's temperature from 287.5 K to 375.8 K, and the fitted slope
-    went from 7.0 K/km on the raw temperatures to 46.1 K/km on the "corrected" ones. Ordinary least
-    squares, Theil–Sen, and Huber all return 46.1 ± 0.3 there: **the estimator is not the problem and
-    a robust fit does not help.**
-
-    So the correction is applied **only where `k` lands inside `(0, 1]`**. Outside it — as with a `NaN`
-    — the timestep is corrected with `k = 1`, the bit-exact no-op, and the slope is taken on the raw
-    temperatures. That is the ambient lapse rate rather than the on-glacier one, which is the honest
-    answer for a timestep whose decoupling was never measured: the reported slope is then a real
-    measurement of something slightly different, rather than a confident measurement of nothing. At
-    Wrangell this drops the series maximum from 46.09 to 8.95 K/km and brings every timestep inside
-    $(_LAPSE_RATE_LIMITS) K/km, so the clamp in
-    `GEMB_GlacierSims.elevation_interval_forcing` no longer engages on the slope at
-    all.
-
-    The screen is on `k`, not on the fitted slope — a corrupted slope is not identifiable from the
-    slope series. `decoupling_factor` itself is still reported raw, 7.35 and all, since that value is
-    evidence about the decoupling fit. To know which timesteps were corrected, test
-    `0 < decoupling_factor <= 1` on the companion stack.
+whose `k` is `NaN` *or* outside `(0, 1]` is fitted on the observed temperatures without correction.
+For a `NaN` that is right in practice: `k` is unmeasurable where the region carries too little warm
+excess for the damping to matter to the slope. An out-of-domain `k` comes from a ratio of two
+near-zero fitted excesses, and its coefficients would add a correction proportional to `glm`. `glm`
+rises with elevation in most regions, so that correction is a smooth, near-collinear false gradient
+rather than scatter, and no slope estimator can reject it. Nothing substituted is written back into
+either output. To know which timesteps were corrected, test `0 < decoupling_factor <= 1` on the
+companion stack.
 
 Returns a `DimStack` on the accumulated `Ti` axis:
 
@@ -498,21 +524,18 @@ Returns a `DimStack` on the accumulated `Ti` axis:
 determined at all, far more than the cell count. A timestep reports `NaN` when it has fewer than
 `min_cells` cells or no spread in elevation.
 
-Two parameters rather than four makes this the less demanding of the two fits — subsampling Wrangell,
-its median error against the all-cell slope is 0.40 K/km at 4 cells and 0.38 at 8, on slopes of
-~5.5 K/km — so `min_cells` is set by the decoupling fit's needs, not this one's. See
-[`derive_decoupling_factor`](@ref) for the numbers.
+Two parameters rather than four makes this the less demanding of the two fits, so `min_cells` is set
+by the decoupling fit's needs, not this one's. See [`derive_decoupling_factor`](@ref).
 
 **Nothing is clamped.** A fitted slope of 200 K/km is real evidence that this region does not
 constrain a lapse rate at that timestep, and clamping it into $(_LAPSE_RATE_LIMITS) K/km would hide
-exactly that. The clamp lives in
-`GEMB_GlacierSims.elevation_interval_forcing`, the one place a slope is applied and
-so the one place it has to be acceptable to `climate_adjust_for_elevation`.
+exactly that. The clamp lives in `GEMB_GlacierSims.elevation_interval_forcing`, the one place a
+slope is applied and so the one place it has to be acceptable to `climate_adjust_for_elevation`.
 
 Summarise with a **median**, not a mean, and expect real spread: a per-timestep slope over a handful
 of cells is broad, and much of that breadth is physical — nocturnal valley inversions and steep
-midday cooling are both in the record. At Wrangell the fits span -0.28 to +7.84 K/km between the 5th
-and 95th percentiles. Group over the `Ti` axis at whatever resolution the decision needs:
+midday cooling are both in the record. Group over the `Ti` axis at whatever resolution the decision
+needs:
 
 ```julia
 using Statistics, Dates
@@ -531,11 +554,11 @@ function derive_lapse_rate(acc, decoupling; min_cells::Int = _MIN_CELLS_DEFAULT)
     n_cells = zeros(Int, n)
 
     k = decoupling.decoupling_factor
-    cα, cβ = decoupling.coef_alpha, decoupling.coef_beta
+    cγ, cδ = decoupling.coef_gamma, decoupling.coef_delta
 
     S = acc.sums
     if S !== nothing
-        @inbounds for t in 1:n
+        for t in 1:n
             n_cells[t] = S.s1[t]
             S.s1[t] >= min_cells || continue
 
@@ -547,41 +570,15 @@ function derive_lapse_rate(acc, decoupling; min_cells::Int = _MIN_CELLS_DEFAULT)
             Szz > 0 || continue
             elevation_spread[t] = sqrt(Szz / m)
 
-            # Bring every cell to the same fully-on-glacier state before taking the slope. The
-            # remaining correction for cell `i` is what is left of `k` after the reanalysis has
-            # already applied its own `glm`-worth of it:
-            #
-            #     T_glacier_i = T_i + (k - 1)(1 - glm_i)·E_ambient(z_i)
-            #
-            # `E_ambient` is the ambient excess — the excess an ice-free cell at that elevation would
-            # see — which is *not* the observed excess, since the observed one is already damped by
-            # `glm_i`. It is exactly the ice-free end of the decoupling fit, `α + β·z`, so the
-            # coefficients that fit came out of are reused here rather than re-derived.
-            #
-            # An unmeasurable timestep is corrected with `k = 1` here and only here: `c = 0` makes
-            # every correction term vanish and the slope is taken on the raw temperatures, which is
-            # the bit-exact no-op. Nothing is written back into the decoupling series.
-            #
-            # A `k` outside `(0, 1]` is treated the same way, and for the same reason: it is not a
-            # decoupling factor, it is the ratio of two near-zero fitted excesses. Applying it scales
-            # every cell by an arbitrary amount, and because the correction carries `(1 - glm_i)` and
-            # `glm` rises with elevation, the damage is a smooth false gradient rather than scatter —
-            # so it lands in the slope in full and no estimator can see it. Measured at Wrangell it
-            # took a 7.0 K/km slope to 46.1 K/km. See the warning in the docstring.
-            fit_ok = isfinite(k[t]) && 0.0 < k[t] <= 1.0 &&
-                     isfinite(cα[t]) && isfinite(cβ[t])
-            c = fit_ok ? k[t] - 1.0 : 0.0
-            α, β = fit_ok ? (cα[t], cβ[t]) : (0.0, 0.0)
+            # Bring every cell to the ice-free state: `T_i - glm_i·(γ + δ·z_i)` for a cell above
+            # melting, unchanged otherwise. Summed, that subtracts `γ·Σglm + δ·Σglm·z` from ΣT and
+            # `γ·Σz·glm + δ·Σz·glm·z` from ΣzT, the sums running over the warm cells. Uncorrected
+            # where `k` is unmeasured or out of domain — see the docstring.
+            γ, δ = _corrects_to_ambient(k[t], cγ[t], cδ[t]) ? (cγ[t], cδ[t]) : (0.0, 0.0)
+            sT  = S.T[t]  - (γ * S.g_warm[t]  + δ * S.w_warm[t])
+            szT = S.zT[t] - (γ * S.zg_warm[t] + δ * S.zw_warm[t])
 
-            # Σ(1-glm)E_ambient and Σz(1-glm)E_ambient, from the stored regressor sums: Σz(1-glm) is
-            # `z - w` and Σz²(1-glm) is `zz - zw`, `w` being the `glm·z` interaction regressor.
-            s_corr  = α * (m - S.g[t]) + β * (S.z[t] - S.w[t])
-            sz_corr = α * (S.z[t] - S.w[t]) + β * (S.zz[t] - S.zw[t])
-
-            sT  = S.T[t]  + c * s_corr
-            szT = S.zT[t] + c * sz_corr
-
-            # Simple linear regression of the on-glacier temperature on elevation.
+            # Simple linear regression of the ambient temperature on elevation.
             SzT = szT - S.z[t] * sT / m
 
             # K/m -> K/km, sign flipped so positive means cooling with height (the convention
@@ -597,6 +594,27 @@ function derive_lapse_rate(acc, decoupling; min_cells::Int = _MIN_CELLS_DEFAULT)
     return DimStack((lapse_rate = DimArray(lapse_rate, ti),
                      n_cells = DimArray(n_cells, ti),
                      elevation_spread = DimArray(elevation_spread, ti)); metadata)
+end
+
+# Whether a timestep's decoupling fit is used to bring cells to the ice-free state: `k` at the
+# reference elevation measured and inside `(0, 1]`, and the glacier coefficients finite. Shared by
+# `derive_lapse_rate` and `_glacier_offset_at_elevation`, so the lapse fit and the donor conversion
+# correct exactly the same timesteps.
+_corrects_to_ambient(k, γ, δ) =
+    isfinite(k) && _DECOUPLING_FACTOR_LIMITS[1] < k <= _DECOUPLING_FACTOR_LIMITS[2] &&
+    isfinite(γ) && isfinite(δ)
+
+# The glacier term of the decoupling fit at elevation `z` (m), per timestep: `γ + δ·z`, the fitted
+# warm excess of a fully glaciated cell minus that of an ice-free one at `z` (K), which is
+# `(k(z) - 1)·(α + β·z)`. `NaN` at every timestep `_corrects_to_ambient` rejects. Linear in `z` with
+# no denominator, so unlike `k(z)` it needs no hold at the edge of the ambient excess. This is the
+# `glacier_offset` `_ambient_forcing` takes, raw; a caller resolves the `NaN`s before applying it.
+function _glacier_offset_at_elevation(decoupling, z::Real)
+    zf = Float64(z)
+    k = decoupling.decoupling_factor
+    γ, δ = decoupling.coef_gamma, decoupling.coef_delta
+    return Float64[_corrects_to_ambient(k[t], γ[t], δ[t]) ? γ[t] + δ[t] * zf : NaN
+                   for t in eachindex(k, γ, δ)]
 end
 
 """
@@ -715,39 +733,118 @@ function _make_applicable(raw, fill::Float64, (lo, hi)::Tuple{Float64,Float64};
     return (applied, n_filled, n_clamped)
 end
 
-# One cell's forcing at an interval center: lapse first, then decouple.
-#
-# That order is not incidental. `k` multiplies an *ambient* temperature at the glacier's elevation,
-# so the elevation adjustment has to run first — `climate_adjust_for_glacier` says so explicitly,
-# and `forcing_at_elevation` (the path the sweep itself uses) does the same. The two do not commute,
-# since the decoupling damps only the excess above a fixed melting point and lapsing changes which
-# timesteps are above it.
-function _cell_forcing_at_interval(fd, delta_elevation, decoupling_factor, lapse_rate)
-    lapsed = climate_adjust_for_elevation(fd, delta_elevation; lapse_rate)
+"""
+    _cell_forcing_at_interval(fd, delta_elevation, decoupling_factor, lapse_rate,
+                              glacier_fraction, donor_glacier_offset) -> DimStack
+
+One donor cell's forcing `fd`, delivered on glacier at an elevation `delta_elevation` (m) above the
+cell's reanalysis surface:
+
+1. **to ambient** — remove the glacier term of the decoupling fit from the cell's own warm excess
+   ([`_ambient_forcing`](@ref)), with `glacier_fraction` the donor cell's `glm` and
+   `donor_glacier_offset` the per-timestep `γ + δ·z` at the **donor's** elevation;
+2. **lapse** — [`climate_adjust_for_elevation`](@ref) with the ambient `lapse_rate` (K/km, scalar,
+   monthly or per-timestep) that [`derive_lapse_rate`](@ref) fits;
+3. **decouple** — the band is glacier, so the band's full per-timestep `decoupling_factor` at the
+   **band's** elevation is applied to the lapsed ambient temperature
+   ([`_decouple_per_timestep`](@ref)).
+
+Step 1 and the two fits share one model, `E_obs = α + β·z + glm·(γ + δ·z)`, so a region whose forcing
+follows it gives the same band temperature `T_ref + k(z_band)·E_ambient(z_band)` from every donor.
+The order is not incidental: the decoupling damps only the excess above a fixed melting point, and
+lapsing changes which timesteps are above it.
+
+`decoupling_factor` must be finite and in `(0, 1]`, `donor_glacier_offset` finite, and
+`glacier_fraction` in `[0, 1]`; anything else throws an `ArgumentError`. The band's `k(z)` comes from
+[`decoupling_factor_at_elevation`](@ref), filled and clamped into that domain by the caller, and the
+donor's offset from `_glacier_offset_at_elevation`, with its `NaN`s resolved by the caller.
+"""
+function _cell_forcing_at_interval(fd, delta_elevation, decoupling_factor, lapse_rate,
+                                   glacier_fraction, donor_glacier_offset)
+    _check_decoupling_series(decoupling_factor, fd, "decoupling_factor")
+    ambient = _ambient_forcing(fd, glacier_fraction, donor_glacier_offset)
+    lapsed = climate_adjust_for_elevation(ambient, delta_elevation; lapse_rate)
     return _decouple_per_timestep(lapsed, decoupling_factor)
 end
 
+function _check_decoupling_series(k, fd, name)
+    _check_series_length(k, fd, name)
+    all(x -> isfinite(x) && 0 < x <= 1, k) || throw(ArgumentError(
+        "$(name) must be finite and in (0, 1] at every timestep; fill and clamp a fitted series " *
+        "before applying it"))
+    return nothing
+end
+
+function _check_series_length(x, fd, name)
+    length(x) == length(dims(fd, Ti)) || throw(DimensionMismatch(
+        "$(name) has $(length(x)) values but the forcing has $(length(dims(fd, Ti))) timesteps"))
+    return nothing
+end
+
+"""
+    _ambient_forcing(fd, glacier_fraction, glacier_offset) -> DimStack
+
+A reanalysis cell's forcing brought to the ice-free (ambient) state with the decoupling fit's own
+model of its warm excess. [`derive_decoupling_factor`](@ref) fits a cell with glacier-mask fraction
+`glm` at elevation `z` as `Ê_obs = α + β·z + glm·(γ + δ·z)`, whose ice-free part is `α + β·z`. The
+cell's ambient excess is that ice-free part plus the cell's own residual from the fit,
+`r = E_obs - Ê_obs`:
+
+    E_ambient = α + β·z + r = E_obs - glm·g,    g = γ + δ·z,    E_obs = max(T - T_ref, 0)
+    T_ambient = T_ref + max(E_ambient, 0)
+
+`glacier_offset` is `g` per timestep at the cell's elevation (K), as `_glacier_offset_at_elevation`
+returns it once its gaps are resolved. A step at or below melting is unchanged, as are vapor
+pressure, longwave and every other layer (warming cannot bring air past saturation).
+
+There is no division, so the correction is bounded by the glacier term at every step,
+`|T_ambient - T| <= |glm·g|`, whatever the residual. Dividing `E_obs` by `1 - glm·(1 - k(z))`, the
+other way to read `E_ambient` off the same model, amplifies the residual by `1/k(z)` at `glm = 1`
+and is unbounded where `k(z)` approaches zero.
+
+Written as the increment `T - min(glm·g, E_obs)`, so `glm = 0` or `g = 0` returns the input bit for
+bit; when that holds at every step the input stack itself is returned. `glacier_fraction` outside
+`[0, 1]`, a non-finite `glacier_offset`, or one of the wrong length throws.
+"""
+function _ambient_forcing(fd, glacier_fraction::Real, glacier_offset)
+    glm = Float64(glacier_fraction)
+    0 <= glm <= 1 || throw(ArgumentError("glacier_fraction must be in [0, 1] (got $(glacier_fraction))"))
+    _check_series_length(glacier_offset, fd, "glacier_offset")
+    all(isfinite, glacier_offset) || throw(ArgumentError(
+        "glacier_offset must be finite at every timestep; resolve a fitted series before applying it"))
+    (glm == 0 || all(iszero, glacier_offset)) && return fd
+
+    T = fd[:temperature_air]
+    T′ = similar(T)
+    for t in eachindex(T, glacier_offset)
+        E = T[t] - _DECOUPLING_REFERENCE_TEMPERATURE
+        T′[t] = E > 0 ? T[t] - min(glm * glacier_offset[t], E) : T[t]
+    end
+    meta = merge(copy(DimensionalData.metadata(fd)),
+                 Dict("temperature_air_mean" => Statistics.mean(T′)))
+    return _rebuild_forcing(fd, meta; temperature_air = T′)
+end
+
 # Per-timestep decoupling. `climate_adjust_for_glacier` takes a scalar `k`, but the derived factor
-# varies with the forcing's own time resolution, so apply the same increment directly:
+# varies with the forcing's own time resolution, so apply the same correction directly:
 #
-#     T′  = T + (k - 1) * max(T - T_ref, 0)
-#     LW′ = longwave re-derived at T′, vapor pressure unchanged
+#     T′ = T + (k - 1) * max(T - T_ref, 0)
+#     e′ = min(e, eₛ(T′)) where T′ < T, e elsewhere
 #
-# written as an increment so `k = 1` is bit-exact — the property that makes a sub-freezing or
+# with longwave and every other layer unchanged — the conventions of `climate_adjust_for_glacier`.
+# Written as an increment so `k = 1` is bit-exact, the property that makes a sub-freezing or
 # unmeasurable timestep a true no-op. Skips the whole pass when every `k` is 1.
 function _decouple_per_timestep(stack, decoupling_factor)
     all(==(1.0), decoupling_factor) && return stack
 
     T = stack[:temperature_air]
     e = stack[:vapor_pressure]
-    LW = stack[:longwave_downward]
 
     T′ = similar(T)
-    @inbounds for t in eachindex(T)
-        k = decoupling_factor[t]
-        T′[t] = T[t] + (k - 1) * max(T[t] - _DECOUPLING_REFERENCE_TEMPERATURE, 0.0)
+    for t in eachindex(T, decoupling_factor)
+        T′[t] = T[t] + (decoupling_factor[t] - 1) * max(T[t] - _DECOUPLING_REFERENCE_TEMPERATURE, 0.0)
     end
-    LW′ = _adjust_longwave(LW, e, T, e, T′)
+    e′ = _cap_vapor_pressure.(e, T, T′)
 
     meta = merge(copy(DimensionalData.metadata(stack)), Dict(
         "glacier_decoupling_factor_mean" => Statistics.mean(decoupling_factor),
@@ -755,6 +852,5 @@ function _decouple_per_timestep(stack, decoupling_factor)
     # The same rebuild the upstream `climate_adjust_*` functions use, so this path cannot drift from
     # them on layer metadata or on the `rebuild` convention — and it throws on a layer name that is
     # not in the stack rather than silently adding one.
-    return _rebuild_forcing(stack, meta;
-                                                temperature_air = T′, longwave_downward = LW′)
+    return _rebuild_forcing(stack, meta; temperature_air = T′, vapor_pressure = e′)
 end

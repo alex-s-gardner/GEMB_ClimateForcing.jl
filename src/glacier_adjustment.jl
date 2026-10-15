@@ -19,7 +19,7 @@
 using DimensionalData
 using Statistics
 
-# `_rebuild_forcing` / `_adjust_longwave` / `_wrap_longitude` (utils.jl) and
+# `_rebuild_forcing` / `_cap_vapor_pressure` / `_wrap_longitude` (utils.jl) and
 # `validate_climate_forcing_units` (datasets/era5_land.jl) are shared with the sibling
 # adjustment functions and reused here.
 
@@ -60,8 +60,9 @@ by nearest glacier centroid to the `"latitude"`/`"longitude"` in the stack metad
 
 # Returns
 - A new `DimStack` on the same time dimension with `temperature_air` cooled and
-  `longwave_downward` recomputed from it. `pressure_air`, `vapor_pressure`, `wind_speed`,
-  `precipitation` and `shortwave_downward` are carried through **unchanged**. Metadata gains a
+  `vapor_pressure` capped at saturation of the cooled air. `longwave_downward`,
+  `pressure_air`, `wind_speed`, `precipitation`, `shortwave_downward` and any further layer
+  are carried through **unchanged**. Metadata gains a
   cumulative `glacier_decoupling_factor` (multiplicative, so repeated calls compose), the
   provenance of the lookup when one was used, and a recomputed `temperature_air_mean`;
   physical-range validation is re-run.
@@ -75,21 +76,29 @@ T′ = T + (k − 1)·(T − T_ref)                      apply_below_freezing = 
 T′ = T + (k − 1)·max(T − T_ref, 0)                apply_below_freezing = false (default)
 ```
 
-Downwelling longwave is then recomputed from the cooled temperature with the Konzelmann et al.
-(1994) clear-sky emissivity, preserving the cloud/aerosol increment `Δε` diagnosed from the
-input — the same treatment as [`temperature_adjust`](@ref):
+**Downwelling longwave is left unchanged.** The decoupling is a shallow surface layer, a few
+meters to tens of meters thick, while downwelling longwave is emitted by the whole lower
+atmosphere and cloud base above it; cooling that layer changes little of the emitting column.
+What `k` measures is the 2 m temperature response to the reanalysis glacier mask, and ERA5-Land's
+downwelling longwave does not depend on that mask, so the data carry no signal for adjusting it.
+
+**Vapor pressure is left untouched except for one physical cap**, and this is *not* the
+constant-relative-humidity propagation used by [`temperature_adjust`](@ref):
 
 ```
-Δε  = LW/(σT⁴) − ε_cs(e, T);   LW′ = (ε_cs(e, T′) + Δε)·σT′⁴
+e′ = min(e, eₛ(T′))   where T′ < T;   e′ = e elsewhere
 ```
 
-**Vapour pressure is deliberately left untouched**, and this is *not* the constant-relative-
-humidity propagation used by [`temperature_adjust`](@ref). Shea & Moore (2010, Eq. 4) show
-`e_gla` is a linear function of `e_amb` that pivots about 6.11 hPa — saturation over ice at
+with `eₛ` the saturation vapor pressure over water ([`saturation_vapor_pressure`](@ref)). Cooled air
+cannot hold more vapor than saturation at its new temperature; the excess is taken to condense.
+The cap is the only clamp, and it applies only where the correction cooled the air, so `k = 1`
+and every sub-freezing step under the default gating return the input bit for bit.
+
+Beyond the cap, `e` is not propagated with temperature: Shea & Moore (2010, Eq. 4) show `e_gla` is a linear function of `e_amb` that pivots about 6.11 hPa — saturation over ice at
 0 °C — so the boundary layer *adds* moisture whenever ambient air is drier than that, the
 opposite sign to constant-RH scaling. Their sub-freezing branch is near-identity. Applying the
 right correction needs the flowpath-length-dependent `j1`/`j2` coefficients, hence a flowpath
-raster; until then, leaving `e` alone is the defensible choice. Wind speed is likewise
+raster; without one, leaving `e` alone is the defensible choice. Wind speed is likewise
 untouched: no published scheme corrects it, and Shaw et al. (2024) show the katabatic jet can
 *enhance* turbulent heat exchange even while the air is cooler, partly offsetting the cooling.
 
@@ -150,16 +159,15 @@ function climate_adjust_for_glacier(stack::DimStack, decoupling_factor::Real;
     end
     T_ref = Float64(reference_temperature)
 
-    T  = stack[:temperature_air]
-    e  = stack[:vapor_pressure]
-    LW = stack[:longwave_downward]
+    T = stack[:temperature_air]
+    e = stack[:vapor_pressure]
 
     # 1. Temperature. Written as an increment so k = 1 is bit-exact.
     T′ = apply_below_freezing ? (@. T + (k - 1) * (T - T_ref)) :
                                 (@. T + (k - 1) * max(T - T_ref, 0.0))
 
-    # 2. Longwave down: respond to the cooled temperature at unchanged vapor pressure.
-    LW′ = _adjust_longwave(LW, e, T, e, T′)
+    # 2. Vapor pressure: capped at saturation of the cooled air, and nowhere else.
+    e′ = _cap_vapor_pressure.(e, T, T′)
 
     src_meta = metadata(stack)
     new_meta = merge(copy(src_meta), Dict(
@@ -171,10 +179,9 @@ function climate_adjust_for_glacier(stack::DimStack, decoupling_factor::Real;
         "glacier_decoupling_below_freezing" => apply_below_freezing,
         "temperature_air_mean" => Statistics.mean(T′),
     ))
-    # Vapor pressure, pressure, wind, precipitation and shortwave are carried through
-    # untouched — see the docstring for why vapor pressure in particular is left alone.
-    adjusted = _rebuild_forcing(stack, new_meta;
-                                temperature_air=T′, longwave_downward=LW′)
+    # Longwave, pressure, wind, precipitation and shortwave are carried through untouched — see
+    # the docstring for why longwave and vapor pressure are not re-derived.
+    adjusted = _rebuild_forcing(stack, new_meta; temperature_air=T′, vapor_pressure=e′)
 
     validate_climate_forcing_units(adjusted)
 

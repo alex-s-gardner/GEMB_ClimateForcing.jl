@@ -40,11 +40,12 @@ the reanalysis surface).
    grid/target elevation difference, motivating this correction. (Glover 1999
    Eq. 16 uses the equivalent first-order linear form.)
 
-3. **Vapor pressure** — *constant relative humidity*: RH is diagnosed at the
-   reanalysis level, preserved with elevation, and vapor pressure is recomputed
-   from the saturation curve at the adjusted temperature. This matches Glover
-   (1999, Eq. 20: `q′ = q·q_sat(T′)/q_sat(T)`) and the way RACMO2 diagnoses 2 m
-   specific humidity from T, P and RH (Curry & Webster 1999, per Noël et al. 2018).
+3. **Vapor pressure** — *constant relative humidity*, in ratio form:
+   `e′ = e·eₛ(T′)/eₛ(T)`, with `eₛ` the saturation vapor pressure over water that
+   ERA5-Land defines its dewpoint against ([`saturation_vapor_pressure`](@ref)).
+   This matches Glover (1999, Eq. 20: `q′ = q·q_sat(T′)/q_sat(T)`) and the way
+   RACMO2 diagnoses 2 m specific humidity from T, P and RH (Curry & Webster 1999,
+   per Noël et al. 2018).
 
 4. **Longwave downward** — recomputed from the adjusted temperature and vapor
    pressure using the Konzelmann et al. (1994) clear-sky emissivity (developed on
@@ -127,33 +128,6 @@ year-round constant.
     there.
 """
 const ANTARCTICA_LAPSE_RATE = fill(14.3, 12)
-
-"""
-    saturation_vapor_pressure(T_K::Real; over_ice::Bool) -> Float64
-
-Saturation vapor pressure (Pa) at temperature `T_K` (Kelvin), using the Buck
-(1981) coefficients over water or over ice.
-
-Over water: `eₛ = 611.21·exp(17.502·Tc/(240.97+Tc))`
-Over ice:   `eₛ = 611.15·exp(22.452·Tc/(272.55+Tc))`
-
-with `Tc` in °C. If `over_ice` is not supplied it defaults to `T_K < 273.15`.
-These are the exact Buck (1981) coefficients as tabulated by Liston & Elder
-(2006, MicroMet, Eq. 4).
-
-# References
-- Buck, A. L. (1981). New equations for computing vapor pressure and enhancement
-  factor. *J. Appl. Meteorol.* 20, 1527–1532.
-- Liston, G. E. & Elder, K. (2006). MicroMet. *J. Hydrometeorol.* 7, 217–234 (Eq. 4).
-"""
-function saturation_vapor_pressure(T_K::Real; over_ice::Bool=T_K < 273.15)
-    Tc = Float64(T_K) - 273.15
-    if over_ice
-        return 611.15 * exp(22.452 * Tc / (272.55 + Tc))
-    else
-        return 611.21 * exp(17.502 * Tc / (240.97 + Tc))
-    end
-end
 
 """
     konzelmann_clear_sky_emissivity(e_Pa::Real, T_K::Real) -> Float64
@@ -341,16 +315,16 @@ reanalysis grid cell and the desired target elevation (downscaling).
 For `Δz = delta_elevation` and lapse rate `Γ` (K/km):
 - `T′ = T − (Γ/1000)·Δz`
 - `P′ = P·exp(−g·Δz/(R_d·T̄))`, `T̄ = ½(T+T′)`, `g=9.80665`, `R_d=287.05`
-- `RH = e/eₛ(T)`; `e′ = clamp(RH, 0, 1)·eₛ(T′)` (over-ice curve below 0 °C)
+- `e′ = e·eₛ(T′)/eₛ(T)` (constant relative humidity; `eₛ` over water, see
+  [`saturation_vapor_pressure`](@ref))
 - `Δε = LW/(σ·T⁴) − ε_cs(e,T)`; `LW′ = (ε_cs(e′,T′) + Δε)·σ·T′⁴`, `σ=5.67e-8`,
   `ε_cs` from Konzelmann et al. (1994)
 - `precip′ = precip·eₛ(T′)/eₛ(T)` if `precip_scaling_method=:clausius_clapeyron`,
   else unchanged
 
-`Δz = 0` reproduces the input exactly for sub-saturated input. Where the input is
-supersaturated over ice (`e > eₛ(T)`, common in cold cloudy reanalysis steps), the
-RH clamp rewrites `e′` — and hence `LW′` — even at `Δz = 0`; `T′`, `P′`, and
-precipitation remain exact identities regardless.
+`Δz = 0` reproduces every layer bit for bit. No relative-humidity clamp is
+needed: the ratio form keeps an input at or below saturation at or below
+saturation at `T′`.
 
 # Example
 ```julia
@@ -397,10 +371,12 @@ function climate_adjust_for_elevation(
             "precip_scaling_method must be nothing or :clausius_clapeyron (got $(precip_scaling_method))"))
     end
 
-    # Per-timestep month index from the time dimension.
-    times = collect(dims(climate_forcing_original, Ti))
-    months = month.(times)
+    # Per-timestep month index, needed only for a monthly lapse rate. Skipped otherwise: `month` on
+    # a long hourly record costs more than the temperature adjustment it would index.
+    times = dims(climate_forcing_original, Ti)
     n = length(times)
+    monthly = lapse_rate isa AbstractVector && length(lapse_rate) == 12
+    months = monthly ? month.(times) : Int[]
 
     # Resolve lapse rate to a per-timestep vector (K/km, positive = cooling up).
     Γ = _resolve_lapse_rate(lapse_rate, months, n)
@@ -420,26 +396,19 @@ function climate_adjust_for_elevation(
     # 2. Pressure: hydrostatic with mean layer temperature.
     P′ = @. P * exp(-_G0 * Δz / (_R_DRY * 0.5 * (T + T′)))
 
-    # 3. Vapor pressure: constant relative humidity (over-ice curve below 0 °C).
-    #    Using the same saturation formula to diagnose and reconstruct RH makes
-    #    Δz = 0 an exact identity for sub-saturated input. Clamp RH to (0, 1] to
-    #    avoid supersaturation — this is deliberate (Konzelmann's ε_cs was fitted
-    #    on sub-saturated data), but it means a supersaturated input step is
-    #    rewritten to RH = 1 even at Δz = 0, so `e′` and hence `LW′` are not
-    #    identities there. Real reanalysis dewpoints do give RH > 1 over ice in
-    #    cold cloudy conditions (~16% of steps in a maritime Alaska ERA5-Land
-    #    record), where e shifts by ≲20 Pa and LW by ≲1 W m⁻².
-    es_T  = saturation_vapor_pressure.(T)
-    es_T′ = saturation_vapor_pressure.(T′)
-    RH = @. clamp(e / es_T, 0.0, 1.0)
-    e′ = @. RH * es_T′
+    # 3. Vapor pressure: constant relative humidity, in ratio form.
+    # With Clausius–Clapeyron scaling the same saturation ratio scales precipitation, so it is
+    # formed once for both.
+    cc = precip_scaling_method === :clausius_clapeyron
+    ratio = cc ? (@. saturation_vapor_pressure(T′) / saturation_vapor_pressure(T)) : nothing
+    e′ = cc ? (@. e * ratio) : _vapor_pressure_at.(e, T, T′)
 
     # 4. Longwave down: recompute from adjusted T, e; preserve cloud increment Δε.
     LW′ = _adjust_longwave(LW, e, T, e′, T′)
 
     # 5. Precipitation: unchanged by default; Clausius–Clapeyron scaling if asked
     #    (Glover 1999, Eq. 19). eₛ ratio proxies q_sat(T′)/q_sat(T); exact at Δz=0.
-    precip′ = precip_scaling_method === :clausius_clapeyron ? (@. precip * (es_T′ / es_T)) : precip
+    precip′ = cc ? (@. precip * ratio) : precip
 
     src_meta = metadata(climate_forcing_original)
     z_reanalysis = get(src_meta, "elevation", nothing)

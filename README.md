@@ -107,7 +107,7 @@ Keyword arguments:
 - `chunk_strategy::Symbol=:geo` — `:geo` for point time-series (recommended), `:time` for spatial maps
 - `cache_path::Union{String,Nothing}=nothing` — persistent disk cache (`Zarr.CachingStore`)
 
-Returns a `DimStack` with `temperature_air`, `pressure_air`, `vapor_pressure`, `wind_speed`, `precipitation`, `shortwave_downward`, and `longwave_downward`, plus location and observation-height metadata.
+Returns a `DimStack` with `temperature_air`, `pressure_air`, `vapor_pressure`, `wind_speed`, `precipitation`, `shortwave_downward`, and `longwave_downward`, plus three layers derived from the shortwave and the solar geometry (`shortwave_forcing_layers`): `solar_zenith_angle` (degrees, irradiance-weighted over the hour each flux averages), `shortwave_downward_diffuse` (W/m², Erbs et al. 1982 diffuse fraction of the clearness index) and `cloud_optical_thickness` (Lacis & Hansen 1974 transmissivity inverted against the FAO-56 clear-sky clearness). Location and observation-height metadata are attached.
 
 ### `climate_adjust_for_elevation(stack, delta_elevation; kwargs...)`
 
@@ -121,7 +121,7 @@ Downscale a forcing `DimStack` (must have a `Ti` dimension) for the elevation di
 |----------|-----------|---------------|
 | `temperature_air` | lapse `T − (Γ/1000)·Δz` | Glover 1999; Fausto 2009; Gardner 2009 |
 | `pressure_air` | hydrostatic `P·exp(−g·Δz/(R_d·T̄))` | Glover 1999; Noël 2018 |
-| `vapor_pressure` | constant relative humidity, recomputed at `T′` | Glover 1999; Curry & Webster 1999 |
+| `vapor_pressure` | constant relative humidity, `e·eₛ(T′)/eₛ(T)` with `eₛ` over water | Glover 1999; Curry & Webster 1999 |
 | `longwave_downward` | Konzelmann (1994) clear-sky emissivity, preserving cloud increment Δε | Konzelmann 1994; Fiddes & Gruber 2014 |
 | `shortwave_downward` | unchanged | — |
 | `precipitation` | unchanged, or Clausius–Clapeyron `×eₛ(T′)/eₛ(T)` if requested | Glover 1999 |
@@ -151,7 +151,7 @@ Apply a **uniform temperature offset** (K) to a forcing `DimStack` and propagate
 | Variable | Adjustment |
 |----------|-----------|
 | `temperature_air` | `T + ΔT` |
-| `vapor_pressure` | constant relative humidity, recomputed at `T′` (over-ice curve below 0 °C) |
+| `vapor_pressure` | constant relative humidity, `e·eₛ(T′)/eₛ(T)` with `eₛ` over water |
 | `longwave_downward` | Konzelmann (1994) clear-sky emissivity at `(e′, T′)`, preserving the cloud increment Δε |
 | `pressure_air`, `wind_speed`, `precipitation`, `shortwave_downward` | unchanged |
 
@@ -187,12 +187,12 @@ Applies the Shaw et al. (2025) decoupling factor `k` from the published **per-gl
 | Variable | Adjustment |
 |----------|-----------|
 | `temperature_air` | `T + (k−1)·max(T − T_ref, 0)`, i.e. cooling proportional to how far ambient sits above melting |
-| `longwave_downward` | Konzelmann (1994) clear-sky emissivity at the cooled `T′`, unchanged `e`, preserving the cloud increment Δε |
-| `vapor_pressure`, `pressure_air`, `wind_speed`, `precipitation`, `shortwave_downward` | unchanged |
+| `vapor_pressure` | unchanged, except capped at saturation of the cooled air: `min(e, eₛ(T′))` where `T′ < T` |
+| `longwave_downward`, `pressure_air`, `wind_speed`, `precipitation`, `shortwave_downward` | unchanged |
 
 **Run `climate_adjust_for_elevation` first.** `k` multiplies an ambient temperature *at the glacier's elevation*; the reverse order is wrong.
 
-`k` must be in `(0, 1]`; `1.0` reproduces the input exactly. Metadata records a **cumulative, multiplicative** `glacier_decoupling_factor` plus the lookup provenance (`glacier_decoupling_rgi_id`, `k_lower`, match distance).
+`k` must be in `(0, 1]`; `1.0` reproduces the input exactly. Downwelling longwave is left unchanged: the decoupling is a shallow surface layer, and ERA5-Land's longwave does not depend on the glacier mask the decoupling is measured from. Metadata records a **cumulative, multiplicative** `glacier_decoupling_factor` plus the lookup provenance (`glacier_decoupling_rgi_id`, `k_lower`, match distance).
 
 ```julia
 stack = climate_forcing(:era5land, 45.97, 7.53;
@@ -212,7 +212,7 @@ row = glacier_decoupling("RGI60-11.02810")   # (; k, k_lower, lat, lon, ele, …
 
 Two limits to know:
 
-- **`vapor_pressure` is left untouched by design.** This is *not* `temperature_adjust`'s constant-RH propagation. Shea & Moore (2010, Eq. 4) show `e_gla` pivots about 6.11 hPa (saturation over ice at 0 °C), so the boundary layer *adds* moisture when ambient air is drier than that — the opposite sign to constant-RH scaling. The correct scheme needs a flowpath-length raster.
+- **`vapor_pressure` is left untouched by design**, apart from the saturation cap. This is *not* `temperature_adjust`'s constant-RH propagation. Shea & Moore (2010, Eq. 4) show `e_gla` pivots about 6.11 hPa (saturation over ice at 0 °C), so the boundary layer *adds* moisture when ambient air is drier than that — the opposite sign to constant-RH scaling. The correct scheme needs a flowpath-length raster.
 - **RGI regions 05 (Greenland periphery) and 19 (Antarctic) are absent** from the Shaw table, so the lookup forms fail there; pass `k` explicitly. Cooling is gated to steps above melting by default (`apply_below_freezing=false`), since a bare `k` multiplier would *warm* sub-freezing air, and the regression is ablation-season only.
 
 ### `climate_model_invariant(; model, parameter, ...)`
@@ -574,7 +574,7 @@ Data is read from ECMWF's ARCO Zarr stores at `arco.datastores.ecmwf.int`. Varia
 | `sfc-2m-temperature` | `t2m`, `d2m` | `temperature_air` (K), `vapor_pressure` (Pa via dewpoint) |
 | `sfc-pressure-precipitation` | `sp`, `tp` | `pressure_air` (Pa), `precipitation` (kg/m² = `tp`×1000) |
 | `sfc-wind` | `u10`, `v10` | `wind_speed` (m/s magnitude) |
-| `sfc-radiation-heat` | `ssrd`, `strd` | `shortwave_downward`, `longwave_downward` (W/m² = J/m² ÷ 3600) |
+| `sfc-radiation-heat` | `ssrd`, `strd` | `shortwave_downward`, `longwave_downward` (W/m² = J/m² ÷ 3600); `solar_zenith_angle`, `shortwave_downward_diffuse`, `cloud_optical_thickness` from the shortwave and solar geometry |
 
 Grid: 0.1° (~9 km), 1801 × 3600 (lat × lon), hourly, 1950–present.
 

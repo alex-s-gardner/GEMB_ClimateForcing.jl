@@ -129,6 +129,15 @@ using GEMB_ClimateForcing: ERA5_LAND_INVARIANT_PARAMETERS,
             # Iceland surface elevations: from ~sea level to well under 3000 m.
             @test minimum(elev) > -200.0
             @test maximum(elev) < 3000.0
+
+            # Across the 0°/360° seam of the 0–359.9°E grid: −0.1°E is the 359.9 column, and
+            # −0.04°E is nearer the 0.0 column than the 359.9 one.
+            lat = 51.5
+            column(x) = geopotential2height(Float64(z[X(Near(x)), Y(Near(lat))]), lat, 0.0;
+                                            height_reference=:orthometric)
+            @test surface_elevation(:era5land, lat, -0.1; cache_path=cache) == column(359.9)
+            @test surface_elevation(:era5land, lat, -0.04; cache_path=cache) == column(0.0)
+            @test surface_elevation(:era5land, lat, 359.97; cache_path=cache) == column(0.0)
         end
 
         @testset "All parameters → lazy RasterStack" begin

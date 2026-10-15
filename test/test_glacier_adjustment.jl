@@ -12,8 +12,7 @@ using Dates
 using DimensionalData
 using Statistics
 
-using GEMB_ClimateForcing: saturation_vapor_pressure,
-    konzelmann_clear_sky_emissivity, _SIGMA_SB
+using GEMB_ClimateForcing: saturation_vapor_pressure
 
 # Melt-season stack straddling 0 °C, so both branches of the gated correction are
 # exercised. Positioned on Haut Glacier d'Arolla so the metadata lookup resolves.
@@ -37,7 +36,7 @@ end
 
 # Variables the glacier correction must never touch.
 const _GLACIER_UNCHANGED = (:pressure_air, :vapor_pressure, :wind_speed, :precipitation,
-    :shortwave_downward)
+    :shortwave_downward, :longwave_downward)
 
 @testset "Glacier Adjustment (ambient → on-glacier)" begin
 
@@ -51,9 +50,6 @@ const _GLACIER_UNCHANGED = (:pressure_air, :vapor_pressure, :wind_speed, :precip
         for var in _GLACIER_UNCHANGED
             @test parent(adj[var]) == parent(stack[var])
         end
-        # Longwave round-trips through the emissivity diagnosis to float tolerance.
-        @test all(isapprox.(parent(adj[:longwave_downward]),
-                            parent(stack[:longwave_downward]); rtol=1e-12))
         # Identity holds in the ungated branch too.
         adj_ub = climate_adjust_for_glacier(stack, 1.0; apply_below_freezing=true)
         @test parent(adj_ub[:temperature_air]) == parent(stack[:temperature_air])
@@ -106,35 +102,34 @@ const _GLACIER_UNCHANGED = (:pressure_air, :vapor_pressure, :wind_speed, :precip
         @test all(parent(adj[:temperature_air]) .< T)
     end
 
-    @testset "only temperature and longwave change" begin
+    @testset "only temperature changes, and vapor pressure is capped at saturation" begin
         stack = make_glacier_stack()
         adj = climate_adjust_for_glacier(stack, 0.7)
 
+        # At 70 % relative humidity the cooled air stays below saturation, so vapor pressure is
+        # untouched along with everything else but temperature — longwave included.
         for var in _GLACIER_UNCHANGED
             @test parent(adj[var]) == parent(stack[var])
         end
-
-        # Vapor pressure is left alone *on purpose* — SM10 Eq. 4 pivots e about
-        # 6.11 hPa, opposite in sign to constant-RH propagation. Contrast with
-        # temperature_adjust, which does propagate at constant RH.
-        @test parent(adj[:vapor_pressure]) == parent(stack[:vapor_pressure])
+        # Contrast with temperature_adjust, which propagates constant relative humidity.
         ta = temperature_adjust(stack, -1.0)
         @test parent(ta[:vapor_pressure]) != parent(stack[:vapor_pressure])
 
-        # Longwave falls wherever the air was cooled, and is unchanged elsewhere.
+        # Near-saturated warm air cooled by the correction: e′ = min(e, eₛ(T′)) where T′ < T, and
+        # e unchanged elsewhere. Longwave stays exactly the input.
         T = parent(stack[:temperature_air])
-        warm = T .> 273.15
-        LW = parent(stack[:longwave_downward])
-        LW′ = parent(adj[:longwave_downward])
-        @test all(LW′[warm] .< LW[warm])
-        @test all(isapprox.(LW′[.!warm], LW[.!warm]; rtol=1e-12))
-
-        # And it matches an explicit Konzelmann recomputation at unchanged e.
-        e = parent(stack[:vapor_pressure])
-        T′ = parent(adj[:temperature_air])
-        Δε = @. LW / (_SIGMA_SB * T^4) - konzelmann_clear_sky_emissivity(e, T)
-        expected = @. (konzelmann_clear_sky_emissivity(e, T′) + Δε) * _SIGMA_SB * T′^4
-        @test all(isapprox.(LW′, expected))
+        humid = rebuild(stack; data = merge(map(parent, NamedTuple(stack)),
+                                            (; vapor_pressure = 0.99 .* saturation_vapor_pressure.(T))))
+        e = parent(humid[:vapor_pressure])
+        out = climate_adjust_for_glacier(humid, 0.5)
+        T′ = parent(out[:temperature_air])
+        cooled = T′ .< T
+        @test any(cooled)
+        @test parent(out[:vapor_pressure]) == [c ? min(x, saturation_vapor_pressure(t′)) : x
+                                               for (c, x, t′) in zip(cooled, e, T′)]
+        @test any(parent(out[:vapor_pressure])[cooled] .< e[cooled])
+        @test all(parent(out[:vapor_pressure])[cooled] .<= saturation_vapor_pressure.(T′[cooled]))
+        @test parent(out[:longwave_downward]) == parent(humid[:longwave_downward])
     end
 
     @testset "metadata" begin

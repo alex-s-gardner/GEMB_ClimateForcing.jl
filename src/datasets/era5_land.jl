@@ -53,16 +53,35 @@ function era5_land_url(variable_group::String, chunk_strategy::Symbol)
 end
 
 """
-    find_nearest_index(values::AbstractVector, target) -> Int
+    find_nearest_index(values::AbstractVector, target) -> index
 
-Find index of nearest value in sorted or unsorted array.
+Index of the value nearest `target`, in sorted or unsorted `values`. Ties go to the first.
 """
 function find_nearest_index(values::AbstractVector, target)
-    # Single pass, no temporaries (avoids materializing abs.(values .- target)).
+    return _nearest_index(values) do v
+        abs(v - target)
+    end
+end
+
+"""
+    _nearest_longitude_index(longitudes::AbstractVector, lon) -> index
+
+Index of the grid longitude nearest `lon` (degrees), measuring distance around the circle so a
+request near the ±180° seam, or in either the −180…180 or 0–360°E convention, finds the cell
+across the seam when it is the closer one. Ties go to the first.
+"""
+function _nearest_longitude_index(longitudes::AbstractVector, lon::Real)
+    return _nearest_index(longitudes) do v
+        abs(_wrap_longitude(v - lon))
+    end
+end
+
+# Single pass, no temporaries: the index minimizing `distance(values[i])`.
+function _nearest_index(distance, values::AbstractVector)
     best_idx = firstindex(values)
-    best_dist = abs(values[best_idx] - target)
-    @inbounds for i in eachindex(values)
-        d = abs(values[i] - target)
+    best_dist = distance(values[best_idx])
+    for i in eachindex(values)
+        d = distance(values[i])
         if d < best_dist
             best_dist = d
             best_idx = i
@@ -103,6 +122,56 @@ const LONGWAVE_ABSOLUTE_MINIMUM = 1.0
 # warmest, most humid tile; this leaves headroom above that rather than sitting on it.
 const LONGWAVE_ABSOLUTE_MAXIMUM = 550.0
 
+# De-accumulated hourly fluxes carry small negative values where a forecast accumulation decreases
+# slightly between steps. Over 2.6 million cached ERA5-Land cell-hours the most negative were
+# −0.0011 W/m² of shortwave and −6e-5 kg/m² of precipitation. Values down to these tolerances are
+# that noise and are floored at zero; anything more negative is not, and fails the load.
+const SHORTWAVE_NEGATIVE_TOLERANCE = 0.1         # W/m²
+const PRECIPITATION_NEGATIVE_TOLERANCE = 1.0e-3  # kg/m² per hour
+
+"""
+    _era5_land_conversions(t2m, d2m, sp, tp, u10, v10, ssrd, strd) -> NamedTuple
+
+The seven forcing layers from ERA5-Land's native variables, as read from the ARCO stores: 2 m
+temperature and dewpoint (K), surface pressure (Pa), total precipitation (m per hour), 10 m wind
+components (m/s), and surface solar and thermal radiation downwards (J/m² accumulated over the
+hour). Returns `Float64` vectors of temperature (K), pressure (Pa), vapor pressure (Pa, from the
+dewpoint over water), wind speed (m/s), precipitation (kg/m² per hour, ×1000), and downward
+shortwave and longwave (W/m², ÷3600).
+
+Shortwave and precipitation below zero by no more than `SHORTWAVE_NEGATIVE_TOLERANCE` and
+`PRECIPITATION_NEGATIVE_TOLERANCE` are de-accumulation noise and are floored at zero; a more
+negative value throws an `ArgumentError`. `NaN` passes through, for the caller to judge.
+"""
+function _era5_land_conversions(t2m, d2m, sp, tp, u10, v10, ssrd, strd)
+    shortwave = @. Float64(ssrd) / 3600.0
+    precipitation = @. Float64(tp) * 1000.0
+    _floor_noise!(shortwave, SHORTWAVE_NEGATIVE_TOLERANCE, "shortwave_downward", "W/m²")
+    _floor_noise!(precipitation, PRECIPITATION_NEGATIVE_TOLERANCE, "precipitation", "kg/m²")
+    return (temperature_air = Float64.(t2m),
+            pressure_air = Float64.(sp),
+            vapor_pressure = dewpoint_to_vapor_pressure(d2m),
+            wind_speed = @.(hypot(Float64(u10), Float64(v10))),
+            precipitation = precipitation,
+            shortwave_downward = shortwave,
+            longwave_downward = @.(Float64(strd) / 3600.0))
+end
+
+function _floor_noise!(x, tolerance, name, units)
+    lo = Inf
+    for i in eachindex(x)
+        v = x[i]
+        if v < 0              # false for NaN, which passes through
+            lo = min(lo, v)
+            x[i] = 0.0
+        end
+    end
+    lo < -tolerance && throw(ArgumentError(
+        "$(name): minimum $(lo) $(units) is more negative than the $(tolerance) $(units) of " *
+        "de-accumulation noise this loader floors at zero"))
+    return x
+end
+
 """
     validate_climate_forcing_units(stack::DimStack)
 
@@ -116,6 +185,8 @@ Validate that climate forcing variables in a DimStack have physically reasonable
 - `shortwave_downward`: W/m², range [0, 1500]
 - `longwave_downward`: W/m², `≤ $(LONGWAVE_ABSOLUTE_MAXIMUM)`, and bulk emissivity `LW/(σT⁴) ≥ $(LONGWAVE_EMISSIVITY_MINIMUM)`
 - `vapor_pressure`: Pascal (Pa), range [0, 10000]
+- where present: `solar_zenith_angle` in [0, 90] degrees, `shortwave_downward_diffuse` in
+  [0, `shortwave_downward`] W/m², `cloud_optical_thickness` in [0, $(CLOUD_OPTICAL_THICKNESS_MAX)]
 
 Two kinds of bound live here, and they behave differently under the adjustment functions. Most are
 physical invariants that hold however the forcing was produced, so they are checked every time. The
@@ -138,8 +209,11 @@ covers the high side.
 # Arguments
 - `stack::DimStack`: DimStack with climate forcing variables
 
+Every layer of the stack, including any beyond these seven, must be finite: a `NaN` or `Inf`
+anywhere fails validation by name.
+
 # Throws
-- `ArgumentError` if any variable has values outside expected physical ranges
+- `ArgumentError` if any value is non-finite or any variable is outside its expected range
 """
 function validate_climate_forcing_units(stack::DimStack)
     # Extract data vectors from DimStack
@@ -151,6 +225,13 @@ function validate_climate_forcing_units(stack::DimStack)
     longwave_downward = parent(stack[:longwave_downward])
     vapor_pressure = parent(stack[:vapor_pressure])
     errors = String[]
+
+    # Non-finite values first: `minimum` and `maximum` propagate NaN, and every range comparison
+    # below is then false, so a NaN would otherwise pass them all.
+    for name in keys(stack)
+        n_bad = count(!isfinite, parent(stack[name]))
+        n_bad == 0 || push!(errors, "$(name): $(n_bad) non-finite values (NaN or Inf)")
+    end
 
     # Each range check reads min and max in two separate reductions rather than one
     # `extrema` pass: Base's `extrema` does not SIMD-vectorize, so the paired
@@ -217,6 +298,28 @@ function validate_climate_forcing_units(stack::DimStack)
                       "so this irradiance is too small for its air temperature")
     end
 
+    # The shortwave layers derived from solar geometry, where present.
+    if haskey(stack, :solar_zenith_angle)
+        sza = parent(stack[:solar_zenith_angle])
+        sza_min, sza_max = minimum(sza), maximum(sza)
+        (sza_min < 0 || sza_max > 90) &&
+            push!(errors, "solar_zenith_angle: expected [0, 90] degrees, got [$(sza_min), $(sza_max)]")
+    end
+    if haskey(stack, :shortwave_downward_diffuse)
+        diffuse = parent(stack[:shortwave_downward_diffuse])
+        minimum(diffuse) < 0 &&
+            push!(errors, "shortwave_downward_diffuse: expected ≥ 0 W/m², got minimum $(minimum(diffuse)) W/m²")
+        n_over = count(i -> diffuse[i] > shortwave_downward[i], eachindex(diffuse, shortwave_downward))
+        n_over == 0 ||
+            push!(errors, "shortwave_downward_diffuse: exceeds shortwave_downward at $(n_over) steps")
+    end
+    if haskey(stack, :cloud_optical_thickness)
+        τ = parent(stack[:cloud_optical_thickness])
+        τ_min, τ_max = minimum(τ), maximum(τ)
+        (τ_min < 0 || τ_max > CLOUD_OPTICAL_THICKNESS_MAX) &&
+            push!(errors, "cloud_optical_thickness: expected [0, $(CLOUD_OPTICAL_THICKNESS_MAX)], got [$(τ_min), $(τ_max)]")
+    end
+
     # Vapor pressure (Pa): should be non-negative and below saturation
     vp_min, vp_max = minimum(vapor_pressure), maximum(vapor_pressure)
     if vp_min < -1e-6
@@ -255,12 +358,27 @@ Load ERA5-Land reanalysis data using pure Julia (Zarr.jl) and return a DimStack 
   - `precipitation`: Precipitation rate (kg/m²/hr)
   - `shortwave_downward`: Downward shortwave radiation (W/m²)
   - `longwave_downward`: Downward longwave radiation (W/m²)
+  - `solar_zenith_angle`: Solar zenith angle (degrees), irradiance-weighted over each hour
+  - `shortwave_downward_diffuse`: Diffuse part of the downward shortwave (W/m²)
+  - `cloud_optical_thickness`: Cloud optical thickness (dimensionless)
 
-  Metadata includes `latitude`, `longitude`, `dataset`, `chunk_strategy`
+  The last three are derived from the shortwave and the solar geometry by
+  [`shortwave_forcing_layers`](@ref), each flux being the mean over the hour before its stamp.
+
+  Metadata includes `latitude`, `longitude`, `dataset`, `chunk_strategy`, and
+  `outside_land_mask`.
 
 # Notes
-- ERA5-Land is on 0.1° grid (approximately 9 km)
-- Uses nearest neighbor selection for lat/lon
+- ERA5-Land is on a 0.1° grid (approximately 9 km). The ARCO stores hold longitude
+  −179.9…180°E and latitude −90…90°N, both ascending.
+- Uses nearest-neighbor selection for lat/lon. `lon` may be in either the −180…180 or the
+  0–360°E convention; the nearest cell is found around the circle, across the ±180° seam.
+- `time_range` must lie within the record; a range that starts before it or ends after it
+  throws rather than returning a shorter series. With `cache_path`, the record is the one in
+  the cached metadata, which never grows: a request past its end throws with instructions for
+  refreshing the cache.
+- A cell outside the ERA5-Land land mask (all values `NaN`) is returned as is, with
+  `outside_land_mask = true` and no validation. Any other non-finite value throws.
 - Hourly temporal resolution
 - Requires free CDS API key from https://cds.climate.copernicus.eu/
 - Pure Julia implementation using Zarr.jl + DimensionalData.jl
@@ -358,7 +476,7 @@ function load_era5_land(
         # Find nearest lat/lon indices
         @info "Finding nearest grid point..."
         lat_idx = find_nearest_index(lat_values, lat)
-        lon_idx = find_nearest_index(lon_values, lon)
+        lon_idx = _nearest_longitude_index(lon_values, lon)
 
         selected_lat = lat_values[lat_idx]
         selected_lon = lon_values[lon_idx]
@@ -372,21 +490,18 @@ function load_era5_land(
         # forcing download.
         selected_elevation = surface_elevation(:era5land, selected_lat, selected_lon)
 
-        # Find time range indices by comparing in the axis's native numeric unit
-        # (hours since epoch). Only the two requested bounds are converted, avoiding a
-        # full-length DateTime allocation across the entire (multi-decade) time axis.
-        start_hours = Dates.value(start_time - epoch) / 3_600_000  # ms → hours
-        end_hours = Dates.value(end_time - epoch) / 3_600_000
-        time_start_idx = findfirst(h -> h >= start_hours, time_values_raw)
-        time_end_idx = findlast(h -> h <= end_hours, time_values_raw)
-
-        if isnothing(time_start_idx) || isnothing(time_end_idx)
-            error("Requested time range not available in dataset")
-        end
-
-        time_slice = time_start_idx:time_end_idx
+        # A cached store keeps the consolidated metadata it was first opened with, so its record
+        # never grows: check it before trusting it.
+        isnothing(cache_path) ||
+            _check_cached_record(cache_path, time_values_raw, epoch, time_range,
+                                 (t2m_zarr, d2m_zarr, sp_zarr, tp_zarr, u10_zarr, v10_zarr,
+                                  ssrd_zarr, strd_zarr))
+        time_slice = _record_slice(time_values_raw, epoch, time_range)
         # Build DateTime values only for the selected slice.
         selected_times = [epoch + Hour(round(Int, time_values_raw[i])) for i in time_slice]
+        # Every flux is the mean over the hour before its stamp, which the solar geometry assumes.
+        all(==(Hour(1)), diff(selected_times)) ||
+            error("ERA5-Land time axis is not hourly between $(first(selected_times)) and $(last(selected_times))")
 
         @info "Extracting $(length(selected_times)) time steps in parallel..."
 
@@ -412,22 +527,17 @@ function load_era5_land(
 
         @info "Converting units..."
 
-        # Variables consumed directly: promote to Float64.
-        temperature_air = Float64.(t2m_raw)
-        pressure_air = Float64.(sp_raw)
-
-        # Dewpoint -> vapor pressure (Magnus formula; promotes internally, one output array).
-        vapor_pressure = dewpoint_to_vapor_pressure(d2m_raw)
-
-        # Precipitation: m -> kg/m², clamp numerical noise (single fused pass, no BitArray mask).
-        precipitation = @. max(Float64(precipitation_raw) * 1000.0, 0.0)
-
-        # Wind speed magnitude from components (one fused output, no Float64 pre-copies).
-        wind_speed = @. hypot(Float64(u10), Float64(v10))
-
-        # Radiation: J/m² (hourly accumulation) -> W/m²; clamp shortwave noise.
-        shortwave_downward = @. max(Float64(shortwave_raw) / 3600.0, 0.0)
-        longwave_downward = @. Float64(longwave_raw) / 3600.0
+        # ERA5-Land is land-only: a cell outside its land mask is NaN in every variable at every
+        # step. That stack is returned unvalidated and marked, so a caller can recognise the cell
+        # and take forcing from a neighbour; a NaN anywhere else fails validation below.
+        outside_land_mask = all(a -> all(isnan, a), data)
+        (; temperature_air, pressure_air, vapor_pressure, wind_speed, precipitation,
+           shortwave_downward, longwave_downward) =
+            _era5_land_conversions(t2m_raw, d2m_raw, sp_raw, precipitation_raw, u10, v10,
+                                   shortwave_raw, longwave_raw)
+        (; solar_zenith_angle, shortwave_downward_diffuse, cloud_optical_thickness) =
+            shortwave_forcing_layers(shortwave_downward, selected_lat, selected_lon,
+                                     selected_times, selected_elevation; step = Hour(1))
 
         @info "Data loaded successfully!" n_time_steps=length(selected_times)
 
@@ -449,7 +559,13 @@ function load_era5_land(
             shortwave_downward = DimArray(shortwave_downward, (time_dim,);
                                          metadata=Dict("units" => "W/m²", "long_name" => "surface solar radiation downward")),
             longwave_downward = DimArray(longwave_downward, (time_dim,);
-                                        metadata=Dict("units" => "W/m²", "long_name" => "surface thermal radiation downward"))
+                                        metadata=Dict("units" => "W/m²", "long_name" => "surface thermal radiation downward")),
+            solar_zenith_angle = DimArray(solar_zenith_angle, (time_dim,);
+                                          metadata=Dict("units" => "degrees", "long_name" => "solar zenith angle, irradiance-weighted over the hour")),
+            shortwave_downward_diffuse = DimArray(shortwave_downward_diffuse, (time_dim,);
+                                                  metadata=Dict("units" => "W/m²", "long_name" => "diffuse surface solar radiation downward")),
+            cloud_optical_thickness = DimArray(cloud_optical_thickness, (time_dim,);
+                                               metadata=Dict("units" => "1", "long_name" => "cloud optical thickness"))
         ); metadata = Dict(
             "latitude" => selected_lat,
             "longitude" => selected_lon,
@@ -460,10 +576,14 @@ function load_era5_land(
             "wind_speed_mean" => Statistics.mean(wind_speed),
             "precipitation_mean" => Statistics.mean(precipitation) * 8760.0,  # hourly to annual
             "temperature_observation_height" => 2.0,  # ERA5-Land 2m temperature
-            "wind_observation_height" => 10.0  # ERA5-Land 10m wind
+            "wind_observation_height" => 10.0,  # ERA5-Land 10m wind
+            "outside_land_mask" => outside_land_mask,
         ))
 
-        # Validate units before returning
+        if outside_land_mask
+            @warn "Grid cell is outside the ERA5-Land land mask: every value is NaN" selected_lat selected_lon
+            return stack
+        end
         @info "Validating units..."
         validate_climate_forcing_units(stack)
         @info "✓ All units validated"
@@ -478,6 +598,56 @@ function load_era5_land(
             rethrow()
         end
     end
+end
+
+"""
+    _record_slice(time_values, epoch, time_range) -> UnitRange
+
+Indices of the hourly record (`time_values` in hours since `epoch`) covering
+`time_range = (start, stop)`, both inclusive. Throws an `ArgumentError` when the range starts
+before the record or ends after it, naming the record's own first and last times: a shorter
+series than requested would otherwise pass silently into every mean computed from it.
+"""
+function _record_slice(time_values::AbstractVector, epoch::DateTime, time_range)
+    start_time, end_time = time_range
+    record_start = epoch + Hour(round(Int, first(time_values)))
+    record_end = epoch + Hour(round(Int, last(time_values)))
+    (start_time >= record_start && end_time <= record_end) || throw(ArgumentError(
+        "time_range $(start_time) to $(end_time) is not within the ERA5-Land record, which " *
+        "runs from $(record_start) to $(record_end)"))
+    # Compared in the axis's own unit (hours since epoch), so only the two bounds are converted
+    # rather than the whole multi-decade axis.
+    start_hours = Dates.value(start_time - epoch) / 3_600_000
+    end_hours = Dates.value(end_time - epoch) / 3_600_000
+    return findfirst(>=(start_hours), time_values):findlast(<=(end_hours), time_values)
+end
+
+"""
+    _check_cached_record(cache_path, time_values, epoch, time_range, arrays)
+
+Refuse a request the disk cache cannot answer correctly. `Zarr.CachingStore` serves each group's
+consolidated metadata (`.zmetadata`) from the copy cached on first open, so the record a cache
+reports ends where the live store ended then. Throws an `ArgumentError` with refresh instructions
+when `time_range` ends after that cached end, or when the cached groups disagree on the record
+length (caches opened at different times). Nothing is deleted.
+"""
+function _check_cached_record(cache_path, time_values, epoch, time_range, arrays)
+    record_end = epoch + Hour(round(Int, last(time_values)))
+    lengths = map(a -> size(a, 3), arrays)
+    consistent = all(==(length(time_values)), lengths)
+    (consistent && last(time_range) <= record_end) && return nothing
+    problem = consistent ?
+        "time_range ends at $(last(time_range)), after the record end in the cached metadata " *
+        "under $(cache_path) ($(record_end))." :
+        "the cached groups under $(cache_path) record different record lengths " *
+        "($(join(unique(lengths), ", ")) steps), so they were cached at different times."
+    throw(ArgumentError(problem * " A disk cache keeps each store's .zmetadata as it was " *
+        "first read, so the cached record never grows, and the chunk files covering the end of " *
+        "the old record were cached before the later steps were written. To refresh, delete " *
+        "the cached group directories (" * join(keys(ERA5_LAND_STORES), ", ") * ") under " *
+        "$(cache_path) — the .zmetadata files and every chunk file in them — and rerun; the " *
+        "next load re-reads the live metadata. Deleting only .zmetadata would leave stale " *
+        "chunks behind. Nothing is deleted automatically."))
 end
 
 """
@@ -616,7 +786,7 @@ function era5_land_chunk_map(;
 
     # ERA5-Land is on a plain geographic grid; tag it EPSG:4326 explicitly so downstream
     # geospatial ops (resample, reproject, projected crops) have a CRS to work with instead
-    # of assuming one. The lon/lat ranges are already lon-major / descending-lat as stored.
+    # of assuming one. The lon/lat ranges are lon-major and ascending in both, as stored.
     raster = Rasters.Raster(
         chunk_ids,
         (Rasters.X(lon_range), Rasters.Y(lat_range));

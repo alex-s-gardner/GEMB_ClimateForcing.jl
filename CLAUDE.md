@@ -206,7 +206,8 @@ julia --project=/tmp/rgi7parquet_env data/make_rgi7_ice_albedo_parquet.jl 2019
      `key:` line of `~/.cdsapirc`. Both the Zarr (Bearer) and Retrieve API (`PRIVATE-TOKEN`)
      paths take their token from here.
    - `dewpoint_to_vapor_pressure()`, `vapor_pressure_to_relative_humidity()`,
-     `relative_humidity_to_vapor_pressure()` — Magnus/Buck formulas
+     `relative_humidity_to_vapor_pressure()`, `saturation_vapor_pressure()` — one curve, the
+     IFS saturation vapor pressure over water (the curve ERA5 d2m is defined against)
    - Shared by **all three** forcing-adjustment functions (elevation, temperature/precip,
      glacier), which otherwise duplicate the same boilerplate four ways:
      - `_rebuild_forcing(stack, meta; changed_layers...)` — rebuild a forcing `DimStack`
@@ -216,7 +217,7 @@ julia --project=/tmp/rgi7parquet_env data/make_rgi7_ice_albedo_parquet.jl 2019
      - `_adjust_longwave(LW, e, T, e′, T′)` — Konzelmann ε_cs recomputation preserving the
        diagnosed cloud increment Δε. Exact identity when `(e′,T′) == (e,T)`.
      - `_wrap_longitude(lon)` — → −180…180°E, for the geoid grid and the glacier table
-       (both −180…180, unlike the 0–360 ERA5-Land grids). Handles any multiple wrap.
+       (both −180…180, unlike the 0–360 ERA5-Land invariant grids). Handles any multiple wrap.
 
 5. **`src/elevation_adjustment.jl`** - Elevation downscaling (workflow 2)
    - `climate_adjust_for_elevation(stack, Δz; lapse_rate, precip_scaling_method)` — per-variable
@@ -253,7 +254,9 @@ julia --project=/tmp/rgi7parquet_env data/make_rgi7_ice_albedo_parquet.jl 2019
      - `climate_adjust_for_glacier(stack, k)` / `(stack; rgi_id)` applies
        `T′ = T + (k−1)·max(T − T_ref, 0)` — increment form so `k=1` is bit-exact, **gated at
        the melting point** by default because a bare `k` multiplier *warms* sub-freezing air.
-       Recomputes `longwave_downward` only. **Leaves `vapor_pressure` untouched on purpose** —
+       Leaves `longwave_downward` unchanged (the decoupled layer is shallow and ERA5-Land
+       longwave does not depend on the glacier mask). **Leaves `vapor_pressure` untouched on
+       purpose**, apart from capping it at saturation of the cooled air —
        do *not* "fix" this by reusing `temperature_adjust`'s constant-RH propagation: SM10
        Eq. 4 pivots `e` about 6.11 hPa, the opposite sign. Wind is likewise untouched.
      - **Order matters**: `climate_adjust_for_elevation` first, then this. **RGI regions 05 and
@@ -296,8 +299,8 @@ julia --project=/tmp/rgi7parquet_env data/make_rgi7_ice_albedo_parquet.jl 2019
    - `surface_elevation(model, lat, lon)` — elevation of the model grid cell nearest a point,
      from the `:z` invariant. Defaults to `:orthometric` (comparable to sea-level DEMs).
      Accepts either symbol spelling: `:era5land` (dataset) or `:era5_land` (invariant registry),
-     normalized by `_invariant_model`. Maps negative longitude into the invariant's native
-     0–360°E before the `Near` lookup.
+     normalized by `_invariant_model`. Finds the nearest invariant longitude around the circle
+     (`_nearest_longitude_index`), so either convention works across the 0°/360° seam.
 
 9. **`src/cds_retrieve.jl`** - Generic CDS **Retrieve API** (job) client
    - `cds_retrieve(dataset, inputs, dest; token, ...)` — submit → poll → download. Plus
@@ -1032,7 +1035,9 @@ step 3 as returning a `GEMB.ClimateForcing` struct — that is stale; loaders re
 ERA5-Land variables require conversion for GEMB compatibility:
 - `tp` (m) → `precipitation` (kg/m²): multiply by 1000
 - `ssrd`, `strd` (J/m²) → `shortwave/longwave_downward` (W/m²): divide by 3600
-- `d2m` (K) → `vapor_pressure` (Pa): via dewpoint formula
+- `d2m` (K) → `vapor_pressure` (Pa): saturation over water at the dewpoint (IFS curve)
+- `solar_zenith_angle`, `shortwave_downward_diffuse`, `cloud_optical_thickness`: from the
+  shortwave and the solar geometry over each step's accumulation hour (`src/solar.jl`)
 - `u10`, `v10` (m/s) → `wind_speed` (m/s): magnitude √(u² + v²)
 
 ### Performance Characteristics
@@ -1065,7 +1070,9 @@ Tests use conditional integration testing:
   analytically instead, so no resampling ever touches the albedo values.
 
 ### Grid-orientation gotcha
-Both the ERA5-Land ARCO grid and the invariant NetCDFs use **0–359.9°E longitude** and
-**descending latitude (90→−90°N)**. When cropping a `Raster`, `X = a .. b` / `Y = a .. b`
+The ERA5-Land **ARCO stores** (forcing, chunk map) hold longitude **−179.9…180°E** and latitude
+**−90…90°N**, both ascending. The **invariant NetCDFs** use **0–359.9°E longitude** and
+**descending latitude (90→−90°N)**. Point lookups in both find the nearest longitude around the
+circle (`_nearest_longitude_index`), so either longitude convention works. When cropping a `Raster`, `X = a .. b` / `Y = a .. b`
 takes `min .. max` regardless of storage order — but verify axis order after any reprojection
 and never assume ascending latitude.

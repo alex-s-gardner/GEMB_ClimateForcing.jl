@@ -255,10 +255,11 @@ function surface_elevation(model::Symbol, lat::Real, lon::Real;
                            cache_path=nothing, verbose::Bool=false)
     z = climate_model_invariant(; model=_invariant_model(model), parameter=:z,
                                 cache_path=cache_path, verbose=verbose)  # lazy Raster, native 0–359.9°E
-    # The geopotential grid is native 0–360°E; map a negative longitude into that range before
-    # the nearest-cell lookup. `geopotential2height(:orthometric)` needs no geoid sample, so the
-    # longitude sign is otherwise immaterial here.
-    Φ = Float64(z[X(Near(lon < 0 ? lon + 360 : lon)), Y(Near(lat))])
+    # Nearest longitude around the circle, so either convention works and a point just west of
+    # 0°E finds the 0.0 cell when that is the closer one. `geopotential2height(:orthometric)`
+    # needs no geoid sample, so the longitude sign is otherwise immaterial here.
+    i = _nearest_longitude_index(lookup(z, X), lon)
+    Φ = Float64(z[X(i), Y(Near(lat))])
     return geopotential2height(Φ, Float64(lat), Float64(lon); height_reference=height_reference)
 end
 
