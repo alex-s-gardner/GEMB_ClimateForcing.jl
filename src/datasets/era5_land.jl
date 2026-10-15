@@ -362,8 +362,9 @@ Load ERA5-Land reanalysis data using pure Julia (Zarr.jl) and return a DimStack 
   - `shortwave_downward_diffuse`: Diffuse part of the downward shortwave (W/m²)
   - `cloud_optical_thickness`: Cloud optical thickness (dimensionless)
 
-  The last three are derived from the shortwave and the solar geometry by
-  [`shortwave_forcing_layers`](@ref), each flux being the mean over the hour before its stamp.
+  The last three are derived from the shortwave, surface pressure, vapor pressure and the solar
+  geometry by [`shortwave_forcing_layers`](@ref), each flux being the mean over the hour before
+  its stamp.
 
   Metadata includes `latitude`, `longitude`, `dataset`, `chunk_strategy`, and
   `outside_land_mask`.
@@ -536,8 +537,8 @@ function load_era5_land(
             _era5_land_conversions(t2m_raw, d2m_raw, sp_raw, precipitation_raw, u10, v10,
                                    shortwave_raw, longwave_raw)
         (; solar_zenith_angle, shortwave_downward_diffuse, cloud_optical_thickness) =
-            shortwave_forcing_layers(shortwave_downward, selected_lat, selected_lon,
-                                     selected_times, selected_elevation; step = Hour(1))
+            shortwave_forcing_layers(shortwave_downward, pressure_air, vapor_pressure,
+                                     selected_lat, selected_lon, selected_times; step = Hour(1))
 
         @info "Data loaded successfully!" n_time_steps=length(selected_times)
 

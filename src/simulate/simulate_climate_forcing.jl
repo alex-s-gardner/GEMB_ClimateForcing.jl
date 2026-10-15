@@ -660,16 +660,6 @@ function simulate_climate_forcing(set_id::String, time_step_hours::Int=0)
     # Simulate downward shortwave radiation (deterministic, no RNG needed)
     shortwave_downward = simulate_shortwave_irradiance(dec_year, location_parameters.latitude)
 
-    # The shortwave layers GEMB reads beside it, from the same instantaneous geometry: zenith angle
-    # (90 with the Sun down), and the diffuse part and cloud optical thickness from the clearness
-    # index against S₀·cos θ.
-    cos_zenith = _simulated_cos_zenith(dec_year, location_parameters.latitude)
-    solar_zenith_angle = [c > 0 ? acosd(min(c, 1.0)) : 90.0 for c in cos_zenith]
-    partition = _partition_shortwave.(shortwave_downward, SOLAR_CONSTANT .* max.(cos_zenith, 0.0),
-                                      location_parameters.elevation)
-    shortwave_downward_diffuse = first.(partition)
-    cloud_optical_thickness = last.(partition)
-
     # Simulate air temperature [K]
     temperature_air = simulate_air_temperature(
         rng, dec_year, location_parameters.latitude, location_parameters.elevation;
@@ -691,6 +681,16 @@ function simulate_climate_forcing(set_id::String, time_step_hours::Int=0)
 
     # Screen-level vapor pressure [Pa]
     vapor_pressure = relative_humidity_to_vapor_pressure(temperature_air, relative_humidity)
+
+    # The shortwave layers GEMB reads beside the shortwave, from the same instantaneous geometry:
+    # zenith angle (90 with the Sun down), and the diffuse part and cloud optical thickness from the
+    # clearness index against S₀·cos θ, τ against the clear sky at the simulated pressure and vapor
+    # pressure. Deterministic, so its place in the sequence leaves the random draws unchanged.
+    cos_zenith = _simulated_cos_zenith(dec_year, location_parameters.latitude)
+    solar_zenith_angle = [c > 0 ? acosd(min(c, 1.0)) : 90.0 for c in cos_zenith]
+    shortwave_downward_diffuse, cloud_optical_thickness =
+        _partition_shortwave_series(shortwave_downward, SOLAR_CONSTANT .* max.(cos_zenith, 0.0),
+                                    solar_zenith_angle, pressure_air, vapor_pressure)
 
     # Downward longwave radiation [W m-2]
     longwave_downward = simulate_longwave_irradiance(temperature_air, vapor_pressure)

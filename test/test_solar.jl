@@ -14,7 +14,8 @@ using Statistics
 
 using GEMB_ClimateForcing: solar_declination, equation_of_time, earth_sun_distance_factor,
     cos_solar_zenith, erbs_diffuse_fraction, cloud_transmissivity, cloud_optical_thickness,
-    _partition_shortwave, CLOUD_OPTICAL_THICKNESS_MAX,
+    _clear_sky_clearness, _inverted_optical_thickness, _partition_shortwave_series,
+    CLOUD_OPTICAL_THICKNESS_MAX, CLOUD_OPTICAL_THICKNESS_ZENITH_MAX,
     validate_climate_forcing_units, _cell_forcing_at_interval
 
 @testset "Solar geometry" begin
@@ -116,52 +117,139 @@ using GEMB_ClimateForcing: solar_declination, equation_of_time, earth_sun_distan
     @testset "cloud optical thickness inverts the cloud transmissivity" begin
         @test cloud_optical_thickness(1.0) == 0.0
         @test cloud_transmissivity(0.0) == 1.0
-        for τ in (0.1, 1.0, 5.0, 20.0, 99.0)
+        for τ in (0.1, 1.0, 5.0, 20.0, 29.0)
             @test cloud_optical_thickness(cloud_transmissivity(τ)) ≈ τ rtol = 1e-12
         end
         @test cloud_transmissivity(10.0) ≈ 1 / 2.3
-        @test cloud_optical_thickness(0.01) == CLOUD_OPTICAL_THICKNESS_MAX
+        # The cap is the top of the Gardner & Sharp (2010) fitted range, Table B1: τ = 0–30.
+        @test CLOUD_OPTICAL_THICKNESS_MAX == 30.0
+        # t = 1/(1 + 0.13·40) inverts to 40 and is held at the cap; t = 0.01 to 761.5.
+        @test cloud_optical_thickness(1 / (1 + 0.13 * 40)) == 30.0
+        @test cloud_optical_thickness(0.01) == 30.0
+        @test cloud_optical_thickness(1 / (1 + 0.13 * 30)) ≈ 30.0 rtol = 1e-12
         @test_throws ArgumentError cloud_optical_thickness(0.0)
         @test_throws ArgumentError cloud_optical_thickness(1.1)
     end
 
-    @testset "partition of one step" begin
-        z = 2000.0
-        k_clear = 0.75 + 2e-5 * z
-        # Night: all shortwave diffuse, τ = 0.
-        @test _partition_shortwave(0.0, 0.0, z) == (0.0, 0.0)
-        @test _partition_shortwave(0.4, 0.0, z) == (0.4, 0.0)
-        # Clear: the clear-sky clearness or more gives τ = 0.
-        d, τ = _partition_shortwave(k_clear * 1000, 1000.0, z)
-        @test τ == 0.0
-        @test d ≈ erbs_diffuse_fraction(k_clear) * k_clear * 1000
-        # Shortwave above the geometric top of atmosphere is treated as k_t = 1.
-        @test _partition_shortwave(120.0, 100.0, z) == (0.165 * 120.0, 0.0)
-        # Overcast: τ from the transmissivity k_t / k_clear.
-        d, τ = _partition_shortwave(200.0, 1000.0, z)
-        @test τ ≈ cloud_optical_thickness(0.2 / k_clear)
-        @test d ≈ erbs_diffuse_fraction(0.2) * 200.0
+    # FAO-56 Annex 3 eqs. 3-17 to 3-20 with K_t = 1, written out here independently of the
+    # package: sin φ the sine of the sun's elevation, P and e_a in kPa.
+    function fao_clearness(sin_φ, P, e_a)
+        W = 0.14 * e_a * P + 2.1                                             # (3-19), mm
+        K_B = 0.98 * exp(-0.00146 * P / sin_φ - 0.091 * (W / sin_φ)^0.25)   # (3-18)
+        K_D = K_B >= 0.15 ? 0.35 - 0.33 * K_B : 0.18 + 0.82 * K_B           # (3-20)
+        return K_B + K_D                                                     # (3-17)
+    end
+
+    @testset "FAO-56 Annex 3 clear-sky clearness" begin
+        # Reference values from eqs. 3-17 to 3-20 evaluated in 256-bit BigFloat with the
+        # coefficients parsed as decimals, at (sin φ, P kPa, e_a kPa):
+        #   (0.5, 101.3, 1.0):  K_B = 0.58662, K_D = 0.35 − 0.33 K_B = 0.15642
+        #   (0.9,  77.0, 0.4):  K_B = 0.74544, K_D = 0.35 − 0.33 K_B = 0.10401
+        #   (0.08, 101.3, 2.0): K_B = 0.10322 < 0.15, K_D = 0.18 + 0.82 K_B = 0.26464
+        # The package takes pressures in Pa.
+        @test _clear_sky_clearness(0.5, 101.3e3, 1.0e3) ≈ 0.7430339046365992 rtol = 1e-12
+        @test _clear_sky_clearness(0.9, 77.0e3, 0.4e3) ≈ 0.8494422160370874 rtol = 1e-12
+        @test _clear_sky_clearness(0.08, 101.3e3, 2.0e3) ≈ 0.36785562641330877 rtol = 1e-12
+        @test_throws "cosine of the solar zenith angle" _clear_sky_clearness(0.0, 1e5, 1e3)
+        @test_throws "cosine of the solar zenith angle" _clear_sky_clearness(1.1, 1e5, 1e3)
+        @test_throws "surface pressure must be positive" _clear_sky_clearness(0.5, 0.0, 1e3)
+        @test_throws "surface pressure must be positive" _clear_sky_clearness(0.5, NaN, 1e3)
+        @test_throws "vapor pressure must be non-negative" _clear_sky_clearness(0.5, 1e5, -1.0)
+    end
+
+    @testset "inversion of one sunlit step" begin
+        P, e = 75.0e3, 500.0                                # Pa
+        toa = 1000.0
+        for θ in (30.0, 60.0, 75.0)
+            k_clear = fao_clearness(cosd(θ), P / 1000, e / 1000)
+            # Shortwave equal to the clear sky inverts to a clear sky.
+            @test _inverted_optical_thickness(k_clear * toa, toa, cosd(θ), P, e) ≈ 0 atol = 1e-12
+            # Transmissivity 1/(1 + 0.13·10) inverts to τ = 10.
+            @test _inverted_optical_thickness(k_clear * toa / (1 + 0.13 * 10), toa, cosd(θ), P, e) ≈
+                  10.0 rtol = 1e-12
+            # Transmissivity 1/(1 + 0.13·50) would invert to 50 and is held at the cap.
+            @test _inverted_optical_thickness(k_clear * toa / (1 + 0.13 * 50), toa, cosd(θ), P, e) ==
+                  CLOUD_OPTICAL_THICKNESS_MAX
+        end
+        # Shortwave above the clear sky, or above the top of atmosphere, is clear.
+        @test _inverted_optical_thickness(900.0, toa, cosd(30.0), P, e) == 0.0
+        @test _inverted_optical_thickness(1200.0, toa, cosd(30.0), P, e) == 0.0
         # Daylight with no shortwave at all is the thickest cloud the inversion reports.
-        @test _partition_shortwave(0.0, 500.0, z) == (0.0, CLOUD_OPTICAL_THICKNESS_MAX)
-        @test all(isnan, _partition_shortwave(NaN, 500.0, z))
+        @test _inverted_optical_thickness(0.0, toa, cosd(30.0), P, e) == CLOUD_OPTICAL_THICKNESS_MAX
+        @test isnan(_inverted_optical_thickness(NaN, toa, cosd(30.0), P, e))
+        @test_throws "only on a sunlit step" _inverted_optical_thickness(0.0, 0.0, 0.5, P, e)
+    end
+
+    @testset "partition of a series: diffuse and the low-sun rule" begin
+        P, e = 70.0e3, 300.0                                 # Pa
+        # One synthetic series: night, a day, night, a twilight-only period, night. `target` is
+        # the τ the shortwave of each inverted step is built to give; low-sun steps get no
+        # shortwave at all, which an inversion would report as the cap.
+        sza    = [90.0, 88.0, 82.0, 80.0, 60.0, 40.0, 79.0, 84.0, 89.0, 90.0, 86.0, 85.0, 87.0, 90.0]
+        target = [ NaN,  NaN,  NaN,  2.0,  3.0,  4.0,  6.0,  NaN,  NaN,  NaN,  NaN,  NaN,  NaN,  NaN]
+        toa = [z < 90 ? SOLAR_CONSTANT * cosd(z) : 0.0 for z in sza]
+        sw = [isnan(τ) ? 0.0 : fao_clearness(cosd(z), P / 1000, e / 1000) * a / (1 + 0.13τ)
+              for (z, a, τ) in zip(sza, toa, target)]
+        n = length(sza)
+        diffuse, τ = _partition_shortwave_series(sw, toa, sza, fill(P, n), fill(e, n))
+        # Dawn (88°, 82°) takes the first inverted step (80°, exactly at the threshold); dusk
+        # (84°, 89°) the last (79°); night and the twilight-only period are 0.
+        expected = [0.0, 2.0, 2.0, 2.0, 3.0, 4.0, 6.0, 6.0, 6.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        @test CLOUD_OPTICAL_THICKNESS_ZENITH_MAX == 80.0
+        @test all(i -> isapprox(τ[i], expected[i]; rtol = 1e-12, atol = 0), eachindex(τ, expected))
+        # Diffuse is f(k_t)·SW at every sunlit step, the Erbs fraction of k_t = SW/TOA; at night
+        # all the shortwave is diffuse.
+        for i in eachindex(sw, toa)
+            @test diffuse[i] == (toa[i] > 0 ? erbs_diffuse_fraction(sw[i] / toa[i]) * sw[i] : sw[i])
+        end
+
+        # Polar day: one daylight period spanning two "days". Low-sun steps take the latest
+        # earlier inversion, the following one only before the first.
+        sza = [85.0, 70.0, 85.0, 86.0, 70.0, 85.0]
+        target = [NaN, 1.0, NaN, NaN, 5.0, NaN]
+        toa = SOLAR_CONSTANT .* cosd.(sza)
+        sw = [isnan(τ) ? 1.0 : fao_clearness(cosd(z), P / 1000, e / 1000) * a / (1 + 0.13τ)
+              for (z, a, τ) in zip(sza, toa, target)]
+        _, τ = _partition_shortwave_series(sw, toa, sza, fill(P, 6), fill(e, 6))
+        @test τ ≈ [1.0, 1.0, 1.0, 1.0, 5.0, 5.0] rtol = 1e-12
+
+        # Night shortwave, normally zero, is all diffuse with τ = 0; NaN shortwave is NaN in both.
+        diffuse, τ = _partition_shortwave_series([0.4, NaN, NaN], [0.0, 500.0, 50.0],
+                                                 [90.0, 60.0, 85.0], fill(P, 3), fill(e, 3))
+        @test diffuse[1] == 0.4 && τ[1] == 0.0
+        @test all(isnan, diffuse[2:3]) && all(isnan, τ[2:3])
+        @test_throws DimensionMismatch _partition_shortwave_series(zeros(3), zeros(3), zeros(3),
+                                                                   zeros(2), zeros(3))
     end
 
     @testset "shortwave_forcing_layers" begin
         times = DateTime(2020, 7, 1) .+ Hour.(1:48)
         g = solar_geometry(46.5, 8.0, times)
         sw = 0.6 .* g.shortwave_toa
-        L = shortwave_forcing_layers(sw, 46.5, 8.0, times, 2500.0)
+        P, e = fill(75000.0, 48), fill(500.0, 48)
+        L = shortwave_forcing_layers(sw, P, e, 46.5, 8.0, times)
         @test L.solar_zenith_angle == g.solar_zenith_angle
         @test all(0 .<= L.shortwave_downward_diffuse .<= sw)
         @test all(0 .<= L.cloud_optical_thickness .<= CLOUD_OPTICAL_THICKNESS_MAX)
-        @test L.shortwave_downward_diffuse == first.(_partition_shortwave.(sw, g.shortwave_toa, 2500.0))
+        @test (L.shortwave_downward_diffuse, L.cloud_optical_thickness) ==
+              _partition_shortwave_series(sw, g.shortwave_toa, g.solar_zenith_angle, P, e)
+        # An inverted hour's τ is 0.6 against the FAO clear sky at its own zenith angle.
+        i = argmin(g.solar_zenith_angle)
+        k_clear = fao_clearness(cosd(g.solar_zenith_angle[i]), 75.0, 0.5)
+        @test L.cloud_optical_thickness[i] ≈ (k_clear / 0.6 - 1) / 0.13 rtol = 1e-12
+        # The same series as views into longer vectors gives the same layers.
+        pad(v) = view(vcat([NaN], v, [NaN]), 2:49)
+        Lv = shortwave_forcing_layers(pad(sw), pad(P), pad(e), 46.5, 8.0, times)
+        @test Lv.cloud_optical_thickness == L.cloud_optical_thickness
+        @test Lv.shortwave_downward_diffuse == L.shortwave_downward_diffuse
+        @test_throws DimensionMismatch shortwave_forcing_layers(sw, P[1:47], e, 46.5, 8.0, times)
     end
 
     @testset "the layers ride through every adjustment unchanged" begin
         times = DateTime(2020, 7, 1) .+ Hour.(1:48)
-        L = shortwave_forcing_layers(0.6 .* solar_geometry(46.5, 8.0, times).shortwave_toa,
-                                     46.5, 8.0, times, 2500.0)
         n = length(times)
+        L = shortwave_forcing_layers(0.6 .* solar_geometry(46.5, 8.0, times).shortwave_toa,
+                                     fill(75000.0, n), fill(500.0, n), 46.5, 8.0, times)
         ti = Ti(times)
         T = [273.15 + 5 * sinpi(2i / 24) for i in 1:n]
         sw = 0.6 .* solar_geometry(46.5, 8.0, times).shortwave_toa
@@ -193,6 +281,9 @@ using GEMB_ClimateForcing: solar_declination, equation_of_time, earth_sun_distan
             bad(:shortwave_downward_diffuse, sw .+ 1))
         @test_throws "cloud_optical_thickness" validate_climate_forcing_units(
             bad(:cloud_optical_thickness, fill(-1.0, n)))
+        @test_throws "cloud_optical_thickness: expected [0, 30.0]" validate_climate_forcing_units(
+            bad(:cloud_optical_thickness, fill(30.5, n)))
+        @test validate_climate_forcing_units(bad(:cloud_optical_thickness, fill(30.0, n)))
     end
 
     @testset "simulated forcing carries the layers" begin
@@ -203,5 +294,8 @@ using GEMB_ClimateForcing: solar_declination, equation_of_time, earth_sun_distan
         sw = parent(ds[:shortwave_downward])
         @test all(parent(ds[:solar_zenith_angle])[sw .== 0] .== 90.0)
         @test all(0 .<= parent(ds[:shortwave_downward_diffuse]) .<= sw)
+        τ = parent(ds[:cloud_optical_thickness])
+        @test all(0 .<= τ .<= CLOUD_OPTICAL_THICKNESS_MAX)
+        @test all(iszero, τ[sw .== 0])
     end
 end

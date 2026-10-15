@@ -149,7 +149,8 @@ using GEMB_ClimateForcing: _era5_land_conversions, _nearest_longitude_index, fin
             @test count(sw[day] .> toa[day]) / count(day) < 0.01
             @test all(parent(s[:solar_zenith_angle])[.!(toa .> 0)] .== 90.0)
             @test all(0 .<= parent(s[:shortwave_downward_diffuse]) .<= sw)
-            @test 0 < median(parent(s[:cloud_optical_thickness])[day]) < 100
+            @test 0 < median(parent(s[:cloud_optical_thickness])[day]) <
+                  GEMB_ClimateForcing.CLOUD_OPTICAL_THICKNESS_MAX
         end
 
         @testset "live: a cell outside the land mask" begin
