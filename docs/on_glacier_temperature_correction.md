@@ -408,6 +408,14 @@ above) before trusting it, and follow the same conventions as the implemented pa
 scalar/lookup arguments, cumulative metadata so repeated calls compose, validation re-run on
 the result, and an exact identity at `k = 1`.
 
+**Glacier correction of a reanalysis cell (downscaling chain).** Before a cell's forcing is
+lapsed to a glacier band it is taken to its ice-free equivalent, undoing the damping ERA5-Land
+already applies to its glacier-masked fraction `glm`. The default is additive,
+`T_ambient = T − glm·(γ + δz)` with the decoupling fit's glacier term at the cell's elevation
+(`_ambient_forcing`, `AdditiveGlacierCorrection`, `GLACIER_CORRECTIONS`), which carries the cell's
+residual from the fit unscaled; the multiplicative form `E_ambient = E_obs / (1 − glm(1 − k))`
+scales that residual by up to `1/0.25`.
+
 Three caveats, all surfaced in the `climate_adjust_for_glacier` docstring:
 
 - **Order of operations.** Elevation downscaling (`climate_adjust_for_elevation`) must come

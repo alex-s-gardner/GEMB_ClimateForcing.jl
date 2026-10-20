@@ -102,6 +102,78 @@ const _DECOUPLING_FACTOR_LIMITS = (0.0, 1.0)
 # range is excluded where the series is resolved, not clamped into it.
 const _DONOR_DECOUPLING_FACTOR_LIMITS = (0.25, 1.0)
 
+"""
+    GLACIER_CORRECTIONS
+
+The forms of the glacier correction, which takes a glaciated reanalysis cell's forcing to its
+ice-free equivalent before it is lapsed ([`_ambient_forcing`](@ref)):
+
+- `:additive`: subtract the decoupling fit's glacier term, `T_ambient = T - glm·(γ + δ·z)`, the
+  correction [`derive_lapse_rate`](@ref) applies to the cells of its fit. The cell's residual from
+  the fit is carried unscaled.
+- `:multiplicative`: divide the observed warm excess by the fit's damping,
+  `E_ambient = E_obs / (1 - glm·(1 - k(z)))`. The residual is scaled with the rest, by up to
+  `1/$(_DONOR_DECOUPLING_FACTOR_LIMITS[1])`.
+
+[`DEFAULT_GLACIER_CORRECTION`](@ref) is the form used when none is requested.
+"""
+const GLACIER_CORRECTIONS = (:additive, :multiplicative)
+
+"""
+    DEFAULT_GLACIER_CORRECTION
+
+The glacier correction form used when none is requested: `:additive`. See
+[`GLACIER_CORRECTIONS`](@ref).
+"""
+const DEFAULT_GLACIER_CORRECTION = :additive
+
+"""
+    AdditiveGlacierCorrection(glacier_term, fitted, decoupling_factor)
+
+A donor cell's additive glacier correction per timestep, as [`_ambient_forcing`](@ref) applies it on
+a step above melting with `E_obs = T - T_ref > 0`:
+
+- where `fitted[t]`, the step's own fit: `T_ambient = T - glm·glacier_term[t]`;
+- elsewhere, the smaller of the two pooled corrections,
+  `T_ambient = T + min(-glm·glacier_term[t], E_obs·glm·(1 - k)/(1 - glm·(1 - k)))` with
+  `k = decoupling_factor[t]`.
+
+`glacier_term` is `g = γ + δ·z` at the donor's elevation (K), finite and `<= 0` at every step (a
+fitted value from [`_glacier_term_at_elevation`](@ref), or a pooled one); `decoupling_factor` is
+`k` at the donor's elevation, finite and in `$(_DONOR_DECOUPLING_FACTOR_LIMITS)`, read only where
+`fitted` is false. All three have one entry per timestep.
+
+The pooled step takes the smaller correction because each pooled form errs in one direction. A
+pooled `g` is the glacier term of a typical warm hour of that month and hour, so it over-warms a
+step whose ambient excess is smaller than typical. A pooled `k` is proportional to the step's
+observed excess, so it multiplies a warm donor's residual from the fit by up to
+`1/$(_DONOR_DECOUPLING_FACTOR_LIMITS[1])`. On a step that follows the fit's model with the pooled
+`k` the ratio form is exact and the smaller; on a step that carries a positive residual the pooled
+`g` is.
+"""
+struct AdditiveGlacierCorrection
+    glacier_term::Vector{Float64}
+    fitted::Vector{Bool}
+    decoupling_factor::Vector{Float64}
+    function AdditiveGlacierCorrection(glacier_term, fitted, decoupling_factor)
+        g = collect(Float64, glacier_term)
+        f = collect(Bool, fitted)
+        k = collect(Float64, decoupling_factor)
+        length(g) == length(f) == length(k) || throw(DimensionMismatch(
+            "glacier_term, fitted and decoupling_factor have $(length(g)), $(length(f)) and " *
+            "$(length(k)) entries; they must have one per timestep"))
+        all(x -> isfinite(x) && x <= 0, g) || throw(ArgumentError(
+            "glacier_term must be finite and <= 0 at every timestep; resolve a fitted series " *
+            "before applying it"))
+        k_min, k_max = _DONOR_DECOUPLING_FACTOR_LIMITS
+        all(x -> isfinite(x) && k_min <= x <= k_max, k) || throw(ArgumentError(
+            "decoupling_factor must be finite and in [$(k_min), $(k_max)] at every timestep"))
+        return new(g, f, k)
+    end
+end
+
+Base.length(c::AdditiveGlacierCorrection) = length(c.glacier_term)
+
 # The ten forcing layers `climate_forcing` returns. Named here rather than derived from a stack so
 # a caller accumulating layer-wise can allocate before it has seen one. The last three are not
 # area-averaged like the rest: an average of `solar_zenith_angle` weights `cos θ` by shortwave
@@ -516,11 +588,13 @@ the fit:
 for a cell above melting, and `T_ambient_i = T_i` for a cell at or below it, where the reanalysis
 applies no damping. An ice-free cell (`glm = 0`) is unchanged and a fully glaciated one gets the
 whole correction. The correction is linear in the warm-cell sums already accumulated, so the fit
-needs no second pass over the forcing. [`_ambient_forcing`](@ref) brings a donor cell to the same
-ice-free state through the ratio form of the model, `E_ambient = E_obs / (1 - glm·(1 - k(z)))` with
-`k(z) = 1 + (γ + δ·z)/(α + β·z)`. On forcing that follows the model the two are identical; they
-differ only in how a cell's residual from the fit is carried (unscaled here, scaled by the ratio
-there).
+needs no second pass over the forcing. [`_ambient_forcing`](@ref) applies the glacier correction (a
+glaciated cell's forcing taken to its ice-free equivalent) to a donor cell in one of two forms: this
+additive one, with the glacier term `γ + δ·z` at the donor's elevation
+([`_glacier_term_at_elevation`](@ref)), or the multiplicative (ratio) form of the model,
+`E_ambient = E_obs / (1 - glm·(1 - k(z)))` with `k(z) = 1 + (γ + δ·z)/(α + β·z)`. On forcing that
+follows the model the two are identical; they differ only in how a cell's residual from the fit is
+carried (unscaled here, scaled by the ratio there).
 
 `decoupling` is the `DimStack` [`derive_decoupling_factor`](@ref) returns, read **raw**. A timestep
 whose `k` is `NaN` *or* outside `(0, 1]` is fitted on the observed temperatures without correction.
@@ -625,6 +699,48 @@ end
 _corrects_to_ambient(k, γ, δ) =
     isfinite(k) && _DECOUPLING_FACTOR_LIMITS[1] < k <= _DECOUPLING_FACTOR_LIMITS[2] &&
     isfinite(γ) && isfinite(δ)
+
+"""
+    _glacier_term_at_elevation(decoupling, elevation) -> Vector{Float64}
+
+The glacier term of the decoupling fit at `elevation` (m), per timestep: `g = γ + δ·z`, the fitted
+warm excess of a fully glaciated cell minus that of an ice-free one at `z` (K). It is what the
+additive glacier correction subtracts, `T_ambient = T - glm·g` ([`_ambient_forcing`](@ref)), the
+correction [`derive_lapse_rate`](@ref) applies to every cell of its fit. `decoupling` is the
+`DimStack` [`derive_decoupling_factor`](@ref) returns.
+
+A timestep reports a value only where the fit's model is defined at `z`, and `NaN` otherwise:
+
+- the fit corrects that timestep to ambient (`_corrects_to_ambient` of `k` at the reference
+  elevation), so the donor is converted on exactly the timesteps whose lapse fit was converted;
+- the fitted ice-free excess at `z`, `α + β·z`, is at least `$(_MIN_AMBIENT_EXCESS)` K, the
+  threshold below which the fit carries no information about the damping;
+- `-(1 - k_min)·(α + β·z) <= g <= 0`, i.e. `k(z)` in `$(_DONOR_DECOUPLING_FACTOR_LIMITS)`, the
+  range the multiplicative form accepts a donor `k` in, so both forms convert a donor from its own
+  fit on the same timesteps.
+
+The last two make the correction a warming no larger than `glm·(1 - k_min)·(α + β·z)` at every
+reported timestep, whatever the donor's own residual from the fit. The `k(z)` bound matters where
+the fit's ice-free end is an extrapolation: on the Greenland land-ice tile N68_W032 the fit puts
+the ice-free excess at 1,827 m at 96.7 K in an hour with `k(z) = 0.004`, and subtracting that
+glacier term would deliver 369.7 K.
+"""
+function _glacier_term_at_elevation(decoupling, elevation::Real)
+    z = Float64(elevation)
+    k = decoupling.decoupling_factor
+    α, β, γ, δ = decoupling.coef_alpha, decoupling.coef_beta,
+                 decoupling.coef_gamma, decoupling.coef_delta
+    g = fill(NaN, length(k))
+    for t in eachindex(g, k, α, β, γ, δ)
+        _corrects_to_ambient(k[t], γ[t], δ[t]) || continue
+        ambient = α[t] + β[t] * z
+        glacier = γ[t] + δ[t] * z
+        (isfinite(ambient) && ambient >= _MIN_AMBIENT_EXCESS) || continue
+        -(1 - _DONOR_DECOUPLING_FACTOR_LIMITS[1]) * ambient <= glacier <= 0 || continue
+        g[t] = glacier
+    end
+    return g
+end
 
 """
     _solve_sym4(A, b) -> NTuple{4,Float64} or nothing
@@ -749,9 +865,10 @@ end
 One donor cell's forcing `fd`, delivered on glacier at an elevation `delta_elevation` (m) above the
 cell's reanalysis surface:
 
-1. **to ambient** — undo the damping the reanalysis applied to the cell's own warm excess
-   ([`_ambient_forcing`](@ref)), with `glacier_fraction` the donor cell's `glm` and
-   `donor_decoupling_factor` the per-timestep `k` at the **donor's** elevation;
+1. **to ambient** — the glacier correction: undo the damping the reanalysis applied to the cell's
+   own warm excess ([`_ambient_forcing`](@ref)), with `glacier_fraction` the donor cell's `glm` and
+   `donor_decoupling_factor` the donor's correction at the **donor's** elevation, either the
+   per-timestep `k` (the multiplicative form) or an [`AdditiveGlacierCorrection`](@ref);
 2. **lapse** — [`climate_adjust_for_elevation`](@ref) with the ambient `lapse_rate` (K/km, scalar,
    monthly or per-timestep) that [`derive_lapse_rate`](@ref) fits;
 3. **decouple** — the band is glacier, so the band's full per-timestep `decoupling_factor` at the
@@ -765,7 +882,7 @@ of the donor, and the slope of step 2 is the ambient one. The order is not incid
 decoupling damps only the excess above a fixed melting point, and lapsing changes which timesteps
 are above it.
 
-`decoupling_factor` must be finite and in `(0, 1]`, `donor_decoupling_factor` finite and in
+`decoupling_factor` must be finite and in `(0, 1]`, a `donor_decoupling_factor` vector finite and in
 `$(_DONOR_DECOUPLING_FACTOR_LIMITS)` (see [`_ambient_forcing`](@ref)), and `glacier_fraction` in
 `[0, 1]`; anything else throws an `ArgumentError`. Both factors come from
 [`decoupling_factor_at_elevation`](@ref), at the band's and the donor's elevation, with their gaps
@@ -795,9 +912,26 @@ end
 
 """
     _ambient_forcing(fd, glacier_fraction, decoupling_factor) -> DimStack
+    _ambient_forcing(fd, glacier_fraction, correction::AdditiveGlacierCorrection) -> DimStack
 
-A reanalysis cell's forcing brought to the ice-free (ambient) state by inverting the damping the
-decoupling fit measures. [`derive_decoupling_factor`](@ref) models a cell with glacier-mask fraction
+The glacier correction: a reanalysis cell's forcing brought to the ice-free (ambient) state by
+inverting the damping the decoupling fit measures, in the multiplicative form (a `decoupling_factor`
+vector) or the additive one (an [`AdditiveGlacierCorrection`](@ref)); see
+[`GLACIER_CORRECTIONS`](@ref).
+
+**Additive.** The fit's model of a cell above melting is `E_obs = α + β·z + glm·(γ + δ·z)`, whose
+ice-free part is `α + β·z`, so removing the glacier term leaves the ice-free excess plus the cell's
+own residual from the fit:
+
+    T_ambient = T - glm·g,    g = γ + δ·z
+
+on a step whose own fit is used, and the smaller of the pooled additive and pooled multiplicative
+corrections elsewhere (see [`AdditiveGlacierCorrection`](@ref)). A step at or below melting is
+unchanged. The correction is a warming of at most `glm·|g|` at every step, with no division, so a
+warm residual is carried as observed rather than amplified. `glm = 0` returns the input stack
+itself.
+
+**Multiplicative.** [`derive_decoupling_factor`](@ref) models a cell with glacier-mask fraction
 `glm` that is above melting as reporting `E_obs = [1 - glm·(1 - k)]·E_ambient`, with `k` the
 decoupling factor at the cell's own elevation, so
 
@@ -843,6 +977,30 @@ function _ambient_forcing(fd, glacier_fraction::Real, decoupling_factor)
             D >= k_min || error("ambient conversion denominator $(D) at step $(t) is below " *
                                 "$(k_min) for k = $(k), glm = $(glm); this is a bug")
             T′[t] = T[t] + E * (glm * (1 - k)) / D
+        else
+            T′[t] = T[t]
+        end
+    end
+    meta = merge(copy(DimensionalData.metadata(fd)),
+                 Dict("temperature_air_mean" => Statistics.mean(T′)))
+    return _rebuild_forcing(fd, meta; temperature_air = T′)
+end
+
+function _ambient_forcing(fd, glacier_fraction::Real, correction::AdditiveGlacierCorrection)
+    glm = Float64(glacier_fraction)
+    0 <= glm <= 1 || throw(ArgumentError("glacier_fraction must be in [0, 1] (got $(glacier_fraction))"))
+    _check_series_length(correction, fd, "glacier correction")
+    glm == 0 && return fd
+
+    T = fd[:temperature_air]
+    T′ = similar(T)
+    g, fitted, k = correction.glacier_term, correction.fitted, correction.decoupling_factor
+    for t in eachindex(T, g, fitted, k)
+        E = T[t] - _DECOUPLING_REFERENCE_TEMPERATURE
+        if E > 0
+            additive = -glm * g[t]
+            T′[t] = T[t] + (fitted[t] ? additive :
+                            min(additive, E * (glm * (1 - k[t])) / (k[t] + (1 - k[t]) * (1 - glm))))
         else
             T′[t] = T[t]
         end

@@ -88,6 +88,7 @@ export glacier_decoupling, glacier_decoupling_table, GlacierDecoupling,
 # Export the per-region downscaling-parameter fits — the inverse of the two adjustments above,
 # read back out of a region's own forcing rather than looked up
 export derive_decoupling_factor, derive_lapse_rate, decoupling_factor_at_elevation
+export GLACIER_CORRECTIONS, DEFAULT_GLACIER_CORRECTION, AdditiveGlacierCorrection
 
 # Include submodules
 include("utils.jl")

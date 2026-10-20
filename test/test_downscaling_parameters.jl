@@ -535,6 +535,164 @@ end
         @test all(t -> isapprox(t - _DECOUPLING_REFERENCE_TEMPERATURE, 6.4; atol = 1e-12), band)
     end
 
+    @testset "additive glacier correction" begin
+        n = length(_DP_TIME)
+        ti = Ti(_DP_TIME)
+        col(v) = DimArray(fill(Float64(v), n), ti)
+        stack(T; z = 2000.0) = DimStack((temperature_air = DimArray(collect(Float64, T), ti),
+                                         pressure_air = col(80000.0), vapor_pressure = col(500.0),
+                                         wind_speed = col(3.0), precipitation = col(0.0),
+                                         shortwave_downward = col(200.0),
+                                         longwave_downward = col(300.0));
+                                        metadata = Dict{String,Any}("elevation" => z))
+        Tref = _DECOUPLING_REFERENCE_TEMPERATURE
+        k_min = _DONOR_DECOUPLING_FACTOR_LIMITS[1]
+        fitted(g) = AdditiveGlacierCorrection(fill(g, n), trues(n), ones(n))
+        @test DEFAULT_GLACIER_CORRECTION === :additive
+        @test GLACIER_CORRECTIONS == (:additive, :multiplicative)
+
+        # A donor that follows the fit's model: k = 0.7, ambient excess 6 K, glm = 0.5, so the
+        # glacier term is g = (k - 1)·6 = -1.8 K and the observed excess 6 + 0.5·g = 5.1 K. Both forms
+        # return the 6 K ambient excess, and the band at the donor's elevation gets k·6 = 4.2 K.
+        k, E, glm = 0.7, 6.0, 0.5
+        g = (k - 1) * E
+        fd = stack(fill(Tref + E + glm * g, n))
+        Ta = parent(_ambient_forcing(fd, glm, fitted(g))[:temperature_air])
+        @test all(t -> isapprox(t - Tref, 6.0; atol = 1e-12), Ta)
+        @test Ta ≈ parent(_ambient_forcing(fd, glm, fill(k, n))[:temperature_air]) atol = 1e-12
+        band = _cell_forcing_at_interval(_ambient_forcing(fd, glm, fitted(g)), 0.0, fill(k, n),
+                                         6.5, 0.0, ones(n))
+        @test all(t -> isapprox(t - Tref, 4.2; atol = 1e-12), band[:temperature_air])
+
+        # A donor with a residual from the fit: glm = 1, k = 0.26, the fit's ice-free excess 20 K, so
+        # g = -14.8 K and the fit predicts 5.2 K; the donor observes 13.2 K, a residual of +8 K. The
+        # additive form carries the residual as observed, 20 + 8 = 28 K; the multiplicative form
+        # divides the whole excess by k, 13.2/0.26 = 50.77 K, i.e. it multiplies the residual by 1/k.
+        k, glm = 0.26, 1.0
+        g = (k - 1) * 20.0
+        fd = stack(fill(Tref + 13.2, n))
+        @test all(t -> isapprox(t - Tref, 13.2 - g; atol = 1e-12),
+                  parent(_ambient_forcing(fd, glm, fitted(g))[:temperature_air]))
+        @test all(t -> isapprox(t - Tref, 13.2 / k; atol = 1e-12),
+                  parent(_ambient_forcing(fd, glm, fill(k, n))[:temperature_air]))
+
+        # The worked hour of N68_W032 (land-ice study, 2025-08-19 15:00 UTC; landice-mascon-design.md
+        # R10): cell at 1015.4 m, glm 1, t2m 286.71 K, fit α 7.59 K, β 0.0182 K/m, γ 4.49 K,
+        # δ -0.0233 K/m. g = 4.49 - 0.0233·1015.4 = -19.17 K, so the additive ambient is 305.88 K
+        # (the multiplicative form gave 324.53 K).
+        g = 4.49 - 0.0233 * 1015.4
+        fd = stack(fill(286.71, n); z = 1015.4)
+        @test all(t -> isapprox(t, 286.71 - g; atol = 1e-12),
+                  parent(_ambient_forcing(fd, 1.0, fitted(g))[:temperature_air]))
+        @test round(286.71 - g; digits = 2) == 305.88
+
+        # Bounded by the glacier term, whatever the observed excess: 0 <= T_amb - T <= glm·|g| on
+        # warm steps; cold steps and glm = 0 are the identity.
+        Ts = [Tref + x for x in (-12.0, -0.3, 0.0, 0.2, 3.0, 17.5)]
+        fd = stack(Ts)
+        for glm in (0.0, 0.1, 0.5, 1.0), g in (0.0, -0.4, -6.0, -40.0)
+            Ta = parent(_ambient_forcing(fd, glm, fitted(g))[:temperature_air])
+            for t in 1:n
+                if Ts[t] > Tref
+                    @test Ta[t] - Ts[t] ≈ -glm * g atol = 1e-12
+                else
+                    @test Ta[t] == Ts[t]
+                end
+            end
+        end
+        @test _ambient_forcing(fd, 0.0, fitted(-3.0)) === fd
+
+        # A step without its own fit takes the smaller warming of the pooled additive and the pooled
+        # multiplicative correction. glm = 1, pooled g = -6 K, pooled k = 0.5: at an observed excess
+        # of 2 K the ratio form gives 2/0.5 - 2 = 2 K (smaller than 6); at 10 K it gives 10 K, and the
+        # additive 6 K is smaller. The fitted step ignores k.
+        pooled = AdditiveGlacierCorrection(fill(-6.0, n), [true; falses(n - 1)], fill(0.5, n))
+        Ts = [Tref + 10.0, Tref + 2.0, Tref + 10.0, Tref - 1.0, Tref + 0.5, Tref + 6.0]
+        Ta = parent(_ambient_forcing(stack(Ts), 1.0, pooled)[:temperature_air])
+        @test Ta[1] ≈ Ts[1] + 6.0 atol = 1e-12
+        @test Ta[2] ≈ Ts[2] + 2.0 atol = 1e-12
+        @test Ta[3] ≈ Ts[3] + 6.0 atol = 1e-12
+        @test Ta[4] == Ts[4]
+        @test Ta[5] ≈ Ts[5] + 0.5 atol = 1e-12
+        @test Ta[6] ≈ Ts[6] + 6.0 atol = 1e-12
+        # glm = 0.5: ratio warming E·0.25/0.75 = E/3; additive 3 K.
+        Ta = parent(_ambient_forcing(stack(Ts), 0.5, pooled)[:temperature_air])
+        @test Ta[2] ≈ Ts[2] + 2.0 / 3 atol = 1e-12
+        @test Ta[3] ≈ Ts[3] + 3.0 atol = 1e-12
+
+        # Refused: a positive or non-finite glacier term, a k outside the donor limits, mismatched
+        # lengths, a correction of the wrong length for the forcing, glm outside [0, 1].
+        @test_throws "glacier_term must be finite and <= 0" AdditiveGlacierCorrection(
+            fill(0.1, n), trues(n), ones(n))
+        @test_throws "glacier_term must be finite and <= 0" AdditiveGlacierCorrection(
+            fill(NaN, n), trues(n), ones(n))
+        @test_throws "decoupling_factor must be finite and in [0.25, 1.0]" AdditiveGlacierCorrection(
+            zeros(n), trues(n), fill(prevfloat(k_min), n))
+        @test_throws DimensionMismatch AdditiveGlacierCorrection(zeros(n), trues(n - 1), ones(n))
+        short = AdditiveGlacierCorrection(zeros(2), trues(2), ones(2))
+        @test_throws DimensionMismatch _ambient_forcing(stack(Ts), 0.5, short)
+        @test_throws "glacier_fraction must be in [0, 1]" _ambient_forcing(stack(Ts), 1.5, fitted(-1.0))
+    end
+
+    @testset "_glacier_term_at_elevation" begin
+        # The fit of the end-to-end region below: E_amb = 20 - 0.006z, k = 0.8, so α = 20, β = -0.006,
+        # γ = -(1 - k)·20 = -4 and δ = 0.0012, and g(z) = -0.2·E_amb(z).
+        n = length(_DP_TIME)
+        ti = Ti(_DP_TIME)
+        col(v) = DimArray(collect(Float64, v), ti)
+        dec(; k = fill(0.8, n), α = fill(20.0, n), β = fill(-0.006, n), γ = fill(-4.0, n),
+            δ = fill(0.0012, n)) =
+            DimStack((decoupling_factor = col(k), coef_alpha = col(α), coef_beta = col(β),
+                      coef_gamma = col(γ), coef_delta = col(δ)))
+        @test GEMB_ClimateForcing._glacier_term_at_elevation(dec(), 1000.0) ≈ fill(-2.8, n) atol = 1e-12
+        # Not reported where the fit's model is undefined at z: the reference k out of domain or
+        # unmeasured (the lapse fit was not corrected), the ice-free excess at z below the threshold
+        # (z ≥ 3250 m here, 0.5 K at 3250), k(z) above 1 (g > 0) or below the donor limit 0.25
+        # (g < -0.75·(α + βz) = -10.5 K at 1000 m). At the limit itself it is reported.
+        k_min = _DONOR_DECOUPLING_FACTOR_LIMITS[1]
+        γ_lim = -(1 - k_min) * 14.0 - 0.0012 * 1000.0
+        g = GEMB_ClimateForcing._glacier_term_at_elevation(
+            dec(; k = [0.8, NaN, 1.2, 0.8, 0.8, 0.8],
+                γ = [-4.0, -4.0, -4.0, 4.0, γ_lim - 1e-9, γ_lim]), 1000.0)
+        @test g[1] ≈ -2.8 atol = 1e-12
+        @test all(isnan, g[2:5])
+        @test g[6] ≈ -(1 - k_min) * 14.0 atol = 1e-12
+        @test GEMB_ClimateForcing._glacier_term_at_elevation(dec(), 3249.0) ≈ fill(-0.2 * 0.506, n) atol = 1e-9
+        @test all(isnan, GEMB_ClimateForcing._glacier_term_at_elevation(dec(), 3251.0))
+    end
+
+    @testset "end to end: the additive correction gives the analytic band temperature" begin
+        # The region of "any donor gives the analytic band temperature", with the donors converted
+        # additively at their own elevations: every donor still delivers 273.15 + 0.8·(20 - 18) =
+        # 274.75 K to the 3000 m band.
+        k_true = 0.8
+        zs = range(500.0, 2500.0; length = 20)
+        cells = [(z = z, glm = clamp(clamp((z - 500) / 2000, 0, 1)^2 + 0.05 * sin(3i), 0, 1))
+                 for (i, z) in enumerate(zs)]
+        E_amb(z) = 20 - 0.006z
+        T_obs(c) = _DECOUPLING_REFERENCE_TEMPERATURE + (1 - c.glm * (1 - k_true)) * E_amb(c.z)
+        acc52 = _acc(cells, c -> fill(T_obs(c), length(_DP_TIME)))
+        d = derive_decoupling_factor(acc52)
+        Γ = collect(derive_lapse_rate(acc52, d).lapse_rate)
+        k_band = collect(decoupling_factor_at_elevation(d, 3000.0))
+        ti = Ti(_DP_TIME)
+        n = length(_DP_TIME)
+        layer(v) = DimArray(fill(v, n), ti)
+        for c in cells
+            T = T_obs(c)
+            fd = DimStack((temperature_air = layer(T), pressure_air = layer(85000.0),
+                           vapor_pressure = layer(0.6 * saturation_vapor_pressure(T)),
+                           wind_speed = layer(3.0), precipitation = layer(0.0),
+                           shortwave_downward = layer(300.0), longwave_downward = layer(320.0));
+                          metadata = Dict{String,Any}("elevation" => c.z))
+            g = GEMB_ClimateForcing._glacier_term_at_elevation(d, c.z)
+            @test all(x -> isapprox(x, (k_true - 1) * E_amb(c.z); atol = 1e-9), g)
+            ambient = _ambient_forcing(fd, c.glm, AdditiveGlacierCorrection(g, trues(n), ones(n)))
+            band = _cell_forcing_at_interval(ambient, 3000.0 - c.z, k_band, Γ, 0.0, ones(n))
+            @test all(t -> isapprox(t, 274.75; atol = 1e-6), band[:temperature_air])
+        end
+    end
+
     @testset "_decouple_per_timestep" begin
         # Per-timestep k, warm and cold steps, one near-saturated warm step. Temperature follows
         # T′ = T + (k − 1)·max(T − T_ref, 0); longwave is unchanged; vapor pressure is capped at
