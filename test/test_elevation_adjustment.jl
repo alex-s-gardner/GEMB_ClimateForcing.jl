@@ -21,7 +21,7 @@ function make_forcing_stack(; n_months::Int=12)
     times = [DateTime(2020, m, 15, 12) for m in 1:n_months]
     time_dim = Ti(times)
     npts = length(times)
-    T  = fill(260.0, npts)              # K (cold, so over-ice curve is used)
+    T  = fill(260.0, npts)              # K
     P  = fill(80000.0, npts)            # Pa (high-elevation surface pressure)
     e  = fill(150.0, npts)              # Pa (low vapor pressure)
     ws = fill(6.0, npts)                # m/s
@@ -42,17 +42,9 @@ end
 @testset "Elevation Adjustment" begin
 
     @testset "Saturation vapor pressure" begin
-        # Over water at 0 °C ≈ 611.21 Pa; over ice ≈ 611.15 Pa (Buck 1981).
-        @test saturation_vapor_pressure(273.15; over_ice=false) ≈ 611.21 rtol=1e-3
-        @test saturation_vapor_pressure(273.15; over_ice=true) ≈ 611.15 rtol=1e-3
-        # Monotonic increase with temperature.
+        # IFS curve over water: 611.21 Pa at the triple point, rising with temperature.
+        @test saturation_vapor_pressure(273.16) == 611.21
         @test saturation_vapor_pressure(283.15) > saturation_vapor_pressure(273.15)
-        # Below freezing, ice curve is below water curve at the same T.
-        @test saturation_vapor_pressure(253.15; over_ice=true) <
-              saturation_vapor_pressure(253.15; over_ice=false)
-        # Auto-selection: default uses ice below 0 °C.
-        @test saturation_vapor_pressure(253.15) ==
-              saturation_vapor_pressure(253.15; over_ice=true)
     end
 
     @testset "Konzelmann clear-sky emissivity" begin
@@ -122,20 +114,13 @@ end
         @test_throws ArgumentError climate_adjust_for_elevation(stack, 100.0; lapse_rate=bad_monthly)
     end
 
-    # Holds because the fixture is sub-saturated (T=260 K, e=150 Pa ⇒ RH≈0.77 on the
-    # over-ice curve this temperature selects). For a
-    # supersaturated step the RH clamp rewrites vapor pressure and longwave even at
-    # Δz = 0; only temperature, pressure, and precipitation are identities there.
+    # Bit for bit, for every layer, whatever the input humidity: the ratio form needs no clamp.
     @testset "Zero delta is identity" begin
         stack = make_forcing_stack()
         adj = climate_adjust_for_elevation(stack, 0.0)
-        @test parent(adj[:temperature_air]) ≈ parent(stack[:temperature_air])
-        @test parent(adj[:pressure_air]) ≈ parent(stack[:pressure_air])
-        @test parent(adj[:vapor_pressure]) ≈ parent(stack[:vapor_pressure])
-        @test parent(adj[:longwave_downward]) ≈ parent(stack[:longwave_downward])
-        @test parent(adj[:precipitation]) ≈ parent(stack[:precipitation])
-        @test parent(adj[:wind_speed]) == parent(stack[:wind_speed])
-        @test parent(adj[:shortwave_downward]) == parent(stack[:shortwave_downward])
+        for v in keys(stack)
+            @test parent(adj[v]) == parent(stack[v])
+        end
     end
 
     @testset "Temperature lapse sign and magnitude" begin
@@ -186,8 +171,10 @@ end
         adj = climate_adjust_for_elevation(stack, 400.0; lapse_rate=GREENLAND_LAPSE_RATE)
         T  = parent(stack[:temperature_air]); e  = parent(stack[:vapor_pressure])
         T′ = parent(adj[:temperature_air]);   e′ = parent(adj[:vapor_pressure])
-        RH  = e ./ saturation_vapor_pressure.(T)
-        RH′ = e′ ./ saturation_vapor_pressure.(T′)
+        # Relative humidity with respect to ice below 273.16 K and water above.
+        es_ref = GEMB_ClimateForcing.saturation_vapor_pressure_reference
+        RH  = e ./ es_ref.(T)
+        RH′ = e′ ./ es_ref.(T′)
         @test RH′ ≈ RH
         @test all(e′ .< e)                     # cooling aloft ⇒ lower vapor pressure
     end

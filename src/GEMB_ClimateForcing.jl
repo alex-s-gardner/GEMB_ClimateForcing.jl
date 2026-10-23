@@ -51,6 +51,12 @@ export simulate_climate_forcing, simulation_parameter_sets,
     fit_seasonal_daily_noise, varname2longname, simulate_coeffs_disp,
     geopotential2height, geoid_undulation, GEOID_MODELS, surface_elevation
 
+# Export solar geometry and the shortwave layers derived from it (zenith angle, diffuse part,
+# cloud optical thickness). The component relations are public but unexported.
+export solar_geometry, shortwave_forcing_layers, SOLAR_CONSTANT
+public solar_declination, equation_of_time, earth_sun_distance_factor, cos_solar_zenith,
+    erbs_diffuse_fraction, cloud_transmissivity, cloud_optical_thickness
+
 # Export satellite observations (ordered from the CDS Retrieve API, not a lazy store)
 export satellite_albedo, satellite_albedo_layers, SATELLITE_ALBEDO_VARIABLES
 
@@ -82,9 +88,11 @@ export glacier_decoupling, glacier_decoupling_table, GlacierDecoupling,
 # Export the per-region downscaling-parameter fits — the inverse of the two adjustments above,
 # read back out of a region's own forcing rather than looked up
 export derive_decoupling_factor, derive_lapse_rate, decoupling_factor_at_elevation
+export GLACIER_CORRECTIONS, DEFAULT_GLACIER_CORRECTION, AdditiveGlacierCorrection
 
 # Include submodules
 include("utils.jl")
+include("solar.jl")
 include("authenticated_http_store.jl")
 # CDS Retrieve (job-based) client — needs get_cds_api_key from utils.jl.
 include("cds_retrieve.jl")
@@ -132,12 +140,12 @@ include("climate_adjustment.jl")
 # data/shaw2025_glacier_decoupling.csv.gz lookup table.
 include("glacier_decoupling.jl")
 # Ambient → on-glacier correction, applying the decoupling factor to a forcing stack.
-# Shares _rebuild_forcing / _adjust_longwave (utils.jl) with the two siblings above.
+# Shares _rebuild_forcing (utils.jl) with the two siblings above.
 include("glacier_adjustment.jl")
 # The inverse of the two adjustments above: per-region regressions that read a decoupling factor
 # and a lapse rate back out of a region's forcing. Must follow elevation_adjustment.jl, whose
 # _LAPSE_RATE_MIN/_MAX it names as the domain a fitted slope has to be clamped into, and shares
-# _rebuild_forcing / _adjust_longwave (utils.jl) with glacier_adjustment.jl.
+# _rebuild_forcing (utils.jl) with glacier_adjustment.jl.
 include("downscaling_parameters.jl")
 
 # Synthetic forcing generation

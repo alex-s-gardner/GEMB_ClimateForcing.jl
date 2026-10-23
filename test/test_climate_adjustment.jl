@@ -21,12 +21,9 @@ function make_perturb_stack(; n_months::Int=12)
     times = [DateTime(2020, m, 15, 12) for m in 1:n_months]
     time_dim = Ti(times)
     npts = length(times)
-    T  = [255.0 + 10.0 * sinpi((m - 1) / 12) for m in 1:npts]  # K, over-ice curve
+    T  = [255.0 + 10.0 * sinpi((m - 1) / 12) for m in 1:npts]  # K
     P  = fill(80000.0, npts)            # Pa
-    # 70% RH over ice at each step. A *fixed* vapor pressure would be
-    # supersaturated at the coldest step (eₛ,ice(255 K) ≈ 123 Pa), and the RH
-    # clamp in the adjustment would then legitimately break the ΔT = 0 identity.
-    e  = 0.7 .* saturation_vapor_pressure.(T)                  # Pa
+    e  = 0.7 .* saturation_vapor_pressure.(T)                  # Pa, 70 % RH
     ws = fill(6.0, npts)                # m/s
     pr = fill(0.2, npts)                # kg/m²/hr
     sw = fill(150.0, npts)              # W/m²
@@ -50,10 +47,10 @@ const _FORCING_VARS = (:temperature_air, :pressure_air, :vapor_pressure, :wind_s
     @testset "Identity perturbations" begin
         stack = make_perturb_stack()
 
-        # ΔT = 0 reproduces every variable exactly.
+        # ΔT = 0 reproduces every variable bit for bit.
         adj = temperature_adjust(stack, 0.0)
         for var in _FORCING_VARS
-            @test all(parent(adj[var]) .≈ parent(stack[var]))
+            @test parent(adj[var]) == parent(stack[var])
         end
 
         # scaling = 1 reproduces every variable exactly.
@@ -61,6 +58,67 @@ const _FORCING_VARS = (:temperature_air, :pressure_air, :vapor_pressure, :wind_s
         for var in _FORCING_VARS
             @test all(parent(adj[var]) .≈ parent(stack[var]))
         end
+    end
+
+    @testset "Identity on saturated input" begin
+        # Saturated with respect to the dewpoint's own curve (dewpoint = air temperature), cold
+        # enough to be supersaturated over ice. The identity adjustments must return vapor pressure
+        # and longwave bit for bit — nothing in them may clamp humidity.
+        T = 253.15
+        e = dewpoint_to_vapor_pressure(T)
+        ti = Ti([DateTime(2020, 1, 15, 12)])
+        layer(v) = DimArray([v], (ti,))
+        s = DimStack((temperature_air = layer(T), pressure_air = layer(70000.0),
+                      vapor_pressure = layer(e), wind_speed = layer(5.0),
+                      precipitation = layer(0.1), shortwave_downward = layer(0.0),
+                      longwave_downward = layer(200.0)); metadata = Dict("elevation" => 2000.0))
+        for adj in (climate_adjust_for_elevation(s, 0.0), temperature_adjust(s, 0.0))
+            @test parent(adj[:vapor_pressure]) == [e]
+            @test parent(adj[:longwave_downward]) == [200.0]
+        end
+    end
+
+    @testset "ΔT = 0 after decoupling is the identity" begin
+        # Decoupling cools the air at fixed vapor pressure, raising relative humidity; a following
+        # ΔT = 0 must still change nothing.
+        n = 6
+        ti = Ti(DateTime(2020, 7, 1) .+ Hour.(0:(n - 1)))
+        layer(v) = DimArray(fill(v, n), (ti,))
+        T = 285.15
+        s = DimStack((temperature_air = layer(T), pressure_air = layer(85000.0),
+                      vapor_pressure = layer(0.95 * saturation_vapor_pressure(T)),
+                      wind_speed = layer(3.0), precipitation = layer(0.0),
+                      shortwave_downward = layer(400.0), longwave_downward = layer(330.0));
+                     metadata = Dict("elevation" => 1500.0))
+        decoupled = climate_adjust_for_glacier(s, 0.6)
+        again = temperature_adjust(decoupled, 0.0)
+        for var in _FORCING_VARS
+            @test parent(again[var]) == parent(decoupled[var])
+        end
+    end
+
+    @testset "Decoupling caps vapor at saturation of the cooled air" begin
+        # Decoupling cools air toward 273.15 K: T′ = 273.15 + k·(T − 273.15). Water-saturated input
+        # cooled to T′ is capped at the carry curve's saturation, over ice below 273.16 K and over
+        # water above. IFS eq. 7.5 constants written out independently.
+        es_w(T) = 611.21 * exp(17.502 * (T - 273.16) / (T - 32.19))
+        es_i(T) = 611.21 * exp(22.587 * (T - 273.16) / (T + 0.7))
+        ti = Ti([DateTime(2020, 7, 1, 12)])
+        layer(v) = DimArray([v], (ti,))
+        stack_at(T) = DimStack((temperature_air = layer(T), pressure_air = layer(85000.0),
+                                vapor_pressure = layer(es_w(T)), wind_speed = layer(3.0),
+                                precipitation = layer(0.0), shortwave_downward = layer(400.0),
+                                longwave_downward = layer(330.0)); metadata = Dict("elevation" => 1500.0))
+        # T = 274.15 K, k = 0.005 ⇒ T′ = 273.155 K, below 273.16 K: capped at ice saturation.
+        cold = climate_adjust_for_glacier(stack_at(274.15), 0.005)
+        T′ = parent(cold[:temperature_air])[1]
+        @test T′ ≈ 273.155 rtol = 1e-12
+        @test parent(cold[:vapor_pressure])[1] ≈ es_i(T′) rtol = 1e-12
+        # T = 283.15 K, k = 0.6 ⇒ T′ = 279.15 K: capped at water saturation.
+        warm = climate_adjust_for_glacier(stack_at(283.15), 0.6)
+        T′w = parent(warm[:temperature_air])[1]
+        @test T′w ≈ 279.15 rtol = 1e-12
+        @test parent(warm[:vapor_pressure])[1] ≈ es_w(T′w) rtol = 1e-12
     end
 
     @testset "Temperature offset is exact" begin
@@ -86,13 +144,15 @@ const _FORCING_VARS = (:temperature_air, :pressure_air, :vapor_pressure, :wind_s
         stack = make_perturb_stack()
         T = parent(stack[:temperature_air])
         e = parent(stack[:vapor_pressure])
-        RH = e ./ saturation_vapor_pressure.(T)
+        # Relative humidity with respect to ice below 273.16 K and water above.
+        es_ref = GEMB_ClimateForcing.saturation_vapor_pressure_reference
+        RH = e ./ es_ref.(T)
 
         for ΔT in (-4.0, 2.0, 6.0)
             adj = temperature_adjust(stack, ΔT)
             T′ = parent(adj[:temperature_air])
             e′ = parent(adj[:vapor_pressure])
-            RH′ = e′ ./ saturation_vapor_pressure.(T′)
+            RH′ = e′ ./ es_ref.(T′)
             @test all(RH′ .≈ RH)
         end
     end

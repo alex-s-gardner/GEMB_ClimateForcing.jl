@@ -24,6 +24,8 @@ Load climate forcing data from specified dataset and return a DimStack with clim
 - `DimStack`: Stack with climate forcing variables as DimArrays
   - `temperature_air`, `pressure_air`, `vapor_pressure`, `wind_speed`,
     `precipitation`, `shortwave_downward`, `longwave_downward`
+  - `solar_zenith_angle` (degrees), `shortwave_downward_diffuse` (W/m²) and
+    `cloud_optical_thickness`, derived from the shortwave by [`shortwave_forcing_layers`](@ref)
   - Metadata includes location, dataset info, and observation heights
 
 # Examples
@@ -122,7 +124,8 @@ fetched.
 - `cache_path::Union{String,Nothing}=nothing`: Zarr.CachingStore cache directory
 
 # Returns
-- `Raster{Int64}` with `X` (longitude, 0–359.9°E) and `Y` (latitude, 90→-90°N) dims.
+- `Raster{Int64}` with `X` (longitude, −179.9…180°E) and `Y` (latitude, −90…90°N) dims, both
+  ascending as stored.
   Chunk IDs are zero-based integers in `[0, n_lon_chunks*n_lat_chunks - 1]`. The
   `metadata` dict contains `"chunk_strategy"`, `"lon_chunk_size"`, `"lat_chunk_size"`,
   `"n_lon_chunks"`, `"n_lat_chunks"`, and `"total_spatial_chunks"`.
@@ -135,8 +138,8 @@ token = ENV["CDS_API_KEY"]
 geo_map  = climate_chunk_map(:era5land; chunk_strategy=:geo,  token=token)
 time_map = climate_chunk_map(:era5land; chunk_strategy=:time, token=token)
 
-# Crop to Greenland (0–360 lon convention: -38°E → 322°E)
-greenland = geo_map[X=310..360, Y=59..84]
+# Crop to Greenland
+greenland = geo_map[X=-75..-10, Y=59..84]
 ```
 """
 function climate_chunk_map(

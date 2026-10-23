@@ -65,6 +65,29 @@ end
             (:albedo_wsa, :n_valid_observations_wsa, :k_used_wsa)
     end
 
+    @testset "the darkest 5 % of 400 retrievals, by hand" begin
+        # 400 kept retrievals at 0.300, 0.301, …, 0.699: the darkest ceil(0.05·400) = 20 average
+        # to 0.3095. Thirty retrievals below the 0.25 floor and thirty darker ones with a rejected
+        # QA class are interleaved, and neither is counted.
+        mktempdir() do root
+            cells = [(17, 2, 100, 100)]
+            rows = Pair{Date,Vector{Tuple{Int,Int,Int}}}[]
+            d = Date(2001, 1, 1)
+            for (i, dn) in enumerate(Iterators.reverse(300:699))
+                push!(rows, d => [(dn, dn, 0)]); d += Day(1)
+                if i <= 30
+                    push!(rows, d => [(200, 200, 0)]); d += Day(1)   # below the floor
+                    push!(rows, d => [(150, 150, 1)]); d += Day(1)   # rejected QA
+                end
+            end
+            _write_cache(root, cells, rows)
+            ice = pool_ice_albedo_from_cache(cells; cache_path = root, progress = false)
+            @test ice[:albedo_bsa][1] ≈ 0.3095 atol = 1e-6
+            @test ice[:n_valid_observations_bsa][1] == 400
+            @test ice[:k_used_bsa][1] == 20
+        end
+    end
+
     @testset "pooled == brute force over all dates" begin
         mktempdir() do root
             cells = sort([(17, 2, 100, 100), (17, 2, 100, 101), (17, 2, 100, 102)])

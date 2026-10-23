@@ -346,7 +346,7 @@ specifies its saturation formula explicitly — Tetens/Bolton (1980) with a phas
 e_s = 6.108 · 10^(9.5·T/(T+265.5))    T >  0 °C   (over ice)
 e_s = 6.108 · 10^(7.5·T/(T+237.3))    T ≤  0 °C
 ```
-which is worth comparing against the Magnus/Buck form already in `src/utils.jl`.
+which is worth comparing against the IFS curve over water in `src/utils.jl`.
 
 **Implication for us: constant RH is the wrong interim assumption.** `temperature_adjust`'s
 constant-RH propagation would scale `e` down with `T`, but SM10 shows the KBL *adds* moisture
@@ -356,10 +356,9 @@ sub-freezing branch is near-identity anyway, so the cleanest defensible choice i
 **leave `vapor_pressure` untouched** by the glacier correction rather than propagate ΔT
 through it, and document that a full SM10 `e` scheme needs an FPL raster.
 
-- **Longwave.** Cooling the air lowers incoming longwave. `temperature_adjust` already
-  handles this via the Konzelmann clear-sky emissivity with the cloud increment preserved.
-- **Longwave.** Cooling the air lowers incoming longwave. `temperature_adjust` already
-  handles this via the Konzelmann clear-sky emissivity with the cloud increment preserved.
+- **Longwave.** Left unchanged by the glacier correction. The decoupled layer is shallow, so
+  cooling it changes little of the column that emits downwelling longwave, and ERA5-Land's
+  longwave does not depend on the glacier mask that `k` is measured from.
 - **Wind speed.** Genuinely problematic. A katabatic layer produces a low-level jet at
   1–5 m above the surface that reanalysis cannot represent, and Shaw et al. (2024) show
   glacier winds can *enhance* turbulent heat transfer even while the air is cooler —
@@ -408,6 +407,14 @@ cost. Verify any implementation against SM10's Table 5/Table 6 site values (both
 above) before trusting it, and follow the same conventions as the implemented path:
 scalar/lookup arguments, cumulative metadata so repeated calls compose, validation re-run on
 the result, and an exact identity at `k = 1`.
+
+**Glacier correction of a reanalysis cell (downscaling chain).** Before a cell's forcing is
+lapsed to a glacier band it is taken to its ice-free equivalent, undoing the damping ERA5-Land
+already applies to its glacier-masked fraction `glm`. The default is additive,
+`T_ambient = T − glm·(γ + δz)` with the decoupling fit's glacier term at the cell's elevation
+(`_ambient_forcing`, `AdditiveGlacierCorrection`, `GLACIER_CORRECTIONS`), which carries the cell's
+residual from the fit unscaled; the multiplicative form `E_ambient = E_obs / (1 − glm(1 − k))`
+scales that residual by up to `1/0.25`.
 
 Three caveats, all surfaced in the `climate_adjust_for_glacier` docstring:
 

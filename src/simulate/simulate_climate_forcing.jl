@@ -356,8 +356,24 @@ Simulate clear-sky downwelling shortwave irradiance [W m-2] using the Haurwitz m
 Matches MATLAB's `simulate_shortwave_irradiance.m`.
 """
 function simulate_shortwave_irradiance(dec_year::Vector{Float64}, latitude::Float64)
-    n = length(dec_year)
+    cos_theta_z = _simulated_cos_zenith(dec_year, latitude)
 
+    # Haurwitz model, zero with the Sun below the horizon.
+    shortwave_downward = zeros(length(dec_year))
+    for i in eachindex(cos_theta_z, shortwave_downward)
+        ctz = cos_theta_z[i]
+        if ctz > 0.0
+            shortwave_downward[i] = 1098.0 * ctz * exp(-0.057 / ctz)
+        end
+    end
+    return shortwave_downward
+end
+
+# Instantaneous cosine of the solar zenith angle at each decimal-year time, with the decimal
+# year's hour taken as local solar time and the declination from Cooper's equation — the geometry
+# of MATLAB's `simulate_shortwave_irradiance.m`, shared by the irradiance and the zenith-angle
+# layer so the two agree.
+function _simulated_cos_zenith(dec_year::Vector{Float64}, latitude::Float64)
     # 1. Time Conversion (Decimal Year -> Day & Hour)
     year_val = floor.(Int, dec_year)
     frac_year = dec_year .- year_val
@@ -386,20 +402,7 @@ function simulate_shortwave_irradiance(dec_year::Vector{Float64}, latitude::Floa
     omega = deg2rad.(15.0 .* (solar_hour .- 12.0))
 
     # Cosine of Solar Zenith Angle
-    cos_theta_z = (sin(phi) .* sin.(delta)) .+ (cos(phi) .* cos.(delta) .* cos.(omega))
-
-    # 3. Calculate Irradiance (Haurwitz Model)
-    shortwave_downward = zeros(n)
-    daylight_mask = cos_theta_z .> 0.0
-
-    for i in 1:n
-        if daylight_mask[i]
-            ctz = cos_theta_z[i]
-            shortwave_downward[i] = 1098.0 * ctz * exp(-0.057 / ctz)
-        end
-    end
-
-    return shortwave_downward
+    return (sin(phi) .* sin.(delta)) .+ (cos(phi) .* cos.(delta) .* cos.(omega))
 end
 
 #=============================================================================
@@ -619,7 +622,11 @@ based on predefined parameter sets.
 A `DimStack` containing synthetic time series and metadata, suitable for conversion
 to `GEMB.ClimateForcing` via `GEMB.ClimateForcing(ds)` when GEMB.jl is loaded.
 
-Matches MATLAB's `simulate_climate_forcing.m`.
+The seven meteorological layers follow MATLAB's `simulate_climate_forcing.m`, except that vapor
+pressure is formed against the saturation curve over water of
+[`saturation_vapor_pressure`](@ref). The stack also carries the three shortwave layers
+`climate_forcing` returns — `solar_zenith_angle`, `shortwave_downward_diffuse` and
+`cloud_optical_thickness` — from the same instantaneous geometry the simulated shortwave uses.
 """
 function simulate_climate_forcing(set_id::String, time_step_hours::Int=0)
     # Load climate simulation parameter set
@@ -675,6 +682,16 @@ function simulate_climate_forcing(set_id::String, time_step_hours::Int=0)
     # Screen-level vapor pressure [Pa]
     vapor_pressure = relative_humidity_to_vapor_pressure(temperature_air, relative_humidity)
 
+    # The shortwave layers GEMB reads beside the shortwave, from the same instantaneous geometry:
+    # zenith angle (90 with the Sun down), and the diffuse part and cloud optical thickness from the
+    # clearness index against S₀·cos θ, τ against the clear sky at the simulated pressure and vapor
+    # pressure. Deterministic, so its place in the sequence leaves the random draws unchanged.
+    cos_zenith = _simulated_cos_zenith(dec_year, location_parameters.latitude)
+    solar_zenith_angle = [c > 0 ? acosd(min(c, 1.0)) : 90.0 for c in cos_zenith]
+    shortwave_downward_diffuse, cloud_optical_thickness =
+        _partition_shortwave_series(shortwave_downward, SOLAR_CONSTANT .* max.(cos_zenith, 0.0),
+                                    solar_zenith_angle, pressure_air, vapor_pressure)
+
     # Downward longwave radiation [W m-2]
     longwave_downward = simulate_longwave_irradiance(temperature_air, vapor_pressure)
     longwave_downward .+= simulate_longwave_irradiance_delta(rng, dec_year, coeffs.longwave_downward)
@@ -704,7 +721,13 @@ function simulate_climate_forcing(set_id::String, time_step_hours::Int=0)
         shortwave_downward = DimArray(shortwave_downward, (time_dim,);
                                      metadata=Dict("units" => "W/m²", "long_name" => "surface solar radiation downward")),
         longwave_downward = DimArray(longwave_downward, (time_dim,);
-                                    metadata=Dict("units" => "W/m²", "long_name" => "surface thermal radiation downward"))
+                                    metadata=Dict("units" => "W/m²", "long_name" => "surface thermal radiation downward")),
+        solar_zenith_angle = DimArray(solar_zenith_angle, (time_dim,);
+                                      metadata=Dict("units" => "degrees", "long_name" => "solar zenith angle")),
+        shortwave_downward_diffuse = DimArray(shortwave_downward_diffuse, (time_dim,);
+                                              metadata=Dict("units" => "W/m²", "long_name" => "diffuse surface solar radiation downward")),
+        cloud_optical_thickness = DimArray(cloud_optical_thickness, (time_dim,);
+                                           metadata=Dict("units" => "1", "long_name" => "cloud optical thickness"))
     ); metadata = Dict(
         "latitude" => location_parameters.latitude,
         "longitude" => location_parameters.longitude,
