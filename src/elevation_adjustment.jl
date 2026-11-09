@@ -297,6 +297,8 @@ reanalysis grid cell and the desired target elevation (downscaling).
   All resolved values must lie within physically plausible bounds (−30 to 25
   K/km); an out-of-range value raises an `ArgumentError` (usually a K/m-vs-K/km
   unit slip or a sign error).
+- `emissivity_minimum=LONGWAVE_EMISSIVITY_MINIMUM`: floor on the adjusted forcing's bulk longwave
+  emissivity `LW/(σT⁴)`, passed to [`validate_climate_forcing_units`](@ref).
 - `precip_scaling_method=nothing`: precipitation elevation treatment.
   - `nothing` (default) — precipitation unchanged, matching the RACMO2.3
     downscaling studies (Noël et al. 2016–2025).
@@ -362,6 +364,7 @@ function climate_adjust_for_elevation(
     delta_elevation::Real;
     lapse_rate=6.5,
     precip_scaling_method::Union{Symbol,Nothing}=nothing,
+    emissivity_minimum::Real=LONGWAVE_EMISSIVITY_MINIMUM,
 )
     Δz = Float64(delta_elevation)
 
@@ -434,7 +437,7 @@ function climate_adjust_for_elevation(
                                 precipitation=precip′, longwave_downward=LW′)
 
     # Re-validate physical ranges after adjustment.
-    validate_climate_forcing_units(adjusted)
+    validate_climate_forcing_units(adjusted; emissivity_minimum)
 
     return adjusted
 end

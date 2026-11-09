@@ -87,6 +87,13 @@ const _MIN_CELLS_DEFAULT = 8
 # to be acceptable.
 const _LAPSE_RATE_LIMITS = (_LAPSE_RATE_MIN, _LAPSE_RATE_MAX)
 
+# Floor on the bulk longwave emissivity `LW/(σT⁴)` of one donor cell's lapsed series, looser than the
+# `LONGWAVE_EMISSIVITY_MINIMUM` that bounds the area-weighted band GEMB runs. A single cell-hour sits
+# well below the band mean it is averaged into: in the Khumbu tile the lowest lapsed cell-hour is 0.195
+# where the lowest hour of the bands those cells make up is 0.39. The ε ≈ 1e-4 that a J/m² to W/m²
+# conversion applied twice produces is far below this and is also caught by the absolute longwave bounds.
+const _DONOR_CELL_LONGWAVE_EMISSIVITY_MINIMUM = 0.10
+
 # The domain `climate_adjust_for_glacier` accepts for `k`, half-open at zero: 1 is no damping and
 # anything above it warms the surface instead, while 0 would erase the warm excess entirely. Same
 # division of labour as `_LAPSE_RATE_LIMITS` — the fit reports outside it, the application clamps
@@ -892,7 +899,8 @@ function _cell_forcing_at_interval(fd, delta_elevation, decoupling_factor, lapse
                                    glacier_fraction, donor_decoupling_factor)
     _check_decoupling_series(decoupling_factor, fd, "decoupling_factor")
     ambient = _ambient_forcing(fd, glacier_fraction, donor_decoupling_factor)
-    lapsed = climate_adjust_for_elevation(ambient, delta_elevation; lapse_rate)
+    lapsed = climate_adjust_for_elevation(ambient, delta_elevation; lapse_rate,
+                                          emissivity_minimum = _DONOR_CELL_LONGWAVE_EMISSIVITY_MINIMUM)
     return _decouple_per_timestep(lapsed, decoupling_factor)
 end
 

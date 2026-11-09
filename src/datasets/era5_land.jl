@@ -212,10 +212,15 @@ covers the high side.
 Every layer of the stack, including any beyond these seven, must be finite: a `NaN` or `Inf`
 anywhere fails validation by name.
 
+# Keyword arguments
+- `emissivity_minimum = LONGWAVE_EMISSIVITY_MINIMUM`: floor on the bulk emissivity `LW/(σT⁴)`. The
+  default bounds a band or a reanalysis cell; a caller validating a single donor cell's lapsed series
+  passes a looser floor (see `_DONOR_CELL_LONGWAVE_EMISSIVITY_MINIMUM`).
+
 # Throws
 - `ArgumentError` if any value is non-finite or any variable is outside its expected range
 """
-function validate_climate_forcing_units(stack::DimStack)
+function validate_climate_forcing_units(stack::DimStack; emissivity_minimum::Real = LONGWAVE_EMISSIVITY_MINIMUM)
     # Extract data vectors from DimStack
     temperature_air = parent(stack[:temperature_air])
     pressure_air = parent(stack[:pressure_air])
@@ -292,8 +297,8 @@ function validate_climate_forcing_units(stack::DimStack)
     end
     # Emissivity, not irradiance, is what bounds the low side — see this function's docstring.
     ε_min = _minimum_bulk_emissivity(longwave_downward, temperature_air)
-    if ε_min < LONGWAVE_EMISSIVITY_MINIMUM
-        push!(errors, "longwave_downward: bulk emissivity LW/(σT⁴) expected ≥ $(LONGWAVE_EMISSIVITY_MINIMUM), " *
+    if ε_min < emissivity_minimum
+        push!(errors, "longwave_downward: bulk emissivity LW/(σT⁴) expected ≥ $(emissivity_minimum), " *
                       "got $(ε_min) — below the dry clear-sky limit of the Konzelmann parameterization, " *
                       "so this irradiance is too small for its air temperature")
     end
