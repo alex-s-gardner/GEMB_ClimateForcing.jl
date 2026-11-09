@@ -20,7 +20,8 @@ using GEMB_ClimateForcing: _MIN_AMBIENT_EXCESS, _MIN_CELLS_DEFAULT, _LAPSE_RATE_
     _DECOUPLING_FACTOR_LIMITS, _DECOUPLING_REFERENCE_TEMPERATURE, _solve_sym4, _r2,
     _make_applicable, _decouple_per_timestep, saturation_vapor_pressure,
     _downscaling_sums, _accumulate_downscaling_cell!, _cell_forcing_at_interval,
-    _ambient_forcing, _DONOR_DECOUPLING_FACTOR_LIMITS
+    _ambient_forcing, _DONOR_DECOUPLING_FACTOR_LIMITS, _DONOR_CELL_LONGWAVE_EMISSIVITY_MINIMUM,
+    LONGWAVE_EMISSIVITY_MINIMUM, validate_climate_forcing_units
 
 const _DP_TIME = collect(DateTime(2000, 1, 1):Hour(1):DateTime(2000, 1, 1, 5))
 
@@ -443,6 +444,23 @@ end
         for v in keys(cold)
             @test parent(same[v]) == parent(cold[v])
         end
+        # A donor cell's lapsed series is validated against the looser donor-cell emissivity floor:
+        # a dry cold hour at ε = 0.15 passes here and fails the band floor; ε ≈ 1e-4, what a J/m² to
+        # W/m² conversion applied twice leaves, fails both.
+        σT4(T) = 5.670374419e-8 * T^4
+        dry(ε) = DimStack((temperature_air = layer(Tc), pressure_air = layer(70000.0),
+                           vapor_pressure = layer(dewpoint_to_vapor_pressure(Tc)),
+                           wind_speed = layer(5.0), precipitation = layer(0.0),
+                           shortwave_downward = layer(0.0), longwave_downward = layer(ε * σT4(Tc)));
+                          metadata = Dict{String,Any}("elevation" => 2000.0))
+        @test _DONOR_CELL_LONGWAVE_EMISSIVITY_MINIMUM < 0.15 < LONGWAVE_EMISSIVITY_MINIMUM
+        @test parent(_cell_forcing_at_interval(dry(0.15), 0.0, ones(n), 6.5, 0.5, ones(n))[:longwave_downward]) ≈
+              fill(0.15 * σT4(Tc), n)
+        @test_throws "bulk emissivity LW/(σT⁴) expected ≥ $(LONGWAVE_EMISSIVITY_MINIMUM)" validate_climate_forcing_units(dry(0.15))
+        @test validate_climate_forcing_units(dry(0.15); emissivity_minimum = _DONOR_CELL_LONGWAVE_EMISSIVITY_MINIMUM)
+        @test_throws ArgumentError _cell_forcing_at_interval(dry(1e-4), 0.0, ones(n), 6.5, 0.5, ones(n))
+        @test_throws ArgumentError validate_climate_forcing_units(dry(1e-4))
+
         # A step at or below melting is never moved, whatever k: the fit uses only cells above
         # melting, and under its model a cell is above melting exactly when its ambient air is.
         k_min = _DONOR_DECOUPLING_FACTOR_LIMITS[1]
