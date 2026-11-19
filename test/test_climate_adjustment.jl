@@ -44,6 +44,36 @@ const _FORCING_VARS = (:temperature_air, :pressure_air, :vapor_pressure, :wind_s
 
 @testset "Climate Adjustment (temperature / precipitation)" begin
 
+    @testset "snowfall_fraction (Jennings et al. 2018 bivariate model)" begin
+        es(T) = GEMB_ClimateForcing.saturation_vapor_pressure(T)
+        # p = 0.5 where α + β·Tₛ + γ·RH = 0: 0.74 °C at 100 % RH and 3.93 °C at 50 %.
+        @test snowfall_fraction(273.15 + 10.04 / 1.41 - 0.09 * 100 / 1.41, es(273.15 + 10.04 / 1.41 - 0.09 * 100 / 1.41)) ≈ 0.5
+        T50 = 273.15 + (10.04 - 0.09 * 50) / 1.41
+        @test snowfall_fraction(T50, 0.5 * es(T50)) ≈ 0.5
+        # Monotone: colder and drier is snowier; humidity above saturation is capped at 100 %.
+        @test snowfall_fraction(268.15, 0.9 * es(268.15)) > snowfall_fraction(278.15, 0.9 * es(278.15))
+        @test snowfall_fraction(275.15, 0.5 * es(275.15)) > snowfall_fraction(275.15, 0.9 * es(275.15))
+        @test snowfall_fraction(275.15, 1.3 * es(275.15)) == snowfall_fraction(275.15, es(275.15))
+
+        stack = make_perturb_stack()
+        f = with_snowfall_fraction(stack)
+        @test parent(f[:snowfall_fraction]) ≈ snowfall_fraction.(parent(stack[:temperature_air]), parent(stack[:vapor_pressure]))
+        @test all(v -> parent(f[v]) == parent(stack[v]), _FORCING_VARS)
+
+        # temperature_adjust recomputes the layer from the adjusted state, or holds it.
+        warm = temperature_adjust(f, 3.0)
+        @test parent(warm[:snowfall_fraction]) ≈ snowfall_fraction.(parent(warm[:temperature_air]), parent(warm[:vapor_pressure]))
+        @test all(parent(warm[:snowfall_fraction]) .<= parent(f[:snowfall_fraction]))
+        held = temperature_adjust(f, 3.0; hold_precipitation_phase=true)
+        @test parent(held[:snowfall_fraction]) == parent(f[:snowfall_fraction])
+        @test parent(held[:temperature_air]) == parent(warm[:temperature_air])
+        # ΔT = 0 leaves it bit for bit; a stack without the layer gains none.
+        @test parent(temperature_adjust(f, 0.0)[:snowfall_fraction]) == parent(f[:snowfall_fraction])
+        @test !haskey(temperature_adjust(stack, 3.0), :snowfall_fraction)
+        # precipitation_adjust carries it through.
+        @test parent(precipitation_adjust(f, 2.0)[:snowfall_fraction]) == parent(f[:snowfall_fraction])
+    end
+
     @testset "Identity perturbations" begin
         stack = make_perturb_stack()
 

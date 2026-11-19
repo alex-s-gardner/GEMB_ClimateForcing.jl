@@ -39,6 +39,7 @@ using CodecZlib
 # Export main interface
 export climate_forcing, climate_chunk_map, get_cds_api_key, climate_adjust_for_elevation,
     temperature_adjust, precipitation_adjust,
+    snowfall_fraction, snowfall_fraction_layer, with_snowfall_fraction, JENNINGS2018_BIVARIATE,
     empirical_lapse_rate, climate_model_invariant, ERA5_LAND_INVARIANT_PARAMETERS,
     GREENLAND_LAPSE_RATE, ARCTIC_LAPSE_RATE, ANTARCTICA_LAPSE_RATE
 
@@ -136,6 +137,8 @@ include("elevation_adjustment.jl")
 # Direct temperature / precipitation perturbations — reuses the saturation-vapor
 # and emissivity helpers from elevation_adjustment.jl.
 include("climate_adjustment.jl")
+# Precipitation phase from air temperature and humidity (Jennings et al. 2018).
+include("precipitation_phase.jl")
 # Shaw et al. (2025) per-glacier decoupling factors, read from the vendored
 # data/shaw2025_glacier_decoupling.csv.gz lookup table.
 include("glacier_decoupling.jl")

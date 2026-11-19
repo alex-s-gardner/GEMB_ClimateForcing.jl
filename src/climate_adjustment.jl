@@ -40,7 +40,7 @@ using Statistics
 
 """
     temperature_adjust(climate_forcing_original::DimStack,
-                       delta_temperature::Real) -> DimStack
+                       delta_temperature::Real; hold_precipitation_phase=false) -> DimStack
 
 Apply a uniform air-temperature offset to a climate-forcing `DimStack`, and
 propagate it through the variables that depend on temperature.
@@ -58,6 +58,11 @@ and additionally corrects surface pressure.
   `precipitation`, `shortwave_downward`, `longwave_downward`.
 - `delta_temperature::Real`: temperature offset in **K**, added to every time
   step. Positive = warming, negative = cooling.
+- `hold_precipitation_phase`: what happens to a `snowfall_fraction` layer
+  ([`with_snowfall_fraction`](@ref)) the stack carries. `false` recomputes it from the adjusted
+  temperature and vapor pressure, so the offset moves the snow–rain partition as a warmer climate
+  would. `true` keeps it as it was, so the offset acts on the energy balance only. A stack without
+  the layer is unaffected either way.
 
 # Returns
 - A new `DimStack` on the same time dimension with adjusted `temperature_air`,
@@ -115,7 +120,8 @@ warmer_wetter = precipitation_adjust(warmer, 1.15)
 
 See also [`precipitation_adjust`](@ref), [`climate_adjust_for_elevation`](@ref).
 """
-function temperature_adjust(climate_forcing_original::DimStack, delta_temperature::Real)
+function temperature_adjust(climate_forcing_original::DimStack, delta_temperature::Real;
+                            hold_precipitation_phase::Bool=false)
     ΔT = Float64(delta_temperature)
 
     # Source variables as DimArrays. Broadcasting preserves the time dimension.
@@ -149,6 +155,9 @@ function temperature_adjust(climate_forcing_original::DimStack, delta_temperatur
     # Re-validate physical ranges after adjustment.
     validate_climate_forcing_units(adjusted)
 
+    if haskey(adjusted, :snowfall_fraction) && !hold_precipitation_phase
+        adjusted = with_snowfall_fraction(adjusted)
+    end
     return adjusted
 end
 
