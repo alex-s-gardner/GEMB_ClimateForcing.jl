@@ -72,6 +72,23 @@ const _FORCING_VARS = (:temperature_air, :pressure_air, :vapor_pressure, :wind_s
         @test !haskey(temperature_adjust(stack, 3.0), :snowfall_fraction)
         # precipitation_adjust carries it through.
         @test parent(precipitation_adjust(f, 2.0)[:snowfall_fraction]) == parent(f[:snowfall_fraction])
+        # Every adjustment that changes temperature or humidity recomputes it.
+        for g in (climate_adjust_for_elevation(f, 400.0), climate_adjust_for_glacier(f, 0.8))
+            @test parent(g[:snowfall_fraction]) ≈
+                  snowfall_fraction.(parent(g[:temperature_air]), parent(g[:vapor_pressure]))
+        end
+    end
+
+    @testset "precipitation_phase of the forcing loaders" begin
+        @test haskey(simulate_climate_forcing("test_1", 3), :snowfall_fraction)
+        ds = simulate_climate_forcing("test_1", 3; precipitation_phase=:threshold)
+        @test !haskey(ds, :snowfall_fraction)
+        @test_throws "precipitation_phase must be one of" simulate_climate_forcing("test_1", 3;
+                                                                                  precipitation_phase=:linear)
+        f = with_snowfall_fraction(make_perturb_stack())
+        bad = GEMB_ClimateForcing._rebuild_forcing(f, metadata(f); hold_snowfall_fraction=true,
+                                                   snowfall_fraction=fill(1.5, length(f[:snowfall_fraction])))
+        @test_throws "snowfall_fraction: expected [0, 1]" GEMB_ClimateForcing.validate_climate_forcing_units(bad)
     end
 
     @testset "Identity perturbations" begin

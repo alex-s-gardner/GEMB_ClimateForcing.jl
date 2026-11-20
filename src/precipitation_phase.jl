@@ -40,13 +40,35 @@ function snowfall_fraction(temperature_air::Real, vapor_pressure::Real)
 end
 
 """
+    PRECIPITATION_PHASES
+
+The precipitation-phase schemes a forcing stack can be built with:
+- `:jennings2018` (the default): the stack carries a `snowfall_fraction` layer
+  ([`with_snowfall_fraction`](@ref)), and GEMB splits each step's precipitation by it;
+- `:threshold`: no layer, and GEMB splits precipitation at its rain temperature threshold.
+"""
+const PRECIPITATION_PHASES = (:jennings2018, :threshold)
+
+function _check_precipitation_phase(precipitation_phase::Symbol)
+    precipitation_phase in PRECIPITATION_PHASES || throw(ArgumentError(
+        "precipitation_phase must be one of $(PRECIPITATION_PHASES), got $(repr(precipitation_phase))"))
+    return precipitation_phase
+end
+
+# The stack a loader returns under `precipitation_phase`.
+_with_precipitation_phase(stack::DimStack, precipitation_phase::Symbol) =
+    precipitation_phase === :jennings2018 ? with_snowfall_fraction(stack) : stack
+
+"""
     snowfall_fraction_layer(stack::DimStack) -> DimArray
 
 [`snowfall_fraction`](@ref) at every step of a forcing stack, from its `temperature_air` and
 `vapor_pressure`, on the stack's time dimension.
 """
 snowfall_fraction_layer(stack::DimStack) =
-    snowfall_fraction.(stack[:temperature_air], stack[:vapor_pressure])
+    rebuild(snowfall_fraction.(stack[:temperature_air], stack[:vapor_pressure]);
+            metadata=Dict("units" => "1",
+                          "long_name" => "fraction of precipitation falling as snow (Jennings et al. 2018)"))
 
 """
     with_snowfall_fraction(stack::DimStack) -> DimStack

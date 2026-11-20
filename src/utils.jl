@@ -200,7 +200,7 @@ _cap_vapor_pressure(e, T, T′) = T′ < T ? min(e, saturation_vapor_pressure_re
 # ----------------------------------------------------------------------------
 
 """
-    _rebuild_forcing(stack, new_metadata; changed_layers...) -> DimStack
+    _rebuild_forcing(stack, new_metadata; hold_snowfall_fraction=false, changed_layers...) -> DimStack
 
 Rebuild a forcing `DimStack` with new stack metadata, replacing only the named layers.
 
@@ -209,9 +209,15 @@ carries the rest through untouched rather than making each call site re-enumerat
 `rebuild` preserves each layer's own metadata, so broadcast results (which drop it) come
 back correctly annotated without threading it by hand.
 
+A `snowfall_fraction` layer is a function of `temperature_air` and `vapor_pressure`, so when either
+of them is replaced it is recomputed from the new values ([`snowfall_fraction_layer`](@ref)) and
+never describes a different air mass from the one beside it. `hold_snowfall_fraction = true` keeps
+it as it was instead, for a perturbation meant to act on the energy balance alone.
+
 Values may be `DimArray`s or plain arrays — only the underlying data is used.
 """
-function _rebuild_forcing(stack::DimStack, new_metadata; changed_layers...)
+function _rebuild_forcing(stack::DimStack, new_metadata; hold_snowfall_fraction::Bool=false,
+                          changed_layers...)
     changed = NamedTuple(changed_layers)
     unknown = setdiff(keys(changed), keys(stack))
     isempty(unknown) ||
@@ -221,8 +227,13 @@ function _rebuild_forcing(stack::DimStack, new_metadata; changed_layers...)
     # leaves those to be wrapped a second time, and a doubly wrapped layer's `parent` is a `DimArray`
     # rather than the values a consumer asked for — which reads as an array of numbers everywhere until
     # something dispatches on `Vector`.
-    return rebuild(stack; data=map(parent, merge(NamedTuple(stack), changed)),
-                   metadata=new_metadata)
+    adjusted = rebuild(stack; data=map(parent, merge(NamedTuple(stack), changed)),
+                       metadata=new_metadata)
+    if haskey(stack, :snowfall_fraction) && !hold_snowfall_fraction &&
+       (haskey(changed, :temperature_air) || haskey(changed, :vapor_pressure))
+        adjusted = with_snowfall_fraction(adjusted)
+    end
+    return adjusted
 end
 
 """

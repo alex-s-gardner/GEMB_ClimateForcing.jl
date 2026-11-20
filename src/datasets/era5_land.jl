@@ -186,7 +186,8 @@ Validate that climate forcing variables in a DimStack have physically reasonable
 - `longwave_downward`: W/m², `≤ $(LONGWAVE_ABSOLUTE_MAXIMUM)`, and bulk emissivity `LW/(σT⁴) ≥ $(LONGWAVE_EMISSIVITY_MINIMUM)`
 - `vapor_pressure`: Pascal (Pa), range [0, 10000]
 - where present: `solar_zenith_angle` in [0, 90] degrees, `shortwave_downward_diffuse` in
-  [0, `shortwave_downward`] W/m², `cloud_optical_thickness` in [0, $(CLOUD_OPTICAL_THICKNESS_MAX)]
+  [0, `shortwave_downward`] W/m², `cloud_optical_thickness` in [0, $(CLOUD_OPTICAL_THICKNESS_MAX)],
+  `snowfall_fraction` in [0, 1]
 
 Two kinds of bound live here, and they behave differently under the adjustment functions. Most are
 physical invariants that hold however the forcing was produced, so they are checked every time. The
@@ -318,6 +319,12 @@ function validate_climate_forcing_units(stack::DimStack; emissivity_minimum::Rea
         n_over == 0 ||
             push!(errors, "shortwave_downward_diffuse: exceeds shortwave_downward at $(n_over) steps")
     end
+    if haskey(stack, :snowfall_fraction)
+        f = parent(stack[:snowfall_fraction])
+        f_min, f_max = minimum(f), maximum(f)
+        (f_min < 0 || f_max > 1) &&
+            push!(errors, "snowfall_fraction: expected [0, 1], got [$(f_min), $(f_max)]")
+    end
     if haskey(stack, :cloud_optical_thickness)
         τ = parent(stack[:cloud_optical_thickness])
         τ_min, τ_max = minimum(τ), maximum(τ)
@@ -353,6 +360,9 @@ Load ERA5-Land reanalysis data using pure Julia (Zarr.jl) and return a DimStack 
 - `token::Union{String,Nothing}`: CDS API key (required)
 - `chunk_strategy::Symbol=:geo`: :geo (time-series) or :time (spatial)
 - `cache_path::Union{String,Nothing}=nothing`: Path for persistent disk cache (uses Zarr.CachingStore)
+- `precipitation_phase::Symbol=:jennings2018`: how precipitation is to be split into snow and rain
+  ([`PRECIPITATION_PHASES`](@ref)). `:jennings2018` adds the `snowfall_fraction` layer; `:threshold`
+  leaves it out.
 
 # Returns
 - `DimStack`: Stack with climate forcing variables as DimArrays:
@@ -370,6 +380,8 @@ Load ERA5-Land reanalysis data using pure Julia (Zarr.jl) and return a DimStack 
   The last three are derived from the shortwave, surface pressure, vapor pressure and the solar
   geometry by [`shortwave_forcing_layers`](@ref), each flux being the mean over the hour before
   its stamp.
+  - `snowfall_fraction`: fraction of precipitation falling as snow, from air temperature and
+    humidity ([`snowfall_fraction`](@ref)); absent under `precipitation_phase = :threshold`
 
   Metadata includes `latitude`, `longitude`, `dataset`, `chunk_strategy`, and
   `outside_land_mask`.
@@ -402,8 +414,10 @@ function load_era5_land(
     token::Union{String,Nothing}=nothing,
     chunk_strategy::Symbol=:geo,
     cache_path::Union{String,Nothing}=nothing,
+    precipitation_phase::Symbol=:jennings2018,
     kwargs...
 )
+    _check_precipitation_phase(precipitation_phase)
     # Validate token
     if isnothing(token)
         throw(ArgumentError("token is required for ERA5-Land access. Get one from https://cds.climate.copernicus.eu/"))
@@ -588,8 +602,9 @@ function load_era5_land(
 
         if outside_land_mask
             @warn "Grid cell is outside the ERA5-Land land mask: every value is NaN" selected_lat selected_lon
-            return stack
+            return _with_precipitation_phase(stack, precipitation_phase)
         end
+        stack = _with_precipitation_phase(stack, precipitation_phase)
         @info "Validating units..."
         validate_climate_forcing_units(stack)
         @info "✓ All units validated"
