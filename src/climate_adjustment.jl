@@ -149,7 +149,7 @@ function temperature_adjust(climate_forcing_original::DimStack, delta_temperatur
 
     # Pressure, wind, precipitation and shortwave are carried through untouched.
     adjusted = _rebuild_forcing(climate_forcing_original, new_meta;
-                                hold_snowfall_fraction=hold_precipitation_phase,
+                                hold_precipitation_phase,
                                 temperature_air=T′, vapor_pressure=e′,
                                 longwave_downward=LW′)
 

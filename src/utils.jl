@@ -200,7 +200,7 @@ _cap_vapor_pressure(e, T, T′) = T′ < T ? min(e, saturation_vapor_pressure_re
 # ----------------------------------------------------------------------------
 
 """
-    _rebuild_forcing(stack, new_metadata; hold_snowfall_fraction=false, changed_layers...) -> DimStack
+    _rebuild_forcing(stack, new_metadata; hold_precipitation_phase=false, changed_layers...) -> DimStack
 
 Rebuild a forcing `DimStack` with new stack metadata, replacing only the named layers.
 
@@ -211,29 +211,30 @@ back correctly annotated without threading it by hand.
 
 A `snowfall_fraction` layer is a function of `temperature_air` and `vapor_pressure`, so when either
 of them is replaced it is recomputed from the new values ([`snowfall_fraction_layer`](@ref)) and
-never describes a different air mass from the one beside it. `hold_snowfall_fraction = true` keeps
+never describes a different air mass from the one beside it. `hold_precipitation_phase = true` keeps
 it as it was instead, for a perturbation meant to act on the energy balance alone.
 
 Values may be `DimArray`s or plain arrays — only the underlying data is used.
 """
-function _rebuild_forcing(stack::DimStack, new_metadata; hold_snowfall_fraction::Bool=false,
+function _rebuild_forcing(stack::DimStack, new_metadata; hold_precipitation_phase::Bool=false,
                           changed_layers...)
     changed = NamedTuple(changed_layers)
     unknown = setdiff(keys(changed), keys(stack))
     isempty(unknown) ||
         throw(ArgumentError("not a layer of this forcing stack: $(join(unknown, ", "))"))
+    if haskey(stack, :snowfall_fraction) && !hold_precipitation_phase && !haskey(changed, :snowfall_fraction) &&
+       (haskey(changed, :temperature_air) || haskey(changed, :vapor_pressure))
+        T = parent(get(changed, :temperature_air, stack[:temperature_air]))
+        e = parent(get(changed, :vapor_pressure, stack[:vapor_pressure]))
+        changed = merge(changed, (; snowfall_fraction = snowfall_fraction.(T, e)))
+    end
     # Unwrapped after the merge, not before: `rebuild` wraps every layer in the stack's dimensions, and
     # `NamedTuple(stack)` hands back the carried layers as `DimArray`s. Unwrapping only the replacements
     # leaves those to be wrapped a second time, and a doubly wrapped layer's `parent` is a `DimArray`
     # rather than the values a consumer asked for — which reads as an array of numbers everywhere until
     # something dispatches on `Vector`.
-    adjusted = rebuild(stack; data=map(parent, merge(NamedTuple(stack), changed)),
-                       metadata=new_metadata)
-    if haskey(stack, :snowfall_fraction) && !hold_snowfall_fraction &&
-       (haskey(changed, :temperature_air) || haskey(changed, :vapor_pressure))
-        adjusted = with_snowfall_fraction(adjusted)
-    end
-    return adjusted
+    return rebuild(stack; data=map(parent, merge(NamedTuple(stack), changed)),
+                   metadata=new_metadata)
 end
 
 """

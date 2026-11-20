@@ -27,15 +27,15 @@ snow fraction of the step's precipitation, which spreads the transition over the
 the observations show rather than switching at one temperature.
 
 Relative humidity is taken with respect to water at every temperature
-([`saturation_vapor_pressure`](@ref)), the convention of the station humidity the model was fitted
-to, and is capped at 100 %.
+([`vapor_pressure_to_relative_humidity`](@ref)), the convention of the station humidity the model
+was fitted to, and is capped at 100 %.
 
 Accepts scalars; broadcast over arrays.
 """
 function snowfall_fraction(temperature_air::Real, vapor_pressure::Real)
     (; α, β, γ) = JENNINGS2018_BIVARIATE
     T = Float64(temperature_air)
-    rh = min(100 * Float64(vapor_pressure) / saturation_vapor_pressure(T), 100.0)
+    rh = vapor_pressure_to_relative_humidity(Float64(vapor_pressure), T)
     return 1 / (1 + exp(α + β * (T - 273.15) + γ * rh))
 end
 

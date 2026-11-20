@@ -600,11 +600,11 @@ function load_era5_land(
             "outside_land_mask" => outside_land_mask,
         ))
 
+        stack = _with_precipitation_phase(stack, precipitation_phase)
         if outside_land_mask
             @warn "Grid cell is outside the ERA5-Land land mask: every value is NaN" selected_lat selected_lon
-            return _with_precipitation_phase(stack, precipitation_phase)
+            return stack
         end
-        stack = _with_precipitation_phase(stack, precipitation_phase)
         @info "Validating units..."
         validate_climate_forcing_units(stack)
         @info "✓ All units validated"

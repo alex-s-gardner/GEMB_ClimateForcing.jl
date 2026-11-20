@@ -86,7 +86,7 @@ const _FORCING_VARS = (:temperature_air, :pressure_air, :vapor_pressure, :wind_s
         @test_throws "precipitation_phase must be one of" simulate_climate_forcing("test_1", 3;
                                                                                   precipitation_phase=:linear)
         f = with_snowfall_fraction(make_perturb_stack())
-        bad = GEMB_ClimateForcing._rebuild_forcing(f, metadata(f); hold_snowfall_fraction=true,
+        bad = GEMB_ClimateForcing._rebuild_forcing(f, metadata(f); hold_precipitation_phase=true,
                                                    snowfall_fraction=fill(1.5, length(f[:snowfall_fraction])))
         @test_throws "snowfall_fraction: expected [0, 1]" GEMB_ClimateForcing.validate_climate_forcing_units(bad)
     end
