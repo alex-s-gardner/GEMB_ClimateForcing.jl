@@ -40,7 +40,7 @@ using Statistics
 
 """
     temperature_adjust(climate_forcing_original::DimStack,
-                       delta_temperature::Real) -> DimStack
+                       delta_temperature::Real; hold_precipitation_phase=false) -> DimStack
 
 Apply a uniform air-temperature offset to a climate-forcing `DimStack`, and
 propagate it through the variables that depend on temperature.
@@ -58,10 +58,15 @@ and additionally corrects surface pressure.
   `precipitation`, `shortwave_downward`, `longwave_downward`.
 - `delta_temperature::Real`: temperature offset in **K**, added to every time
   step. Positive = warming, negative = cooling.
+- `hold_precipitation_phase`: what happens to the `snowfall_fraction` layer
+  ([`with_snowfall_fraction`](@ref)) that [`climate_forcing`](@ref) stacks carry. `false` recomputes
+  it from the adjusted temperature and vapor pressure, so the offset moves the snow–rain partition as
+  a warmer climate would. `true` keeps it as it was, so the offset acts on the energy balance only. A
+  stack without the layer is unaffected either way.
 
 # Returns
 - A new `DimStack` on the same time dimension with adjusted `temperature_air`,
-  `vapor_pressure` and `longwave_downward`. `pressure_air`, `wind_speed`,
+  `vapor_pressure`, `longwave_downward` and, unless held, `snowfall_fraction`. `pressure_air`, `wind_speed`,
   `precipitation` and `shortwave_downward` are carried through unchanged.
   Metadata gains `delta_temperature` and a cumulative `temperature_offset`, and
   `temperature_air_mean` is recomputed; physical-range validation is re-run.
@@ -115,7 +120,8 @@ warmer_wetter = precipitation_adjust(warmer, 1.15)
 
 See also [`precipitation_adjust`](@ref), [`climate_adjust_for_elevation`](@ref).
 """
-function temperature_adjust(climate_forcing_original::DimStack, delta_temperature::Real)
+function temperature_adjust(climate_forcing_original::DimStack, delta_temperature::Real;
+                            hold_precipitation_phase::Bool=false)
     ΔT = Float64(delta_temperature)
 
     # Source variables as DimArrays. Broadcasting preserves the time dimension.
@@ -143,6 +149,7 @@ function temperature_adjust(climate_forcing_original::DimStack, delta_temperatur
 
     # Pressure, wind, precipitation and shortwave are carried through untouched.
     adjusted = _rebuild_forcing(climate_forcing_original, new_meta;
+                                hold_precipitation_phase,
                                 temperature_air=T′, vapor_pressure=e′,
                                 longwave_downward=LW′)
 

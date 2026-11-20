@@ -608,7 +608,7 @@ end
 =============================================================================#
 
 """
-    simulate_climate_forcing(set_id::String, time_step_hours::Int=0)
+    simulate_climate_forcing(set_id::String, time_step_hours::Int=0; precipitation_phase=:jennings2018)
 
 Reproducibly generate synthetic climate forcing data for GEMB simulations
 based on predefined parameter sets.
@@ -617,6 +617,8 @@ based on predefined parameter sets.
 - `set_id::String`: Identifier for the simulation parameter set (e.g., "test_1").
 - `time_step_hours::Int`: Temporal resolution in hours. If 0 (default), uses the
   default time step defined by the parameter set.
+- `precipitation_phase::Symbol=:jennings2018`: as for [`climate_forcing`](@ref): `:jennings2018`
+  adds the `snowfall_fraction` layer, `:threshold` leaves it out.
 
 # Returns
 A `DimStack` containing synthetic time series and metadata, suitable for conversion
@@ -626,9 +628,12 @@ The seven meteorological layers follow MATLAB's `simulate_climate_forcing.m`, ex
 pressure is formed against the saturation curve over water of
 [`saturation_vapor_pressure`](@ref). The stack also carries the three shortwave layers
 `climate_forcing` returns — `solar_zenith_angle`, `shortwave_downward_diffuse` and
-`cloud_optical_thickness` — from the same instantaneous geometry the simulated shortwave uses.
+`cloud_optical_thickness` — from the same instantaneous geometry the simulated shortwave uses —
+and, by default, the `snowfall_fraction` layer.
 """
-function simulate_climate_forcing(set_id::String, time_step_hours::Int=0)
+function simulate_climate_forcing(set_id::String, time_step_hours::Int=0;
+                                  precipitation_phase::Symbol=:jennings2018)
+    _check_precipitation_phase(precipitation_phase)
     # Load climate simulation parameter set
     location_parameters, coeffs = simulation_parameter_sets(set_id)
 
@@ -739,5 +744,5 @@ function simulate_climate_forcing(set_id::String, time_step_hours::Int=0)
         "wind_observation_height" => location_parameters.wind_observation_height
     ))
 
-    return stack
+    return _with_precipitation_phase(stack, precipitation_phase)
 end

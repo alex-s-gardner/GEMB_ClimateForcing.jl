@@ -26,6 +26,10 @@ Load climate forcing data from specified dataset and return a DimStack with clim
     `precipitation`, `shortwave_downward`, `longwave_downward`
   - `solar_zenith_angle` (degrees), `shortwave_downward_diffuse` (W/m²) and
     `cloud_optical_thickness`, derived from the shortwave by [`shortwave_forcing_layers`](@ref)
+  - `snowfall_fraction`, the fraction of precipitation falling as snow, from the bivariate
+    logistic model of Jennings et al. (2018) ([`snowfall_fraction`](@ref)). Pass
+    `precipitation_phase = :threshold` to leave it out, so GEMB splits precipitation at its rain
+    temperature threshold instead ([`PRECIPITATION_PHASES`](@ref)).
   - Metadata includes location, dataset info, and observation heights
 
 # Examples
