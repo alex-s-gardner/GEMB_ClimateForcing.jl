@@ -13,7 +13,14 @@ const G = GEMB_ClimateForcing
 # `data/run_rgi7_pooled_albedo.jl`'s `write_pooled`, because the reader validates neither — it
 # locates rows by `searchsortedfirst` on the cell list and would silently mis-read a
 # differently ordered file.
-function _write_test_pooled(dir, hemi, rows)
+function _write_test_pooled(dir, hemi, rows; glacier_percent = 100)
+    # The per-cell stack also reads the glacier-fraction table beside the pooled one.
+    open(GzipCompressorStream, glacier_fraction_path(dir, hemi), "w") do io
+        println(io, "h,v,row,col,glacier_percent")
+        for row in rows
+            println(io, join((first(row)..., glacier_percent), ','))
+        end
+    end
     path = bare_ice_albedo_path(dir, hemi)
     open(GzipCompressorStream, path, "w") do io
         println(io, "# synthetic test fixture")
@@ -333,16 +340,16 @@ end
             latc, lonc = G._modis_cell_center(c...)
             ln = GI.LineString([(lona, lata), (lonc, latc)])
 
-            per = bare_ice_albedo(ln; dir, glacier_fraction_dir = dir)
+            per = bare_ice_albedo(ln; dir)
             @test collect(per[:glacier_fraction]) == Float32[1.0, 0.94, 0.95]
             @test collect(per[:albedo_wsa]) == Float32[0.39, 0.49, 0.59]
 
             # The 94 % cell is screened out and counts as unresolved; the 95 % cell passes.
-            scr = bare_ice_albedo(ln; dir, glacier_fraction_dir = dir, min_glacier_fraction = 0.95)
+            scr = bare_ice_albedo(ln; dir, min_glacier_fraction = 0.95)
             @test isnan(scr[:albedo_bsa][2]) && isnan(scr[:albedo_wsa][2])
             @test scr[:albedo_wsa][3] === 0.59f0
             @test collect(scr[:in_product]) == [true, true, true]
-            r = bare_ice_albedo(ln, mean; dir, glacier_fraction_dir = dir, min_glacier_fraction = 0.95)
+            r = bare_ice_albedo(ln, mean; dir, min_glacier_fraction = 0.95)
             @test r.n_cells_wsa == 2
             @test r.albedo_wsa ≈ 0.49f0
 
@@ -351,14 +358,18 @@ end
             _write_test_pooled(dir, :north,
                                [(a, "0.4000", "0.3900", 400, 410, 20, 21),
                                 (off, "0.6000", "0.5900", 500, 500, 25, 25)])
-            empty!(G._BIA_TABLE_CACHE)
+            open(GzipCompressorStream, glacier_fraction_path(dir, :north), "w") do io
+                println(io, "h,v,row,col,glacier_percent")
+                println(io, join((a..., 100), ','))
+            end
+            empty!(G._BIA_TABLE_CACHE); empty!(G._GLACIER_FRACTION_CACHE)
             lato, lono = G._modis_cell_center(off...)
-            m = bare_ice_albedo(GI.Point(lono, lato); dir, glacier_fraction_dir = dir,
+            m = bare_ice_albedo(GI.Point(lono, lato); dir,
                                 min_glacier_fraction = 0.5)
             @test isnan(m[:glacier_fraction][1]) && isnan(m[:albedo_wsa][1])
 
             @test_throws "min_glacier_fraction must lie in [0, 1]" bare_ice_albedo(
-                ln; dir, glacier_fraction_dir = dir, min_glacier_fraction = 1.5)
+                ln; dir, min_glacier_fraction = 1.5)
         end
         empty!(G._BIA_TABLE_CACHE); empty!(G._GLACIER_FRACTION_CACHE)
     end

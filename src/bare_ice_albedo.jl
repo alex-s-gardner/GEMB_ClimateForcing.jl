@@ -423,11 +423,7 @@ function _bia_read(cells::Vector{NTuple{4,Int}}, dir::AbstractString)
 
     for hemi in unique(_bia_hemisphere(c[2]) for c in cells)
         t = _bia_table(dir, hemi)
-        for (k, c) in pairs(cells)
-            _bia_hemisphere(c[2]) === hemi || continue
-            key = (Int32(c[1]), Int32(c[2]), Int32(c[3]), Int32(c[4]))
-            j = searchsortedfirst(t.cells, key)
-            (j <= length(t.cells) && t.cells[j] == key) || continue
+        for (k, j) in _bia_locate(t.cells, cells, hemi)
             found[k] = true
             bsa[k] = t.bsa[j];  wsa[k] = t.wsa[j]
             nb[k] = t.nb[j];    nw[k] = t.nw[j]
@@ -435,6 +431,23 @@ function _bia_read(cells::Vector{NTuple{4,Int}}, dir::AbstractString)
         end
     end
     return (; bsa, wsa, nb, nw, kb, kw, found)
+end
+
+"""
+    _bia_locate(table_cells, cells, hemisphere) -> Vector{Pair{Int,Int}}
+
+`k => j` for every `cells[k]` in `hemisphere` found at row `j` of the sorted `table_cells`.
+"""
+function _bia_locate(table_cells::Vector{NTuple{4,Int32}}, cells::Vector{NTuple{4,Int}},
+                     hemi::Symbol)
+    hits = Pair{Int,Int}[]
+    for (k, c) in pairs(cells)
+        _bia_hemisphere(c[2]) === hemi || continue
+        key = (Int32(c[1]), Int32(c[2]), Int32(c[3]), Int32(c[4]))
+        j = searchsortedfirst(table_cells, key)
+        (j <= length(table_cells) && table_cells[j] == key) && push!(hits, k => j)
+    end
+    return hits
 end
 
 # ------------------------------------------------------------------- glacier fraction
@@ -449,30 +462,21 @@ glacier_fraction_path(dir::AbstractString, hemisphere::Symbol) =
     joinpath(dir, "rgi7_modis_glacier_fraction_$(hemisphere).csv.gz")
 
 """
-    _GlacierFractionTable
-
-One hemisphere's glacier fraction per MCD43A3 cell, `cells` in canonical order and `percent` the
-whole-number share (0–100) of the cell's ~46 m sub-cells whose centres lie inside an RGI 7.0
-outline.
+One hemisphere's glacier fraction per MCD43A3 cell, `cells` in canonical order; `percent` is the
+share (0–100) of the cell's 10 × 10 sub-cells whose centres lie inside an RGI 7.0 outline.
 """
 struct _GlacierFractionTable
     cells::Vector{NTuple{4,Int32}}
     percent::Vector{UInt8}
 end
 
-"""
-    _GLACIER_FRACTION_CACHE
-
-One parsed glacier-fraction table per `(dir, hemisphere)`, kept for the process's lifetime, for the
-same reason as [`_BIA_TABLE_CACHE`](@ref).
-"""
+"""One parsed glacier-fraction table per `(dir, hemisphere)`, as [`_BIA_TABLE_CACHE`](@ref)."""
 const _GLACIER_FRACTION_CACHE = Dict{Tuple{String,Symbol},_GlacierFractionTable}()
 
 """
     _glacier_fraction_table(dir, hemisphere) -> _GlacierFractionTable
 
-The parsed glacier-fraction table for one hemisphere, from [`_GLACIER_FRACTION_CACHE`](@ref) or read
-once. Every field is a non-negative integer, so each row is parsed with [`_bia_next_uint`](@ref).
+The parsed glacier-fraction table for one hemisphere, cached in [`_GLACIER_FRACTION_CACHE`](@ref).
 """
 function _glacier_fraction_table(dir::AbstractString, hemi::Symbol)
     key = (String(dir), hemi)
@@ -484,7 +488,7 @@ function _glacier_fraction_table(dir::AbstractString, hemi::Symbol)
         "data/make_rgi7_modis_glacier_fraction.jl."))
     str = String(open(io -> read(GzipDecompressorStream(io)), path))
     n = ncodeunits(str)
-    nrow = n ÷ 16
+    nrow = n ÷ 18     # a row is ~18 bytes
     cells = sizehint!(NTuple{4,Int32}[], nrow)
     percent = sizehint!(UInt8[], nrow)
     i = 1
@@ -522,11 +526,7 @@ function _glacier_fraction(cells::Vector{NTuple{4,Int}}, dir::AbstractString)
     frac = fill(NaN32, length(cells))
     for hemi in unique(_bia_hemisphere(c[2]) for c in cells)
         t = _glacier_fraction_table(dir, hemi)
-        for (k, c) in pairs(cells)
-            _bia_hemisphere(c[2]) === hemi || continue
-            key = (Int32(c[1]), Int32(c[2]), Int32(c[3]), Int32(c[4]))
-            j = searchsortedfirst(t.cells, key)
-            (j <= length(t.cells) && t.cells[j] == key) || continue
+        for (k, j) in _bia_locate(t.cells, cells, hemi)
             frac[k] = t.percent[j] / 100f0
         end
     end
@@ -570,8 +570,7 @@ whose *centre* it covers, or a different rule via `boundary`.
   cells are dropped first, which is what makes `n_cells_bsa` meaningful.
 
 # Keywords
-- `dir = joinpath(@__DIR__, "..", "data")`: where the pooled tables live.
-- `glacier_fraction_dir = joinpath(@__DIR__, "..", "data")`: where the vendored per-cell
+- `dir = joinpath(@__DIR__, "..", "data")`: where the pooled tables and the per-cell
   glacier-fraction tables ([`glacier_fraction_path`](@ref)) live.
 - `boundary = :center`: for polygons, `:center` (cell centre inside), `:touches` (any overlap)
   or `:inside` (wholly within). `:center` matches how the vendored cell table itself was
@@ -621,7 +620,6 @@ See also [`pool_ice_albedo_from_cache`](@ref), which computes this product, and
 """
 function bare_ice_albedo(geometry, reducer = nothing;
                          dir::AbstractString = joinpath(@__DIR__, "..", "data"),
-                         glacier_fraction_dir::AbstractString = joinpath(@__DIR__, "..", "data"),
                          boundary::Symbol = :center,
                          shape::Union{Symbol,Nothing} = nothing,
                          min_cells::Integer = 1,
@@ -643,8 +641,18 @@ function bare_ice_albedo(geometry, reducer = nothing;
         "selects nothing unless it covers a cell centre; use `boundary = :touches`, or pass " *
         "the cell centre as a point."))
 
-    v = _bia_screen_glacier_fraction(_bia_read(cells, dir), _glacier_fraction(cells, glacier_fraction_dir),
-                                     Float32(min_glacier_fraction))
+    v = _bia_read(cells, dir)
+    # The fraction table is read only when the screen or the per-cell stack needs it.
+    glacier_fraction = reducer === nothing || min_glacier_fraction > 0 ?
+                       _glacier_fraction(cells, dir) : fill(NaN32, length(cells))
+    if min_glacier_fraction > 0
+        # A cell below the screen stays `found` but counts as unresolved; a cell with no
+        # fraction on record fails it.
+        screened = .!(glacier_fraction .>= Float32(min_glacier_fraction))
+        v.bsa[screened] .= NaN32
+        v.wsa[screened] .= NaN32
+    end
+    v = (; v..., glacier_fraction)
     if !any(v.found)
         @warn("none of the $(length(cells)) selected cells is in the RGI 7.0 bare-ice albedo " *
               "product, so every value is NaN — the geometry is probably off-glacier",
@@ -653,26 +661,6 @@ function bare_ice_albedo(geometry, reducer = nothing;
 
     return reducer === nothing ? _bia_stack(v, cells, burn, boundary) :
                                 _bia_reduce(v, cells, reducer, min_cells)
-end
-
-"""
-    _bia_screen_glacier_fraction(v, glacier_fraction, minimum) -> NamedTuple
-
-`v` with `glacier_fraction` added and the albedo of every cell below `minimum` set to `NaN32`.
-
-A cell below the threshold stays `found` (it is glacierized and in the product) but is treated as
-unresolved, so a reducer drops it and `n_cells_*` counts only cells that passed. A cell with no
-glacier fraction on record fails any positive threshold.
-"""
-function _bia_screen_glacier_fraction(v, glacier_fraction::Vector{Float32}, minimum::Float32)
-    if minimum > 0
-        for k in eachindex(glacier_fraction)
-            glacier_fraction[k] >= minimum && continue
-            v.bsa[k] = NaN32
-            v.wsa[k] = NaN32
-        end
-    end
-    return (; v..., glacier_fraction)
 end
 
 """
