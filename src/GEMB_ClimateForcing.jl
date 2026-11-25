@@ -79,7 +79,7 @@ export rgi7_modis_cells, RGI7ModisCells, n_glaciers, rgi7_modis_cell_tuples,
     rgi7_hemisphere_split, rgi7_ice_albedo_climatology, rgi7_ice_albedo_path
 
 # Sample that product at a GeoInterface geometry (point / line / polygon)
-export bare_ice_albedo, bare_ice_albedo_path, bare_ice_albedo_points, BARE_ICE_ALBEDO_YEARS
+export bare_ice_albedo, bare_ice_albedo_path, glacier_fraction_path, bare_ice_albedo_points, BARE_ICE_ALBEDO_YEARS
 export pool_ice_albedo_from_cache, POOLED_ICE_ALBEDO_RANGE
 
 # Export on-glacier temperature decoupling (Shaw et al. 2025 lookup table)

@@ -13,7 +13,14 @@ const G = GEMB_ClimateForcing
 # `data/run_rgi7_pooled_albedo.jl`'s `write_pooled`, because the reader validates neither — it
 # locates rows by `searchsortedfirst` on the cell list and would silently mis-read a
 # differently ordered file.
-function _write_test_pooled(dir, hemi, rows)
+function _write_test_pooled(dir, hemi, rows; glacier_percent = 100)
+    # The per-cell stack also reads the glacier-fraction table beside the pooled one.
+    open(GzipCompressorStream, glacier_fraction_path(dir, hemi), "w") do io
+        println(io, "h,v,row,col,glacier_percent")
+        for row in rows
+            println(io, join((first(row)..., glacier_percent), ','))
+        end
+    end
     path = bare_ice_albedo_path(dir, hemi)
     open(GzipCompressorStream, path, "w") do io
         println(io, "# synthetic test fixture")
@@ -314,6 +321,68 @@ end
             # min_cells reports too-thin a sample rather than reducing over almost nothing.
             @test isnan(bare_ice_albedo(ln, median; dir = dir, min_cells = 3).albedo_bsa)
         end
+    end
+
+    @testset "glacier-fraction screen" begin
+        mktempdir() do dir
+            a, b, c = (17, 2, 100, 100), (17, 2, 100, 101), (17, 2, 100, 102)
+            _write_test_pooled(dir, :north,
+                               [(a, "0.4000", "0.3900", 400, 410, 20, 21),
+                                (b, "0.5000", "0.4900", 450, 450, 22, 22),
+                                (c, "0.6000", "0.5900", 500, 500, 25, 25)])
+            open(GzipCompressorStream, glacier_fraction_path(dir, :north), "w") do io
+                println(io, "h,v,row,col,glacier_percent")
+                for (cell, pct) in ((a, 100), (b, 94), (c, 95))
+                    println(io, join((cell..., pct), ','))
+                end
+            end
+            lata, lona = G._modis_cell_center(a...)
+            latc, lonc = G._modis_cell_center(c...)
+            ln = GI.LineString([(lona, lata), (lonc, latc)])
+
+            per = bare_ice_albedo(ln; dir)
+            @test collect(per[:glacier_fraction]) == Float32[1.0, 0.94, 0.95]
+            @test collect(per[:albedo_wsa]) == Float32[0.39, 0.49, 0.59]
+
+            # The 94 % cell is screened out and counts as unresolved; the 95 % cell passes.
+            scr = bare_ice_albedo(ln; dir, min_glacier_fraction = 0.95)
+            @test isnan(scr[:albedo_bsa][2]) && isnan(scr[:albedo_wsa][2])
+            @test scr[:albedo_wsa][3] === 0.59f0
+            @test collect(scr[:in_product]) == [true, true, true]
+            r = bare_ice_albedo(ln, mean; dir, min_glacier_fraction = 0.95)
+            @test r.n_cells_wsa == 2
+            @test r.albedo_wsa ≈ 0.49f0
+
+            # A cell missing from the fraction table fails any positive threshold.
+            off = (17, 2, 100, 103)
+            _write_test_pooled(dir, :north,
+                               [(a, "0.4000", "0.3900", 400, 410, 20, 21),
+                                (off, "0.6000", "0.5900", 500, 500, 25, 25)])
+            open(GzipCompressorStream, glacier_fraction_path(dir, :north), "w") do io
+                println(io, "h,v,row,col,glacier_percent")
+                println(io, join((a..., 100), ','))
+            end
+            empty!(G._BIA_TABLE_CACHE); empty!(G._GLACIER_FRACTION_CACHE)
+            lato, lono = G._modis_cell_center(off...)
+            m = bare_ice_albedo(GI.Point(lono, lato); dir,
+                                min_glacier_fraction = 0.5)
+            @test isnan(m[:glacier_fraction][1]) && isnan(m[:albedo_wsa][1])
+
+            @test_throws "min_glacier_fraction must lie in [0, 1]" bare_ice_albedo(
+                ln; dir, min_glacier_fraction = 1.5)
+        end
+        empty!(G._BIA_TABLE_CACHE); empty!(G._GLACIER_FRACTION_CACHE)
+    end
+
+    @testset "vendored glacier-fraction table" begin
+        dir = joinpath(@__DIR__, "..", "data")
+        for hemi in (:north, :south)
+            t = G._glacier_fraction_table(dir, hemi)
+            @test issorted(t.cells)
+            @test all(<=(100), t.percent)
+        end
+        @test length(G._glacier_fraction_table(dir, :north).cells) == 2_584_232
+        @test length(G._glacier_fraction_table(dir, :south).cells) == 776_484
     end
 
     @testset "southern geometry reads only the southern table" begin
