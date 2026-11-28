@@ -342,6 +342,17 @@ end
 
             per = bare_ice_albedo(ln; dir)
             @test collect(per[:glacier_fraction]) == Float32[1.0, 0.94, 0.95]
+
+            # The point lookup reads the same table bare_ice_albedo screens with.
+            latb, lonb = G._modis_cell_center(b...)
+            @test modis_glacier_fraction([lata, latb, latc], [lona, lonb, lonc]; dir) ==
+                  Float32[1.0, 0.94, 0.95]
+            @test modis_glacier_fraction(latb, lonb; dir) === 0.94f0
+            @test modis_glacier_fraction([a, b, c, (17, 2, 100, 103)]; dir)[1:3] == Float32[1.0, 0.94, 0.95]
+            @test isnan(modis_glacier_fraction([(17, 2, 100, 103)]; dir)[1])
+            @test isnan(modis_glacier_fraction(G._modis_cell_center(17, 2, 100, 103)...; dir))
+            @test_throws "lat and lon must have the same length" modis_glacier_fraction(
+                [lata], [lona, lonb]; dir)
             @test collect(per[:albedo_wsa]) == Float32[0.39, 0.49, 0.59]
 
             # The 94 % cell is screened out and counts as unresolved; the 95 % cell passes.
