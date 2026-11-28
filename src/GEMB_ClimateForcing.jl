@@ -79,7 +79,8 @@ export rgi7_modis_cells, RGI7ModisCells, n_glaciers, rgi7_modis_cell_tuples,
     rgi7_hemisphere_split, rgi7_ice_albedo_climatology, rgi7_ice_albedo_path
 
 # Sample that product at a GeoInterface geometry (point / line / polygon)
-export bare_ice_albedo, bare_ice_albedo_path, glacier_fraction_path, modis_glacier_fraction, bare_ice_albedo_points,
+export bare_ice_albedo, bare_ice_albedo_path, glacier_fraction_path, modis_glacier_fraction, modis_mask_fraction,
+    bare_ice_albedo_points,
     BARE_ICE_ALBEDO_YEARS
 export pool_ice_albedo_from_cache, POOLED_ICE_ALBEDO_RANGE
 
@@ -132,6 +133,7 @@ include("pooled_ice_albedo.jl")
 # (`_rgi7_tile_dims`, the burn grid it reuses as a boolmask target) and
 # rgi7_ice_albedo_climatology.jl (`rgi7_ice_albedo_path`, `_rgi7_reduction_name`).
 include("bare_ice_albedo.jl")
+include("modis_mask_fraction.jl")
 include("geoid.jl")
 include("invariant.jl")
 include("elevation_adjustment.jl")

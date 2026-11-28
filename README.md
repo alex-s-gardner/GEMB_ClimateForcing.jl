@@ -558,6 +558,20 @@ f = modis_glacier_fraction(lats, lons)
 use_modis = f .>= 0.95
 ```
 
+RGI 7.0 does not outline the ice sheets. `modis_mask_fraction(lat, lon, mask, classes)` computes
+the same 10 × 10 sub-cell share from any categorical mask raster, for example BedMachine's ice mask
+(grounded and floating ice, `classes = (2, 3)`). Each sub-cell centre takes the nearest mask pixel.
+Where the mask pixel is as coarse as the cell (BedMachine Antarctica, 500 m), pass `buffer` [m]:
+a fraction of 1 then means ice everywhere within that distance of the cell.
+
+```julia
+using Rasters
+gr = Raster("BedMachineGreenland_v7_mask.tif"; lazy = true)       # 150 m
+an = Raster("BedMachineAntarctica_V04.nc"; name = :mask, lazy = true)   # 500 m, no CRS attached
+f_gr = modis_mask_fraction(lats_n, lons_n, gr, (2, 3))
+f_an = modis_mask_fraction(lats_s, lons_s, an, (2, 3); buffer = 1000, crs = Rasters.EPSG(3031))
+```
+
 > [!IMPORTANT]
 > `:in_product = false` means the cell is **off-glacier**, not merely cloudy — both read `NaN`.
 > RGI 7.0's glacier product **excludes the ice sheets** (region 05 is Greenland *periphery*), so

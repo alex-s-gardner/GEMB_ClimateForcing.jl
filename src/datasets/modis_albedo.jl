@@ -306,13 +306,21 @@ the caller so a point's *sampled* location is auditable against the location it 
 """
 function _modis_cell_center(h::Integer, v::Integer, row::Integer, col::Integer)
     ulx, uly = _modis_tile_origin(h, v)
-    x = ulx + (col - 0.5) * _MODIS_PIXEL_M
-    y = uly - (row - 0.5) * _MODIS_PIXEL_M
+    lon, lat = _modis_sinu_to_lonlat(ulx + (col - 0.5) * _MODIS_PIXEL_M, uly - (row - 0.5) * _MODIS_PIXEL_M)
+    return (lat, lon)
+end
+
+"""
+    _modis_sinu_to_lonlat(x, y) -> (lon, lat)
+
+Inverse of [`_modis_lonlat_to_sinu`](@ref): a point in MODIS sinusoidal metres to degrees.
+"""
+function _modis_sinu_to_lonlat(x::Real, y::Real)
     φ = y / _MODIS_SPHERE_R
     # cos φ → 0 at the poles, where longitude is degenerate; guard the division.
     c = cos(φ)
     λ = abs(c) < 1e-12 ? 0.0 : x / (_MODIS_SPHERE_R * c)
-    return (rad2deg(φ), rad2deg(λ))
+    return (rad2deg(λ), rad2deg(φ))
 end
 
 # ---------------------------------------------------------------------- granule identity

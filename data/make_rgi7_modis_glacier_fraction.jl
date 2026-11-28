@@ -51,9 +51,6 @@ function subgrid_dims(h, v)
             Y(Sampled(ys; order = ReverseOrdered(), span = Regular(-d), sampling = Intervals(Center()))))
 end
 
-# Inverse sinusoidal projection on the MODIS sphere.
-inv_sinu(x, y) = (φ = y / G._MODIS_SPHERE_R; (rad2deg(x / (G._MODIS_SPHERE_R * cos(φ))), rad2deg(φ)))
-
 t = G.rgi7_modis_cells()
 north, south = G.rgi7_hemisphere_split(t)
 for (hemi, idx) in ((:north, north), (:south, south))
@@ -107,7 +104,7 @@ for (hemi, idx) in ((:north, north), (:south, south))
             if dem !== nothing && n_gl > 0
                 for (jj, j) in enumerate(ir), (kk, k) in enumerate(ic)
                     sub[kk, jj] || continue
-                    lon_s, lat_s = inv_sinu(xs[k], ys[j])
+                    lon_s, lat_s = G._modis_sinu_to_lonlat(xs[k], ys[j])
                     z = demz(lon_s, lat_s)
                     (ismissing(z) || !isfinite(z) || z < -500) && continue
                     zsum += z; zn += 1
