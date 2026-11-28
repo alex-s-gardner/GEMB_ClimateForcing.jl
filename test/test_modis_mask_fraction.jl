@@ -38,6 +38,15 @@ const G = GEMB_ClimateForcing
                 crs = sinu)
     @test modis_mask_fraction([cell], me, (2, 3)) == modis_mask_fraction([cell], m, (2, 3))
 
+    # The cell at the South Pole reaches past ±180° of longitude; the share is taken over the sub-cells on the surface.
+    pole = (18, 17, 2400, 1)
+    plat, plon = G._modis_cell_center(pole...)
+    ps = Raster(fill(Int8(2), 201, 201), (X(range(-50_000.0, 50_000.0; length = 201); sampling = Points()),
+                                          Y(range(50_000.0, -50_000.0; length = 201); sampling = Points()));
+                crs = Rasters.EPSG(3031))
+    fp = modis_mask_fraction([pole], ps, (2,))[1]
+    @test fp == 1
+
     @test_throws "the mask raster carries no CRS" modis_mask_fraction(
         [cell], Raster(vals, (X(xs; sampling = Points()), Y(ys; sampling = Points()))), (2,))
     @test_throws "factor must be >= 1" modis_mask_fraction([cell], m, (2,); factor = 0)

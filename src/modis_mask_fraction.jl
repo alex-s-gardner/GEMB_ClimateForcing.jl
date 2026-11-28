@@ -9,10 +9,12 @@ and floating ice).
 The cell is split into `factor × factor` sub-cells in the MODIS sinusoidal grid, the sub-cell
 geometry of the RGI 7.0 fraction behind [`modis_glacier_fraction`](@ref), and each sub-cell centre
 takes the value of the mask pixel containing it. A sub-cell centre outside the mask, or on its
-missing value, counts as not in `classes`. With `buffer` [m] the sampled square is the cell widened
-by `buffer` on every side at the same sub-cell spacing, so a fraction of 1 means the mask holds
-`classes` everywhere within `buffer` of the cell: use it where the mask pixel is as coarse as the
-cell, which makes a within-cell fraction meaningless.
+missing value, counts as not in `classes`. The sinusoidal grid's polar cells reach past ±180° of
+longitude, off the Earth's surface; the share is taken over the sub-cells on the surface. With
+`buffer` [m] the sampled square is the cell widened by `buffer` on every side at the same sub-cell
+spacing, so a fraction of 1 means the mask holds `classes` everywhere within `buffer` of the cell:
+use it where the mask pixel is as coarse as the cell, which makes a within-cell fraction
+meaningless.
 
 `cells` are `(h, v, row, col)` tuples, or the cells containing points `lat`, `lon` (degrees).
 `crs` is the mask's coordinate reference system; it must be given when the raster carries none.
@@ -39,10 +41,16 @@ function modis_mask_fraction(cells::AbstractVector{<:NTuple{4,Integer}}, mask::R
                     y0 = uly - (row - 1) * _MODIS_PIXEL_M + buffer
                     for j in 1:n, i in 1:n
                         lon, lat = _modis_sinu_to_lonlat(x0 + (i - 0.5) * d, y0 - (j - 0.5) * d)
+                        # Near the poles a sinusoidal cell reaches past ±180° of longitude, or to ±90° of
+                        # latitude at the grid's edge, off the Earth's surface; such a sub-cell is left out.
+                        if abs(lon) > 180 || abs(lat) >= 90
+                            pts[(j - 1) * n + i] = (NaN, NaN)
+                            continue
+                        end
                         p = ArchGDAL.transform!(ArchGDAL.createpoint(lon, lat), tr)
                         pts[(j - 1) * n + i] = (ArchGDAL.getx(p, 0), ArchGDAL.gety(p, 0))
                     end
-                    ij = [(index(xs, c1x, x), index(ys, c1y, y)) for (x, y) in pts]
+                    ij = [isnan(x) ? (nothing, nothing) : (index(xs, c1x, x), index(ys, c1y, y)) for (x, y) in pts]
                     ok = [i !== nothing && j !== nothing for (i, j) in ij]
                     any(ok) || return 0.0f0
                     ir = extrema(first(ij[k]) for k in eachindex(ij) if ok[k])
@@ -54,7 +62,7 @@ function modis_mask_fraction(cells::AbstractVector{<:NTuple{4,Integer}}, mask::R
                         val = w[ij[k][1] - ir[1] + 1, ij[k][2] - jr[1] + 1]
                         !ismissing(val) && val !== mv && val in classes
                     end
-                    Float32(hits / (n * n))
+                    Float32(hits / count(p -> !isnan(first(p)), pts))
                 end
             end
         end
