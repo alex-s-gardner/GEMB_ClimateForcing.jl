@@ -546,7 +546,17 @@ value reported for a cell is the value computed for that cell — nothing is int
 resampled.
 
 Layers are `:albedo_bsa` / `:albedo_wsa` with their `:n_valid_*` and `:k_used_*` counts, plus
-`:latitude`, `:longitude`, `:cell_id` and `:in_product`.
+`:glacier_fraction`, `:latitude`, `:longitude`, `:cell_id` and `:in_product`.
+`min_glacier_fraction = 0.95` drops cells less than 95 % glacier before reducing.
+
+`modis_glacier_fraction(lat, lon)` returns that same RGI 7.0 glacier fraction for the 500 m cell
+containing each point (the share of its 10 × 10 sub-cells inside an outline; `NaN` off-glacier and
+on the ice sheets), so a screen applied to MODIS albedo elsewhere uses the same cells:
+
+```julia
+f = modis_glacier_fraction(lats, lons)
+use_modis = f .>= 0.95
+```
 
 > [!IMPORTANT]
 > `:in_product = false` means the cell is **off-glacier**, not merely cloudy — both read `NaN`.

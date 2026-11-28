@@ -533,6 +533,37 @@ function _glacier_fraction(cells::Vector{NTuple{4,Int}}, dir::AbstractString)
     return frac
 end
 
+"""
+    modis_glacier_fraction(lat, lon; dir) -> Vector{Float32}
+    modis_glacier_fraction(cells; dir) -> Vector{Float32}
+
+RGI 7.0 glacier fraction (0–1) of MCD43A3 500 m cells, the same value [`bare_ice_albedo`](@ref)
+screens with `min_glacier_fraction`. The fraction is the share of the cell's 10 × 10 sub-cells
+whose centres lie inside an RGI 7.0 outline ([`glacier_fraction_path`](@ref)).
+
+The cells are those containing points `lat`, `lon` (degrees; vectors of equal length, or scalars),
+or are given directly as `(h, v, row, col)` tuples. A cell absent from the table is `NaN32`; the
+table holds the cells of the RGI 7.0 glacier product, so an absent cell is off-glacier or on an
+ice sheet, which RGI 7.0 does not outline, and fails any `fraction >= x` test.
+
+# Example
+```julia
+f = modis_glacier_fraction([69.9979], [-29.0341])
+keep = f .>= 0.95          # cells at least 95 % glacier; NaN fails
+```
+"""
+function modis_glacier_fraction(lat::AbstractVector{<:Real}, lon::AbstractVector{<:Real};
+                                dir::AbstractString = joinpath(@__DIR__, "..", "data"))
+    length(lat) == length(lon) || throw(DimensionMismatch(
+        "lat and lon must have the same length, got $(length(lat)) and $(length(lon))"))
+    return _glacier_fraction(NTuple{4,Int}[_modis_cell(la, lo) for (la, lo) in zip(lat, lon)], dir)
+end
+modis_glacier_fraction(cells::AbstractVector{<:NTuple{4,Integer}};
+                       dir::AbstractString = joinpath(@__DIR__, "..", "data")) =
+    _glacier_fraction(collect(NTuple{4,Int}, cells), dir)
+modis_glacier_fraction(lat::Real, lon::Real; kwargs...) =
+    only(modis_glacier_fraction([lat], [lon]; kwargs...))
+
 # --------------------------------------------------------------------------- public API
 
 """
@@ -644,7 +675,7 @@ function bare_ice_albedo(geometry, reducer = nothing;
     v = _bia_read(cells, dir)
     # The fraction table is read only when the screen or the per-cell stack needs it.
     glacier_fraction = reducer === nothing || min_glacier_fraction > 0 ?
-                       _glacier_fraction(cells, dir) : fill(NaN32, length(cells))
+                       modis_glacier_fraction(cells; dir) : fill(NaN32, length(cells))
     if min_glacier_fraction > 0
         # A cell below the screen stays `found` but counts as unresolved; a cell with no
         # fraction on record fails it.
