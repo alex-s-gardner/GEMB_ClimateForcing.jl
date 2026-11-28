@@ -123,6 +123,7 @@ println("="^70)
     # read/reduce against synthetic pooled tables written to a tempdir. The final testset pins
     # real values and skips itself until data/run_rgi7_pooled_albedo.jl has been run.)
     include("test_bare_ice_albedo.jl")
+    include("test_modis_mask_fraction.jl")
 
     @testset "Input Validation" begin
         # Missing time_range
